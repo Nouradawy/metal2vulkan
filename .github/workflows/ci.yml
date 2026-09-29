@@ -68,9 +68,11 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
-      # clippy --all-targets typechecks the workspace; no separate cargo build step.
+      # clippy --all-targets --all-features typechecks the workspace INCLUDING the
+      # `serde` cfg the shipped CLI is built with; without it, code and tests behind
+      # `#[cfg(feature = "serde")]` are never compiled by any gate.
       - name: Clippy (warnings denied)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Build public documentation (warnings denied)
         env:
@@ -78,10 +80,10 @@ jobs:
         run: cargo doc --workspace --all-features --no-deps
 
       - name: Test metal2vulkan
-        run: cargo test -p metal2vulkan
+        run: cargo test -p metal2vulkan --all-features
 
       - name: Test validation suite
-        run: cargo test -p metal2vulkan-validation
+        run: cargo test -p metal2vulkan-validation --all-features
 
       # Machine-specific semantic qualification remains explicit. Linux CI has lavapipe, so it can
       # execute the owned public cases against their exact committed Metal observations without a
