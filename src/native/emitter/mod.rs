@@ -196,10 +196,13 @@ pub(super) struct Emitter {
     param_values: HashSet<String>,
     inline_parameter_substitutions: Vec<(Word, Word)>,
     raw_buffer_params: HashSet<String>,
-    /// Constant descriptor-relative byte cursors passed to raw helper parameters, keyed by
-    /// `(callee, parameter)`. The emitted-helper inliner can then keep a non-zero caller GEP rooted
-    /// in the real StorageBuffer instead of the ordinary Private placeholder value.
-    raw_call_param_offsets: HashMap<(String, String), RawBufferOffset>,
+    /// Residual helper raw-buffer parameters that some call site reaches through an address-changing
+    /// alias of a caller parameter (a GEP, phi, or select rather than the parameter itself). A raw
+    /// pointer's SSA value is only a placeholder; its address is the descriptor root plus a byte
+    /// cursor. Calls therefore pass the root as the pointer operand and append one `u32` byte-cursor
+    /// shadow for exactly these parameters, after any nullness shadows, and the callee folds that
+    /// shadow into the parameter's raw offset.
+    function_param_raw_cursors: HashSet<(String, usize)>,
     /// Current function's entry params declared `air.buffer` in kernel metadata (data pointers,
     /// never textures/samplers). Rebuilt per emit_function from `ir.metadata_data_buffer_params`.
     data_buffer_params: HashSet<String>,
@@ -624,7 +627,7 @@ impl Emitter {
             param_values: HashSet::new(),
             inline_parameter_substitutions: Vec::new(),
             raw_buffer_params: HashSet::new(),
-            raw_call_param_offsets: HashMap::new(),
+            function_param_raw_cursors: HashSet::new(),
             data_buffer_params: HashSet::new(),
             raw_offsets: HashMap::new(),
             int_alignments: HashMap::new(),
@@ -891,6 +894,112 @@ impl Emitter {
             !self.ir.entry_functions.contains(&key.0) && !function_param_nonnull.contains(key)
         });
         Ok(required)
+    }
+
+    /// Select the residual helper raw-buffer parameters that need a byte-cursor shadow (see
+    /// [`Emitter::function_param_raw_cursors`]). A call site needs one when its argument is an
+    /// address-preserving alias of a caller parameter — the same relation raw-buffer propagation
+    /// follows — that is not provably the parameter's own address. Forwarding a caller parameter that
+    /// itself carries a cursor propagates the requirement to the callee. The decision is taken from
+    /// typed AIR before any function is emitted, so every call site and the callee agree on one
+    /// signature regardless of emission order.
+    pub(super) fn infer_function_param_raw_cursors(
+        &self,
+        functions: &[LlFunction],
+    ) -> HashSet<(String, usize)> {
+        let functions_by_name: HashMap<&str, &LlFunction> = functions
+            .iter()
+            .map(|function| (function.name.as_str(), function))
+            .collect();
+        let aliases: HashMap<&str, (HashMap<String, String>, HashMap<String, String>)> = functions
+            .iter()
+            .map(|function| {
+                (
+                    function.name.as_str(),
+                    (
+                        super::ir::pointer_param_alias_roots(function),
+                        super::ir::pointer_param_zero_offset_aliases(function),
+                    ),
+                )
+            })
+            .collect();
+        let mut required = HashSet::new();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for function in functions {
+                let (alias_roots, zero_offset_roots) = &aliases[function.name.as_str()];
+                for inst in function.carrier_insts() {
+                    let Some(call) = inst.call().as_ref() else {
+                        continue;
+                    };
+                    let Some(callee) = functions_by_name.get(call.callee.as_str()) else {
+                        continue;
+                    };
+                    if call.args.len() != callee.params.len() {
+                        continue;
+                    }
+                    for (index, (argument, (param, param_ty))) in
+                        call.args.iter().zip(&callee.params).enumerate()
+                    {
+                        let key = (callee.name.clone(), index);
+                        if required.contains(&key)
+                            || !self.raw_cursor_param_candidate(callee, index, param, param_ty)
+                        {
+                            continue;
+                        }
+                        let LlValue::Local(argument) = &argument.value else {
+                            continue;
+                        };
+                        if !alias_roots.contains_key(argument) {
+                            continue;
+                        }
+                        let needs_cursor = zero_offset_roots.get(argument).is_none_or(|root| {
+                            function
+                                .params
+                                .iter()
+                                .position(|(name, _)| name == root)
+                                .is_some_and(|caller_index| {
+                                    required.contains(&(function.name.clone(), caller_index))
+                                })
+                        });
+                        if needs_cursor {
+                            required.insert(key);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        required
+    }
+
+    /// A helper parameter whose emitted binding is a descriptor- or Workgroup-rooted raw offset (the
+    /// same condition under which `emit_function` records `raw_offsets` for it), and which is not
+    /// already an address-carrying BDA parameter.
+    fn raw_cursor_param_candidate(
+        &self,
+        callee: &LlFunction,
+        index: usize,
+        param: &str,
+        param_ty: &LlType,
+    ) -> bool {
+        if self.ir.entry_functions.contains(&callee.name)
+            || !self
+                .ir
+                .raw_buffer_params
+                .contains(&(callee.name.clone(), param.to_string()))
+        {
+            return false;
+        }
+        match self.resolve_type(param_ty) {
+            Ok(LlType::Ptr(1)) => !self.bda_device_pointers,
+            Ok(LlType::Ptr(2)) => true,
+            Ok(LlType::Ptr(3)) => self
+                .concrete_vector_workgroup_raw_param_pointee(&callee.name, index, param)
+                .is_none(),
+            _ => false,
+        }
     }
 
     fn local_call_arg_nonnull_values(
@@ -2713,6 +2822,7 @@ impl Emitter {
         attempt!(self.infer_function_param_pointees(&functions));
         self.function_param_nonnull = attempt!(self.infer_function_param_nonnull(&functions));
         self.function_param_nullness = attempt!(self.infer_function_param_nullness(&functions));
+        self.function_param_raw_cursors = self.infer_function_param_raw_cursors(&functions);
         let entry_name = self
             .ir
             .entry_name

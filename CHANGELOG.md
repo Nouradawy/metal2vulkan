@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A helper that receives a pointer derived from a raw buffer -- `getelementptr`, even with offset
+  0, rather than the buffer parameter itself -- now reads and writes that buffer at the caller's
+  location instead of reading zero. A raw pointer's SSA value is only a Private placeholder; its
+  address is the descriptor root plus the byte cursor in `raw_offsets`. Both helper boundaries
+  handed the callee the placeholder whenever the buffer was not a device (`addrspace(1)`) buffer:
+  a spliced one-block helper bound its parameter to it, and an emitted call passed it as the
+  argument, so every load through the parameter folded to `OpCopyObject %uint <OpConstantNull>`
+  (CoreAnimation's UberShader colour program, `constant float4*`, lost all 2472 loads and the
+  wallpaper rendered white). A spliced parameter now aliases its argument's complete raw offset in
+  every address space. An emitted helper parameter that some call site reaches through an
+  address-changing alias of a caller parameter gets a `u32` byte-cursor shadow, chosen from typed
+  AIR before emission like the nullness shadow, so every call passes the descriptor root plus its
+  own cursor and distinct offsets into one helper coexist. The former single-constant
+  `raw_call_param_offsets` side table, which failed on two different offsets and was never applied
+  when the helper happened to be emitted before its caller, is gone. A raw argument that still
+  carries an offset where no cursor is passed now fails visibly instead of being re-addressed at
+  its root. Over 341 captured macOS 26 shaders, the 16 modules that contained such null loads
+  (2472, 134, 114, 13, 13, 9, nine with 8, 6) now contain none; the other 325 translate
+  byte-identically.
+
 - Reflected translation no longer asks a consumer to create a `VkSampler` at a binding the module
   does not declare. `StaticSampler` is a descriptor translation invents -- nothing in Metal's API
   puts one there, so the only reason a consumer creates it is that this reflection asked. Reflection

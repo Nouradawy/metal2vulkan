@@ -268,7 +268,7 @@ pub(in crate::native) struct ParamCallEdge {
 /// Trace a pointer-valued local back to one of `f`'s pointer parameters through aliases that preserve
 /// the pointed-to address.  This deliberately accepts only a single, unambiguous parameter root: a
 /// cross-buffer select/phi is not one buffer alias and must not make raw-buffer marking contagious.
-fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
+pub(in crate::native) fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
     let mut roots: HashMap<String, String> = f
         .params
         .iter()
@@ -337,6 +337,51 @@ fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
                     if roots.insert(res.clone(), root).is_none() {
                         changed = true;
                     }
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// The subset of [`pointer_param_alias_roots`] that provably names its parameter's own address:
+/// the parameter itself, an identity pointer bitcast, or a GEP whose every index is a constant zero.
+/// Any other alias (a non-zero or dynamic GEP, a phi, a select) may carry a byte offset from the root.
+pub(in crate::native) fn pointer_param_zero_offset_aliases(
+    f: &LlFunction,
+) -> HashMap<String, String> {
+    let mut roots: HashMap<String, String> = f
+        .params
+        .iter()
+        .filter(|&(_name, ty)| matches!(ty, LlType::Ptr(_)))
+        .map(|(name, _ty)| (name.clone(), name.clone()))
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for inst in f.carrier_insts() {
+            let alias = if let Some((result, base)) = inst.identity_ptr_bitcast() {
+                Some((result.to_string(), base))
+            } else if let (Some(result), Some(gep)) = (&inst.result, inst.gep()) {
+                let zero_offset = gep.indices.iter().all(|index| {
+                    matches!(
+                        index.value,
+                        LlValue::Int(0) | LlValue::SignedInt(0) | LlValue::Hex(0) | LlValue::Zero
+                    )
+                });
+                match &gep.base.value {
+                    LlValue::Local(base) if zero_offset => Some((result.clone(), base.as_str())),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let Some((result, base)) = alias else {
+                continue;
+            };
+            if let Some(root) = roots.get(base).cloned() {
+                if roots.insert(result, root).is_none() {
+                    changed = true;
                 }
             }
         }

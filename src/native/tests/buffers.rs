@@ -3606,6 +3606,306 @@ entry:
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// The set of 32-bit words of the raw `{ uint[] }` descriptor at `binding` that the translated
+/// module addresses, by constant-folding every access-chain word index rooted at that variable.
+/// Panics if any access has a non-constant index or if any load was replaced by a copy of a null
+/// constant (the silent-zero symptom of a raw pointer whose cursor was lost).
+fn raw_descriptor_words(spv: &[u8], binding: u32) -> std::collections::BTreeSet<u32> {
+    fn fold(id: Word, definitions: &HashMap<Word, &Instruction>) -> Option<u32> {
+        let instruction = definitions.get(&id)?;
+        let operand = |index: usize| match instruction.operands.get(index) {
+            Some(Operand::IdRef(id)) => fold(*id, definitions),
+            _ => None,
+        };
+        match instruction.class.opcode {
+            Op::Constant => match instruction.operands.first()? {
+                Operand::LiteralBit32(value) => Some(*value),
+                Operand::LiteralBit64(value) => u32::try_from(*value).ok(),
+                _ => None,
+            },
+            Op::ConstantNull | Op::ConstantFalse => Some(0),
+            Op::ConstantTrue => Some(1),
+            Op::IAdd => Some(operand(0)?.wrapping_add(operand(1)?)),
+            Op::IMul => Some(operand(0)?.wrapping_mul(operand(1)?)),
+            Op::UDiv => operand(0)?.checked_div(operand(1)?),
+            Op::ShiftRightLogical => operand(0)?.checked_shr(operand(1)?),
+            Op::IEqual => Some(u32::from(operand(0)? == operand(1)?)),
+            Op::Select => {
+                if operand(0)? != 0 {
+                    operand(1)
+                } else {
+                    operand(2)
+                }
+            }
+            Op::CopyObject | Op::Bitcast | Op::UConvert | Op::SConvert => operand(0),
+            _ => None,
+        }
+    }
+
+    let module = load_bytes(spv).expect("load translated SPIR-V");
+    let asm = disassemble(spv).expect("disassemble");
+    let variables = module
+        .annotations
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::Decorate)
+        .filter_map(|instruction| match instruction.operands.as_slice() {
+            [Operand::IdRef(target), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(bound)]
+                if *bound == binding =>
+            {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        variables.len(),
+        1,
+        "one descriptor at binding {binding}:\n{asm}"
+    );
+    let body = module
+        .functions
+        .iter()
+        .flat_map(|function| function.all_inst_iter())
+        .collect::<Vec<_>>();
+    let definitions = module
+        .types_global_values
+        .iter()
+        .chain(body.iter().copied())
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+        .collect::<HashMap<_, _>>();
+    assert!(
+        !body.iter().any(|instruction| {
+            instruction.class.opcode == Op::CopyObject
+                && matches!(
+                    instruction.operands.first(),
+                    Some(Operand::IdRef(source))
+                        if definitions
+                            .get(source)
+                            .is_some_and(|definition| definition.class.opcode == Op::ConstantNull)
+                )
+        }),
+        "a buffer load was replaced by a null constant:\n{asm}"
+    );
+    body.iter()
+        .filter(|instruction| {
+            matches!(
+                instruction.class.opcode,
+                Op::AccessChain | Op::InBoundsAccessChain
+            ) && matches!(
+                instruction.operands.first(),
+                Some(Operand::IdRef(base)) if variables.contains(base)
+            )
+        })
+        .map(|instruction| {
+            let Some(Operand::IdRef(index)) = instruction.operands.last() else {
+                panic!("access chain without an index:\n{asm}");
+            };
+            fold(*index, &definitions)
+                .unwrap_or_else(|| panic!("non-constant word index %{index}:\n{asm}"))
+        })
+        .collect()
+}
+
+/// A one-block helper is spliced into its caller before emission. Its pointer parameter bound to
+/// a GEP of a constant (`addrspace(2)`) raw buffer used to be bound to the GEP's Private
+/// placeholder, so every load through it became `OpCopyObject %uint <null>`. The spliced
+/// parameter must alias the argument: descriptor root plus the GEP's byte cursor.
+#[test]
+fn native_inline_constant_buffer_gep_argument_reads_offset_words() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define internal fastcc <4 x float> @callee(ptr addrspace(2) noundef readonly %p) unnamed_addr #1 {
+  %a = getelementptr inbounds <4 x float>, ptr addrspace(2) %p, i64 1
+  %v = load <4 x float>, ptr addrspace(2) %a, align 16
+  ret <4 x float> %v
+}
+
+define <4 x float> @repro(<4 x float> %pos, ptr addrspace(2) noundef readonly "air-buffer-no-alias" %buf) {
+  %q = getelementptr inbounds <4 x float>, ptr addrspace(2) %buf, i64 7
+  %r0 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %buf)
+  %r1 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %q)
+  %s = fadd fast <4 x float> %r0, %r1
+  ret <4 x float> %s
+}
+
+attributes #1 = { noinline nounwind }
+
+!air.fragment = !{!0}
+!0 = !{ptr @repro, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"pos", !"air.arg_unused"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"colorP"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_inline_constant_buffer_gep_arg_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    // `@callee(%buf)` reads float4 #1 (words 4..7); `@callee(%buf + 7 float4)` reads #8 (32..35).
+    assert_eq!(
+        raw_descriptor_words(&spv, 4),
+        std::collections::BTreeSet::from([4, 5, 6, 7, 32, 33, 34, 35])
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A multi-block helper stays an emitted `OpFunctionCall` until the post-emission inliner runs,
+/// so a GEP argument's byte cursor has to cross a real call boundary. Each call site passes the
+/// descriptor root plus its own cursor, so distinct offsets into one constant buffer coexist.
+#[test]
+fn native_helper_call_constant_buffer_gep_arguments_pass_byte_cursors() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define internal fastcc <4 x float> @callee(ptr addrspace(2) noundef readonly %p, i1 %c) unnamed_addr #1 {
+entry:
+  br i1 %c, label %then, label %else
+then:
+  %a = getelementptr inbounds <4 x float>, ptr addrspace(2) %p, i64 1
+  %v = load <4 x float>, ptr addrspace(2) %a, align 16
+  br label %done
+else:
+  %w = load <4 x float>, ptr addrspace(2) %p, align 16
+  br label %done
+done:
+  %r = phi <4 x float> [ %v, %then ], [ %w, %else ]
+  ret <4 x float> %r
+}
+
+define <4 x float> @repro(<4 x float> %pos, ptr addrspace(2) noundef readonly "air-buffer-no-alias" %buf) {
+  %x = extractelement <4 x float> %pos, i64 0
+  %c = fcmp fast ogt float %x, 1.000000e+01
+  %q = getelementptr inbounds <4 x float>, ptr addrspace(2) %buf, i64 7
+  %q2 = getelementptr inbounds <4 x float>, ptr addrspace(2) %buf, i64 14
+  %r0 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %buf, i1 %c)
+  %r1 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %q, i1 %c)
+  %r2 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %q2, i1 %c)
+  %s0 = fadd fast <4 x float> %r0, %r1
+  %s = fadd fast <4 x float> %s0, %r2
+  ret <4 x float> %s
+}
+
+attributes #1 = { noinline nounwind }
+
+!air.fragment = !{!0}
+!0 = !{ptr @repro, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"pos"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"colorP"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_helper_call_constant_buffer_gep_args_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    // Each call reads float4 #0 and #1 relative to its cursor of 0, 7, or 14 float4s.
+    let expected = [0u32, 7, 14]
+        .into_iter()
+        .flat_map(|base| (base * 4)..(base * 4 + 8))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(raw_descriptor_words(&spv, 4), expected);
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A cursor-carrying helper parameter forwarded through a further GEP to another emitted helper
+/// composes both offsets, and one raw device-buffer helper may be called with distinct constant
+/// cursors (formerly `conflicting constant byte offsets`). The helpers are defined before the
+/// kernel, so the callee signature cannot depend on callers having been emitted first. The mixed
+/// `i32`/`float` stores make the buffer raw.
+#[test]
+fn native_nested_helper_calls_compose_device_buffer_byte_cursors() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define internal fastcc void @outer(ptr addrspace(1) %p, i32 %v) unnamed_addr #1 {
+entry:
+  %skip = icmp eq i32 %v, 0
+  br i1 %skip, label %done, label %work
+work:
+  %q = getelementptr inbounds i8, ptr addrspace(1) %p, i64 8
+  tail call fastcc void @inner(ptr addrspace(1) %q, i32 %v)
+  br label %done
+done:
+  store i32 %v, ptr addrspace(1) %p, align 4
+  ret void
+}
+
+define internal fastcc void @inner(ptr addrspace(1) %d, i32 %v) unnamed_addr #1 {
+entry:
+  %hi = icmp ugt i32 %v, 7
+  br i1 %hi, label %high, label %low
+high:
+  %d1 = getelementptr inbounds i8, ptr addrspace(1) %d, i64 4
+  %f = uitofp i32 %v to float
+  store float %f, ptr addrspace(1) %d1, align 4
+  br label %done
+low:
+  store i32 %v, ptr addrspace(1) %d, align 4
+  br label %done
+done:
+  ret void
+}
+
+define void @k(ptr addrspace(1) %out, i32 %tid) {
+entry:
+  %a = getelementptr inbounds i8, ptr addrspace(1) %out, i64 16
+  %b = getelementptr inbounds i8, ptr addrspace(1) %out, i64 48
+  tail call fastcc void @outer(ptr addrspace(1) %a, i32 %tid)
+  tail call fastcc void @outer(ptr addrspace(1) %b, i32 %tid)
+  ret void
+}
+
+attributes #1 = { noinline nounwind }
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_nested_helper_device_buffer_cursors_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    // `@outer(out + 16 B)` stores word 4 and `@inner(out + 24 B)` word 6 or 7; likewise 12, 14, 15.
+    assert_eq!(
+        raw_descriptor_words(&spv, 0),
+        std::collections::BTreeSet::from([4, 6, 7, 12, 14, 15])
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn native_indirect_helper_gep_drops_signed_zero_record_index() {
     let ll = r#"

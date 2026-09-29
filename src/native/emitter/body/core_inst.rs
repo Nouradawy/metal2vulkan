@@ -770,33 +770,47 @@ impl Emitter {
                 return Ok(());
             }
         }
-        // Preserve a descriptor-backed raw buffer's byte cursor across helper inlining.  A non-zero
-        // GEP of a raw device buffer has a Private placeholder as its ordinary SSA value, while its
-        // real descriptor root and byte offset live in `raw_offsets`.  Binding the helper parameter
-        // to that placeholder silently turns helper writes into Private writes.  Root the inline
-        // substitution at the descriptor instead and carry the cursor onto the parameter; the
-        // callee's existing raw load/store lowering then reapplies the offset structurally.
+        // Preserve a raw buffer's byte cursor across helper inlining.  A GEP (or identity bitcast) of
+        // a raw buffer has a Private placeholder as its ordinary SSA value, while its real root and
+        // byte offset live in `raw_offsets`.  Binding the helper parameter to that placeholder
+        // silently turns helper loads into zero reads and helper writes into Private writes, in
+        // every address space.  The inlined parameter is an alias of its argument, so root the
+        // inline substitution at the raw root and carry the complete cursor onto the parameter; the
+        // callee's existing raw load/store lowering then reapplies the offset structurally (and an
+        // unmodelable cursor fails there visibly, exactly as a direct access through the argument).
         let inline_raw = match (&argument.value, &resolved_ty) {
-            (LlValue::Local(source), LlType::Ptr(addrspace)) => self
-                .raw_offsets
-                .get(source)
-                .cloned()
-                .filter(|raw| {
-                    !raw.unmodelable
-                        && ((self.raw_buffer_params.contains(name) && raw.addrspace == 1)
-                            || (self.bda_device_pointers && raw.device_addr_base.is_some()))
-                })
-                .or_else(|| {
-                    (self.bda_device_pointers)
-                        .then(|| self.bda_direct_addresses.get(source).copied())
-                        .flatten()
-                        .map(|address| {
-                            let mut raw =
-                                RawBufferOffset::root(format!(".bda_inline_{address}"), *addrspace);
-                            raw.device_addr_base = Some(address);
-                            raw
-                        })
-                }),
+            (LlValue::Local(source), LlType::Ptr(addrspace)) => {
+                let source_raw = self
+                    .raw_offsets
+                    .get(source)
+                    .filter(|raw| raw.device_addr_base.is_none() || self.bda_device_pointers)
+                    .cloned();
+                // A direct BDA address has no raw root of its own; the parameter itself, whose
+                // value is substituted by that address, becomes the root.
+                let address_raw = (self.bda_device_pointers)
+                    .then(|| self.bda_direct_addresses.get(source).copied())
+                    .flatten()
+                    .map(|address| {
+                        let mut raw = RawBufferOffset::root(name.to_string(), *addrspace);
+                        raw.device_addr_base = Some(address);
+                        raw
+                    });
+                match (source_raw, address_raw) {
+                    // In the device-address model a directly addressed argument is bound by its
+                    // address, unless its raw offset is itself address-rooted or names the
+                    // descriptor of a raw device parameter.
+                    (Some(raw), Some(address))
+                        if raw.unmodelable
+                            || (raw.device_addr_base.is_none()
+                                && !(self.raw_buffer_params.contains(name)
+                                    && raw.addrspace == 1)) =>
+                    {
+                        Some(address)
+                    }
+                    (Some(raw), _) => Some(raw),
+                    (None, address) => address,
+                }
+            }
             _ => None,
         };
         let inline_raw_storage = inline_raw.as_ref().map(|raw| {
@@ -825,11 +839,7 @@ impl Emitter {
         let argument_id = if let Some(address) = bda_argument_address {
             address
         } else if let Some(raw) = inline_raw.as_ref() {
-            self.value_id_in(
-                &LlValue::Local(raw.root.clone()),
-                &argument.ty,
-                instructions,
-            )?
+            self.raw_root_value_id(raw)?
         } else {
             self.value_id_in(&argument.value, &argument.ty, instructions)?
         };
@@ -897,10 +907,7 @@ impl Emitter {
             if let Some(nullness) = nullness {
                 self.record_pointer_nullness(name.to_string(), nullness);
             }
-            if let Some(mut raw) = inline_raw.filter(|raw| {
-                self.raw_buffer_params.contains(name) || raw.device_addr_base.is_some()
-            }) {
-                raw.root = name.to_string();
+            if let Some(raw) = inline_raw {
                 self.raw_offsets.insert(name.to_string(), raw);
                 if let Some(storage) = inline_raw_storage {
                     self.pointer_storage.insert(name.to_string(), storage);

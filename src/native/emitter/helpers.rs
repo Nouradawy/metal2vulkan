@@ -93,6 +93,11 @@ pub(super) fn raw_byte_index_name(name: &str) -> String {
     format!("{name}.air.rawbyte")
 }
 
+/// The synthetic `u32` value bound to a helper raw parameter's byte-cursor shadow.
+pub(super) fn raw_cursor_value_name(name: &str) -> String {
+    format!("{name}.metal2vulkan.raw_cursor")
+}
+
 pub(super) fn compatible_pointer_provenance(a: &GepProvenance, b: &GepProvenance) -> bool {
     a.root == b.root
         && a.addrspace == b.addrspace

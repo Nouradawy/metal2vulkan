@@ -610,9 +610,25 @@ impl Emitter {
         let bool_type = (!nullness_params.is_empty())
             .then(|| self.type_id(&LlType::Bool))
             .transpose()?;
+        let raw_cursor_params = f
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                self.function_param_raw_cursors
+                    .contains(&(f.name.clone(), *index))
+            })
+            .map(|(_, (name, _))| name.clone())
+            .collect::<Vec<_>>();
+        let cursor_type = (!raw_cursor_params.is_empty())
+            .then(|| self.type_id(&LlType::Int(32)))
+            .transpose()?;
         let mut function_param_types = param_types.clone();
         if let Some(bool_type) = bool_type {
             function_param_types.extend(std::iter::repeat_n(bool_type, nullness_params.len()));
+        }
+        if let Some(cursor_type) = cursor_type {
+            function_param_types.extend(std::iter::repeat_n(cursor_type, raw_cursor_params.len()));
         }
         let fn_ty = self.function_type_id(ret_id, &function_param_types);
 
@@ -696,11 +712,7 @@ impl Emitter {
                     self.pointer_pointees.insert(name.clone(), pointee);
                 }
                 if self.raw_buffer_params.contains(name) && !concrete_workgroup_raw_param {
-                    let mut raw = self
-                        .raw_call_param_offsets
-                        .get(&(f.name.clone(), name.clone()))
-                        .cloned()
-                        .unwrap_or_else(|| RawBufferOffset::root(name.clone(), addrspace));
+                    let mut raw = RawBufferOffset::root(name.clone(), addrspace);
                     raw.root = shared_raw_roots
                         .get(name)
                         .cloned()
@@ -733,6 +745,33 @@ impl Emitter {
                 vec![],
             ));
             self.record_pointer_nullness(name, id);
+        }
+        for name in raw_cursor_params {
+            let id = self.fresh();
+            params.push(Self::inst(
+                Op::FunctionParameter,
+                cursor_type,
+                Some(id),
+                vec![],
+            ));
+            // The pointer operand is the caller's raw root; its byte cursor arrives here. Fold it
+            // into the parameter's raw offset so every access through the parameter (and every
+            // GEP derived from it) addresses the caller's actual location.
+            let cursor = raw_cursor_value_name(&name);
+            self.values.insert(cursor.clone(), (id, LlType::Int(32)));
+            let raw = self.raw_offsets.get_mut(&name).ok_or_else(|| {
+                format!(
+                    "native emitter: raw cursor parameter {name} of @{} has no raw buffer offset",
+                    f.name
+                )
+            })?;
+            raw.dyn_terms.push((
+                TypedValue {
+                    ty: LlType::Int(32),
+                    value: LlValue::Local(cursor),
+                },
+                1,
+            ));
         }
 
         // T5/T8 keystone: seed every block's typed carrier from its lines at SPLIT time — BEFORE

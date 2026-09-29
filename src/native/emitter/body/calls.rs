@@ -439,7 +439,15 @@ impl Emitter {
             .map(|(_, argument, _)| argument.value.clone())
             .collect::<Vec<_>>();
         let mut ids = Vec::with_capacity(args.len() + nullness_args.len());
+        let mut raw_cursor_ids = Vec::new();
         for (index, arg, (param_name, param_ty)) in args {
+            if let Some((root, cursor)) =
+                self.raw_cursor_call_arg_ids(&call.callee, index, &param_name, &arg, instructions)?
+            {
+                ids.push(root);
+                raw_cursor_ids.push(cursor);
+                continue;
+            }
             if let Some(id) = self.data_buffer_array_call_arg_id(
                 &call.callee,
                 &param_name,
@@ -487,7 +495,65 @@ impl Emitter {
         for value in &nullness_args {
             ids.push(self.pointer_call_arg_nullness_id(value)?);
         }
+        ids.extend(raw_cursor_ids);
         Ok(ids)
+    }
+
+    /// Lower an argument bound to a raw helper parameter that carries a byte-cursor shadow (see
+    /// [`Emitter::function_param_raw_cursors`]). A raw pointer's SSA value is a placeholder, so the
+    /// pointer operand is the argument's raw root and the cursor is its complete byte offset from
+    /// that root — constant, dynamic, or inherited from the caller's own cursor. An argument without
+    /// a modelable raw offset has no address to pass and fails visibly.
+    fn raw_cursor_call_arg_ids(
+        &mut self,
+        callee: &str,
+        param_index: usize,
+        param_name: &str,
+        arg: &TypedValue,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Option<(Word, Word)>, String> {
+        if !self
+            .function_param_raw_cursors
+            .contains(&(callee.to_string(), param_index))
+        {
+            return Ok(None);
+        }
+        let raw = match &arg.value {
+            LlValue::Local(arg_name) => self.raw_offsets.get(arg_name).cloned(),
+            _ => None,
+        };
+        let Some(raw) = raw else {
+            return Err(format!(
+                "native emitter: raw helper parameter @{callee} {param_name} needs a raw buffer \
+                 cursor, but its argument {:?} has no raw offset",
+                arg.value
+            ));
+        };
+        if raw.device_addr_base.is_some() {
+            return Err(format!(
+                "native emitter: raw helper parameter @{callee} {param_name} received a \
+                 device-address cursor"
+            ));
+        }
+        let expected_root = if raw.addrspace == 3 {
+            raw_workgroup_array_type()
+        } else {
+            raw_buffer_block_type()
+        };
+        if !self
+            .pointer_pointees
+            .get(&raw.root)
+            .is_some_and(|pointee| types_compatible(pointee, &expected_root))
+        {
+            return Err(format!(
+                "native emitter: raw helper parameter @{callee} {param_name} argument is not \
+                 rooted at a raw buffer view (root {})",
+                raw.root
+            ));
+        }
+        let root = self.raw_root_value_id(&raw)?;
+        let cursor = self.emit_raw_byte_index(&raw, 0, instructions)?;
+        Ok(Some((root, cursor)))
     }
 
     fn data_buffer_array_call_arg_id(
@@ -663,22 +729,21 @@ impl Emitter {
         Ok(Some(result))
     }
 
-    /// When a raw, descriptor-backed DEVICE buffer pointer is passed to a callee param that is itself a
-    /// raw device buffer (and will be helper-inlined), pass the buffer's ROOT id rather than the value the
-    /// arg normally resolves to. A `void*` device buffer reaches a helper through an IDENTITY
-    /// `bitcast ptr addrspace(1) %buf to ptr addrspace(1)`; the bitcast result carries a Private byte
+    /// When a raw, descriptor-backed device or constant buffer pointer is passed to a callee param that
+    /// is itself a raw buffer (and will be helper-inlined), pass the buffer's ROOT id rather than the
+    /// value the arg normally resolves to. A `void*` buffer reaches a helper through an IDENTITY
+    /// `bitcast ptr addrspace(N) %buf to ptr addrspace(N)`; the bitcast result carries a Private byte
     /// placeholder VALUE for any DIRECT in-function access, but if that placeholder is passed as the call
     /// argument, the emitted-graph inliner roots the callee's accesses (loads/stores AND atomics) on
     /// the Private var — demoting the buffer to reads-zero / writes-discarded and dropping its
-    /// StorageBuffer binding. Passing the descriptor-backed root instead keeps the real device buffer
-    /// live.
+    /// StorageBuffer binding. Passing the descriptor-backed root instead keeps the real buffer live.
     ///
-    /// Gated structurally and tightly so it only fires for the genuine case: the arg must be a Local with
-    /// a modelable descriptor-backed `raw_offsets` entry whose root is a real device-buffer param. A
-    /// constant non-zero cursor is recorded for that callee parameter and reapplied while the helper is
-    /// emitted; conflicting call-site cursors and dynamic offsets fail visibly rather than silently
-    /// discarding an offset. This lives ONLY on the call-argument path; direct accesses and pointer merges
-    /// keep their existing behavior.
+    /// Parameters reached through an address-changing alias carry a byte-cursor shadow and are lowered
+    /// by [`Self::raw_cursor_call_arg_ids`] instead. Without that shadow the callee binds the parameter
+    /// at its root's own address, so an argument that still carries an offset from its root, or whose
+    /// root is not a raw buffer parameter of this function, fails visibly rather than being silently
+    /// re-addressed or replaced by its placeholder. This lives ONLY on the call-argument path; direct
+    /// accesses and pointer merges keep their existing behavior.
     pub(in crate::native::emitter) fn raw_device_call_arg_id(
         &mut self,
         callee: &str,
@@ -697,8 +762,8 @@ impl Emitter {
         let LlType::Ptr(param_addrspace) = self.resolve_type(param_ty)? else {
             return Ok(None);
         };
-        if param_addrspace != 1 {
-            return Ok(None); // device buffers only; the workgroup case is handled separately
+        if !matches!(param_addrspace, 1 | 2) {
+            return Ok(None); // descriptor buffers only; the workgroup case is handled separately
         }
         let LlValue::Local(arg_name) = &arg.value else {
             return Ok(None);
@@ -718,30 +783,26 @@ impl Emitter {
                 .materialize_device_address(&address_raw, instructions)
                 .map(Some);
         }
-        if raw.addrspace != 1
-            || !raw.dyn_terms.is_empty()
-            || raw.unmodelable
-            || raw.device_addr_base.is_some()
-        {
+        if raw.addrspace != param_addrspace || raw.device_addr_base.is_some() {
             return Ok(None);
+        }
+        if raw.unmodelable || raw.const_off != 0 || !raw.dyn_terms.is_empty() {
+            return Err(format!(
+                "native emitter: raw helper parameter @{callee} {param_name} has no byte-cursor \
+                 shadow but its argument {arg_name} is offset from raw root {}: {raw:?}",
+                raw.root
+            ));
         }
         let root = raw.root.clone();
-        if !self.param_values.contains(&root) || !self.raw_buffer_params.contains(&root) {
+        if &root == arg_name {
+            // The argument is the raw root itself, so its ordinary value is the root.
             return Ok(None);
         }
-        let key = (callee.to_string(), param_name.to_string());
-        if let Some(previous) = self.raw_call_param_offsets.get(&key) {
-            if previous.const_off != raw.const_off || previous.addrspace != raw.addrspace {
-                return Err(format!(
-                    "native emitter: raw helper parameter @{callee} {param_name} is called with \
-                     conflicting constant byte offsets {} and {}",
-                    previous.const_off, raw.const_off
-                ));
-            }
-        } else {
-            let mut parameter_raw = raw;
-            parameter_raw.root = param_name.to_string();
-            self.raw_call_param_offsets.insert(key, parameter_raw);
+        if !self.param_values.contains(&root) || !self.raw_buffer_params.contains(&root) {
+            return Err(format!(
+                "native emitter: raw helper parameter @{callee} {param_name} argument {arg_name} \
+                 aliases raw root {root}, which is not a raw buffer parameter"
+            ));
         }
         let id = self.value_id_in(&LlValue::Local(root), &arg.ty, instructions)?;
         Ok(Some(id))
@@ -795,6 +856,15 @@ impl Emitter {
         }
         let raw_ty = raw_workgroup_array_type();
         if let Some(raw) = &raw {
+            // Without a cursor shadow the callee binds this parameter at the root's own address; an
+            // offset argument is lowered by `raw_cursor_call_arg_ids`, never re-addressed here.
+            if raw.unmodelable || raw.const_off != 0 || !raw.dyn_terms.is_empty() {
+                return Err(format!(
+                    "native emitter: raw workgroup helper parameter @{callee} {param_name} has no \
+                     byte-cursor shadow but its argument is offset from raw root {}: {raw:?}",
+                    raw.root
+                ));
+            }
             let root_id = self.raw_root_value_id(raw)?;
             if self
                 .pointer_pointees
