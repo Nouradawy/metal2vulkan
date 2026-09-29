@@ -479,9 +479,12 @@ entry:
 /// `[[front_facing]]` it could not wire called every triangle back-facing — in a module that
 /// validated and reflected as though the builtin were connected.
 ///
-/// Unlike an unmodelled role, this branch is unreachable on real AIR: Metal fixes each attribute's
-/// type, and over 2880 corpus sources no module takes it. So the rejection costs nothing and exists
-/// to keep the silent zero from coming back.
+/// `[[front_facing]]` is the one reachable exception: macOS 26's own fragment shaders carry it as
+/// an integer, so an integer parameter translates as a select of the boolean builtin (see
+/// `native_fragment_integer_front_facing_selects_from_the_bool_builtin`) and only a type that is
+/// neither bool nor integer is refused. For the others the branch is unreachable on real AIR —
+/// Metal fixes each attribute's type — and the rejection exists to keep the silent zero from
+/// coming back.
 #[test]
 fn a_builtin_parameter_of_the_wrong_type_fallbacks() {
     const FRAGMENT: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
@@ -515,6 +518,7 @@ entry:
         ("position", "float4", "<4 x float>"),
         ("point_coord", "float2", "<2 x float>"),
         ("front_facing", "bool", "i1"),
+        ("front_facing", "uint", "i32"),
     ] {
         assert!(
             translate_sanitized_native(&build(role, name, ty), Stage::Fragment, &tmp()).is_ok(),
@@ -526,7 +530,7 @@ entry:
     for (role, name, ty, needle) in [
         ("position", "float2", "<2 x float>", "float4"),
         ("point_coord", "float4", "<4 x float>", "float2"),
-        ("front_facing", "uint", "i32", "bool"),
+        ("front_facing", "float", "float", "bool"),
     ] {
         match translate_sanitized_native(&build(role, name, ty), Stage::Fragment, &tmp()) {
             Ok(spv) => panic!(

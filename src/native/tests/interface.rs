@@ -886,6 +886,260 @@ attributes #0 = { nounwind }
     }
 }
 
+/// A fragment whose `[[front_facing]]` parameter has the body type `param_ty` and picks red for a
+/// front face and blue for a back face. An `i1` flag drives the branch directly; any other type is
+/// compared against zero first, which is how a body that carries the flag as `i8`/`i32` reads it.
+fn front_facing_fragment(param_ty: &str) -> String {
+    let (compare, condition) = match param_ty {
+        "i1" => (String::new(), "%front"),
+        "float" => (
+            "  %is_front = fcmp one float %front, 0.000000e+00\n".to_string(),
+            "%is_front",
+        ),
+        int => (
+            format!("  %is_front = icmp ne {int} %front, 0\n"),
+            "%is_front",
+        ),
+    };
+    format!(
+        r#"
+source_filename = "synth_front_facing_typed"
+target datalayout = "e-p:64:64:64"
+target triple = "air64-apple-macosx14.0.0"
+
+define <4 x float> @frag({param_ty} %front) local_unnamed_addr #0 {{
+entry:
+{compare}  br i1 {condition}, label %yes, label %no
+
+yes:
+  ret <4 x float> <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>
+
+no:
+  ret <4 x float> <float 0.000000e+00, float 0.000000e+00, float 1.000000e+00, float 1.000000e+00>
+}}
+
+attributes #0 = {{ nounwind }}
+
+!air.fragment = !{{!0}}
+!0 = !{{ptr @frag, !1, !3}}
+!1 = !{{!2}}
+!2 = !{{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}}
+!3 = !{{!4}}
+!4 = !{{i32 0, !"air.front_facing", !"air.arg_type_name", !"bool", !"air.arg_name", !"front"}}
+"#
+    )
+}
+
+/// Every `OpLoad` of the module's one `FrontFacing` variable, after checking that variable is an
+/// Input `OpTypeBool` listed in the entry point interface and that each load yields that bool.
+fn front_facing_bool_loads(module: &Module) -> Vec<Word> {
+    let vars = module
+        .annotations
+        .iter()
+        .filter_map(|inst| match inst.operands.as_slice() {
+            [
+                Operand::IdRef(var),
+                Operand::Decoration(Decoration::BuiltIn),
+                Operand::BuiltIn(BuiltIn::FrontFacing),
+            ] => Some(*var),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [var] = vars.as_slice() else {
+        panic!("expected exactly one FrontFacing variable, found {vars:?}");
+    };
+    assert_eq!(
+        variable_storage_class(module, *var),
+        Some(StorageClass::Input),
+        "FrontFacing must be an Input variable"
+    );
+    let bool_ty = variable_pointee_type(module, *var).expect("FrontFacing pointee type");
+    assert!(
+        module
+            .types_global_values
+            .iter()
+            .any(|inst| inst.class.opcode == Op::TypeBool && inst.result_id == Some(bool_ty)),
+        "FrontFacing is a boolean builtin; its variable must point at OpTypeBool"
+    );
+    assert!(
+        module.entry_points.iter().any(|inst| inst
+            .operands
+            .iter()
+            .skip(3)
+            .any(|operand| *operand == Operand::IdRef(*var))),
+        "FrontFacing must be part of the entry point interface"
+    );
+    let loads = module
+        .functions
+        .iter()
+        .flat_map(|function| function.all_inst_iter())
+        .filter(|inst| {
+            inst.class.opcode == Op::Load && inst.operands.first() == Some(&Operand::IdRef(*var))
+        })
+        .map(|inst| {
+            assert_eq!(
+                inst.result_type,
+                Some(bool_ty),
+                "FrontFacing loads as a bool"
+            );
+            inst.result_id.expect("load result")
+        })
+        .collect::<Vec<_>>();
+    assert!(!loads.is_empty(), "FrontFacing must be read");
+    loads
+}
+
+/// Whether any function-body instruction reads `id` as an operand.
+fn is_consumed(module: &Module, id: Word) -> bool {
+    module
+        .functions
+        .iter()
+        .flat_map(|function| function.all_inst_iter())
+        .any(|inst| inst.operands.contains(&Operand::IdRef(id)))
+}
+
+/// A `[[front_facing]]` parameter whose body type is an integer rather than `i1` reads the boolean
+/// builtin and selects 1 or 0 of its own integer type.
+///
+/// `FrontFacing` is `OpTypeBool`, so nothing can be loaded straight into an `i32` or `i8` parameter.
+/// The parameter used to be refused ("is not a bool"); it now loads the bool and `OpSelect`s the
+/// parameter type's own 1 and 0, so a front face stays non-zero and a back face stays zero. The
+/// constants must be 1/0 in that order — swapped, every triangle would read as facing the other way
+/// in a module that validates. An `i8` stays an 8-bit integer (with `Int8`), not a widened `i32`,
+/// because the select's result replaces the parameter in the body's own `i8` compare.
+///
+/// `translate_sanitized_native` runs spirv-val as its sole acceptance boundary, so `Ok` already means
+/// the module validated; the structure below pins what it validated as.
+#[test]
+fn native_fragment_integer_front_facing_selects_from_the_bool_builtin() {
+    for (param_ty, width) in [("i32", 32u32), ("i8", 8)] {
+        let tmp = std::env::temp_dir().join(format!(
+            "metal2vulkan_fragment_front_facing_{param_ty}_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&tmp);
+        let ll = front_facing_fragment(param_ty);
+        let spv = crate::translate_sanitized_native(&ll, Stage::Fragment, &tmp)
+            .unwrap_or_else(|e| panic!("[[front_facing]] typed {param_ty} must translate: {e}"));
+        let asm = disassemble(&spv).expect("disassemble");
+        let module = load_bytes(&spv).expect("parse transformed");
+        let loads = front_facing_bool_loads(&module);
+        let definitions = module
+            .all_inst_iter()
+            .filter_map(|inst| Some((inst.result_id?, inst)))
+            .collect::<HashMap<_, _>>();
+
+        let selects = module
+            .functions
+            .iter()
+            .flat_map(|function| function.all_inst_iter())
+            .filter(|inst| inst.class.opcode == Op::Select)
+            .filter_map(|inst| match inst.operands.as_slice() {
+                [Operand::IdRef(condition), Operand::IdRef(on_true), Operand::IdRef(on_false)]
+                    if loads.contains(condition) =>
+                {
+                    Some((inst, *on_true, *on_false))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(select, on_true, on_false)] = selects.as_slice() else {
+            panic!(
+                "expected one OpSelect on the FrontFacing load for {param_ty}, found {}:\n{asm}",
+                selects.len()
+            );
+        };
+        let int_ty = select.result_type.expect("select result type");
+        let int_def = definitions[&int_ty];
+        assert_eq!(int_def.class.opcode, Op::TypeInt, "{param_ty}:\n{asm}");
+        assert_eq!(
+            int_def.operands.first(),
+            Some(&Operand::LiteralBit32(width)),
+            "the select yields the parameter's own {width}-bit integer:\n{asm}"
+        );
+        for (id, value) in [(*on_true, 1), (*on_false, 0)] {
+            let constant = definitions[&id];
+            assert_eq!(constant.class.opcode, Op::Constant, "{param_ty}:\n{asm}");
+            assert_eq!(constant.result_type, Some(int_ty), "{param_ty}:\n{asm}");
+            assert_eq!(
+                constant.operands.as_slice(),
+                [Operand::LiteralBit32(value)],
+                "a front face selects 1 and a back face 0 ({param_ty}):\n{asm}"
+            );
+        }
+        let selected = select.result_id.expect("select result");
+        assert!(
+            is_consumed(&module, selected),
+            "the selected integer must replace the parameter in the body ({param_ty}):\n{asm}"
+        );
+        if width == 8 {
+            assert!(
+                module.capabilities.iter().any(|inst| matches!(
+                    inst.operands.as_slice(),
+                    [Operand::Capability(Capability::Int8)]
+                )),
+                "an 8-bit integer parameter needs Int8:\n{asm}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+}
+
+/// The `i1` form of the same parameter keeps loading the bool straight into the body, with no
+/// integer select in between.
+#[test]
+fn native_fragment_bool_front_facing_loads_the_builtin_directly() {
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_front_facing_i1_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv =
+        crate::translate_sanitized_native(&front_facing_fragment("i1"), Stage::Fragment, &tmp)
+            .expect("[[front_facing]] typed i1 must translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("parse transformed");
+    for load in &front_facing_bool_loads(&module) {
+        assert!(
+            !module
+                .functions
+                .iter()
+                .flat_map(|function| function.all_inst_iter())
+                .any(|inst| inst.class.opcode == Op::Select
+                    && inst.operands.first() == Some(&Operand::IdRef(*load))),
+            "a bool parameter needs no select:\n{asm}"
+        );
+        assert!(
+            is_consumed(&module, *load),
+            "the bool load must reach the body:\n{asm}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+/// Accepting integers did not open the door to other types: `FrontFacing` has no honest reading as
+/// a float, so a `float` `[[front_facing]]` parameter still falls back.
+#[test]
+fn native_fragment_float_front_facing_still_fallbacks() {
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_fragment_front_facing_float_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    match crate::translate_sanitized_native(&front_facing_fragment("float"), Stage::Fragment, &tmp)
+    {
+        Ok(spv) => panic!(
+            "a float [[front_facing]] must FALLBACK, got {} bytes",
+            spv.len()
+        ),
+        Err(e) => assert!(
+            e.contains("front_facing") && e.contains("bool"),
+            "the diagnostic should name the attribute and the type it needs; got: {e}"
+        ),
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
 #[test]
 fn native_fragment_primitive_id_maps_to_primitiveid_builtin() {
     let ll = r#"

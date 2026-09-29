@@ -77,6 +77,33 @@ pub(in crate::passes) fn apply_bindings(
                 ));
                 splices.push((pid, converted));
             }
+            ParamBinding::LoadBoolAsInt {
+                var,
+                bool_ty,
+                param_ty,
+            } => {
+                let lid = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Load,
+                    Some(bool_ty),
+                    Some(lid),
+                    vec![Operand::IdRef(var)],
+                ));
+                let one = ctx.const_int_of(param_ty, 1);
+                let zero = ctx.const_int_of(param_ty, 0);
+                let selected = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Select,
+                    Some(param_ty),
+                    Some(selected),
+                    vec![
+                        Operand::IdRef(lid),
+                        Operand::IdRef(one),
+                        Operand::IdRef(zero),
+                    ],
+                ));
+                splices.push((pid, selected));
+            }
             ParamBinding::LoadVarConverted {
                 var,
                 load_ty,

@@ -77,6 +77,14 @@ pub(in crate::passes) enum ParamBinding {
     /// A scalar fragment bool varying. Vulkan user IO cannot use OpTypeBool, so the interface slot is
     /// a flat uint and the loaded value is compared against zero at function entry.
     LoadVarBoolFromUint { var: Word, bool_ty: Word },
+    /// The boolean `FrontFacing` builtin feeding an integer `[[front_facing]]` parameter (a body that
+    /// carries the flag as `i8`/`i32` rather than `i1`): load the bool, then select 1 or 0 of the
+    /// parameter's own integer type, so a front face still reads as non-zero.
+    LoadBoolAsInt {
+        var: Word,
+        bool_ty: Word,
+        param_ty: Word,
+    },
     /// A scalar builtin Input var (`VertexIndex`/`InstanceIndex`, a 32-bit uint) feeding a NARROWER
     /// integer param (`ushort [[instance_id]]`, an i16): load the uint then `OpUConvert` it down to the
     /// param's own width, so the body's 16-bit uses (`OpBitwiseAnd %ushort`) are width-consistent.
@@ -1913,28 +1921,42 @@ pub(super) fn build_stage_input(
             bindings.push((*pid, ParamBinding::LoadVar { var, ty: v3 }));
         } else if role_is("front_facing") {
             let bool_ty = ctx.ty_bool();
+            let is_int = defs
+                .get(pty)
+                .is_some_and(|definition| definition.class.opcode == Op::TypeInt);
+            if *pty != bool_ty && !is_int {
+                return Err(format!(
+                    "[[front_facing]] parameter {idx} is neither a bool nor an integer; FrontFacing \
+                     is a boolean builtin and reading a zero in its place claims every triangle is \
+                     back-facing"
+                ));
+            }
+            let var = if let Some(v) = front_facing_var {
+                v
+            } else {
+                let pptr = ctx.ty_ptr(StorageClass::Input, bool_ty);
+                let var = ctx.module.fresh_id();
+                ctx.new_globals.push(Instruction::new(
+                    Op::Variable,
+                    Some(pptr),
+                    Some(var),
+                    vec![Operand::StorageClass(StorageClass::Input)],
+                ));
+                decorate_builtin(&mut ctx.module, var, BuiltIn::FrontFacing);
+                ctx.interface.push(var);
+                front_facing_var = Some(var);
+                var
+            };
             if *pty == bool_ty {
-                let var = if let Some(v) = front_facing_var {
-                    v
-                } else {
-                    let pptr = ctx.ty_ptr(StorageClass::Input, bool_ty);
-                    let var = ctx.module.fresh_id();
-                    ctx.new_globals.push(Instruction::new(
-                        Op::Variable,
-                        Some(pptr),
-                        Some(var),
-                        vec![Operand::StorageClass(StorageClass::Input)],
-                    ));
-                    decorate_builtin(&mut ctx.module, var, BuiltIn::FrontFacing);
-                    ctx.interface.push(var);
-                    front_facing_var = Some(var);
-                    var
-                };
                 bindings.push((*pid, ParamBinding::LoadVar { var, ty: bool_ty }));
             } else {
-                return Err(format!(
-                    "[[front_facing]] parameter {idx} is not a bool; FrontFacing is a boolean \
-                     builtin and reading a zero in its place claims every triangle is back-facing"
+                bindings.push((
+                    *pid,
+                    ParamBinding::LoadBoolAsInt {
+                        var,
+                        bool_ty,
+                        param_ty: *pty,
+                    },
                 ));
             }
         } else if role_is("primitive_id") {
