@@ -116,8 +116,9 @@ declare float @llvm.minnum.f32(float, float)
         .flat_map(|w| w.to_le_bytes())
         .collect::<Vec<_>>();
     let asm = disassemble(&out).expect("disassemble transformed");
-    assert!(asm.lines().any(|line| line.contains(" FMax ")), "{asm}");
-    assert!(asm.lines().any(|line| line.contains(" FMin ")), "{asm}");
+    // Metal's fmax/fmin and LLVM's maxnum/minnum return the non-NaN operand: NMax/NMin.
+    assert!(asm.lines().any(|line| line.contains(" NMax ")), "{asm}");
+    assert!(asm.lines().any(|line| line.contains(" NMin ")), "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
     assert!(!asm.contains("llvm.maxnum"), "{asm}");
     assert!(!asm.contains("llvm.minnum"), "{asm}");

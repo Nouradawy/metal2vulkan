@@ -229,12 +229,16 @@ pub(in crate::passes) fn glsl_extinst(name: &str) -> Option<GLSLstd450> {
         || is_air_math(name, "fmax")
         || is_air_math(name, "max")
     {
-        FMax
+        // Metal: "If one argument is a NaN, fmax() returns the other argument",
+        // and `llvm.maxnum` is IEEE maxNum. That is NMax; FMax leaves the NaN
+        // case undefined, and a GPU that returns the NaN turns one degenerate
+        // path edge into a streak across RenderBox's coverage accumulator.
+        NMax
     } else if name.starts_with("llvm.minnum.")
         || is_air_math(name, "fmin")
         || is_air_math(name, "min")
     {
-        FMin
+        NMin
     } else if is_air_math(name, "sqrt") {
         Sqrt
     } else if is_air_math(name, "rsqrt") {
@@ -288,7 +292,8 @@ pub(in crate::passes) fn glsl_extinst(name: &str) -> Option<GLSLstd450> {
     } else if is_air_math(name, "fma") || name.starts_with("llvm.fmuladd.") {
         Fma
     } else if is_air_math(name, "clamp") {
-        FClamp
+        // Metal defines clamp as fmin(fmax(x, lo), hi), so a NaN clamps to lo.
+        NClamp
     } else {
         return None;
     })

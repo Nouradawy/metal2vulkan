@@ -397,11 +397,11 @@ declare float @air.fast_fmedian3.f32(float, float, float)
     let asm = disassemble(&out).expect("disassemble transformed");
     let fmax_count = asm
         .lines()
-        .filter(|line| line.contains("OpExtInst") && line.contains(" FMax "))
+        .filter(|line| line.contains("OpExtInst") && line.contains(" NMax "))
         .count();
     let fmin_count = asm
         .lines()
-        .filter(|line| line.contains("OpExtInst") && line.contains(" FMin "))
+        .filter(|line| line.contains("OpExtInst") && line.contains(" NMin "))
         .count();
     assert_eq!(fmax_count, 4, "{asm}");
     assert_eq!(fmin_count, 4, "{asm}");

@@ -538,9 +538,9 @@ pub(in crate::passes) fn lower_float_math(
     // invalid OpExtInst.
     if args.len() == 3 {
         let ternary_minmax = if name.contains("fmax3") {
-            Some(GLSLstd450::FMax)
+            Some(GLSLstd450::NMax)
         } else if name.contains("fmin3") {
-            Some(GLSLstd450::FMin)
+            Some(GLSLstd450::NMin)
         } else if name.starts_with("air.max3.u.") {
             Some(GLSLstd450::UMax)
         } else if name.starts_with("air.min3.u.") {
@@ -593,7 +593,7 @@ pub(in crate::passes) fn lower_float_math(
                 Some(min_ab),
                 vec![
                     Operand::IdRef(ext),
-                    Operand::LiteralExtInstInteger(GLSLstd450::FMin as u32),
+                    Operand::LiteralExtInstInteger(GLSLstd450::NMin as u32),
                     Operand::IdRef(args[0]),
                     Operand::IdRef(args[1]),
                 ],
@@ -604,7 +604,7 @@ pub(in crate::passes) fn lower_float_math(
                 Some(max_ab),
                 vec![
                     Operand::IdRef(ext),
-                    Operand::LiteralExtInstInteger(GLSLstd450::FMax as u32),
+                    Operand::LiteralExtInstInteger(GLSLstd450::NMax as u32),
                     Operand::IdRef(args[0]),
                     Operand::IdRef(args[1]),
                 ],
@@ -615,7 +615,7 @@ pub(in crate::passes) fn lower_float_math(
                 Some(min_max_ab_c),
                 vec![
                     Operand::IdRef(ext),
-                    Operand::LiteralExtInstInteger(GLSLstd450::FMin as u32),
+                    Operand::LiteralExtInstInteger(GLSLstd450::NMin as u32),
                     Operand::IdRef(max_ab),
                     Operand::IdRef(args[2]),
                 ],
@@ -626,7 +626,7 @@ pub(in crate::passes) fn lower_float_math(
                 Some(res),
                 vec![
                     Operand::IdRef(ext),
-                    Operand::LiteralExtInstInteger(GLSLstd450::FMax as u32),
+                    Operand::LiteralExtInstInteger(GLSLstd450::NMax as u32),
                     Operand::IdRef(min_ab),
                     Operand::IdRef(min_max_ab_c),
                 ],
@@ -692,7 +692,8 @@ pub(in crate::passes) fn lower_float_math(
             ops,
         )]);
     }
-    // saturate(x) = FClamp(x, 0, 1); needs synthesized 0/1 constants of the result ELEMENT type
+    // saturate(x) = NClamp(x, 0, 1) — Metal's clamp is fmin(fmax(x, 0), 1), so saturate(NaN) is 0,
+    // which FClamp leaves undefined. Needs synthesized 0/1 constants of the result ELEMENT type
     // (half `air.saturate.f16` -> half 0/1; float -> float 0/1; else spirv-val rejects the mismatch).
     if name.contains("saturate") && args.len() == 1 {
         let ext = ctx.glsl();
@@ -706,7 +707,7 @@ pub(in crate::passes) fn lower_float_math(
             Some(res),
             vec![
                 Operand::IdRef(ext),
-                Operand::LiteralExtInstInteger(GLSLstd450::FClamp as u32),
+                Operand::LiteralExtInstInteger(GLSLstd450::NClamp as u32),
                 Operand::IdRef(args[0]),
                 Operand::IdRef(lo),
                 Operand::IdRef(hi),

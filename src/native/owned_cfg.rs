@@ -2147,7 +2147,7 @@ fn glsl_ext_inst_contract(number: u32) -> Option<GlslExtInstContract> {
             arity: 2,
             width_16_or_32: true,
         }),
-        Glsl::FMin | Glsl::FMax => Some(FloatSame {
+        Glsl::FMin | Glsl::FMax | Glsl::NMin | Glsl::NMax => Some(FloatSame {
             arity: 2,
             width_16_or_32: false,
         }),
