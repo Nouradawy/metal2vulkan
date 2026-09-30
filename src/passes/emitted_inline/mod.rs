@@ -1164,6 +1164,12 @@ fn inline_one_call(
         })
         .collect::<HashMap<_, _>>();
     let mut elided_aggregate_extracts = HashSet::new();
+    let callee_definitions = callee
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+        .collect::<HashMap<_, _>>();
     for instruction in callee.blocks.iter().flat_map(|block| &block.instructions) {
         if instruction.class.opcode != Op::CompositeExtract {
             continue;
@@ -1173,21 +1179,20 @@ fn inline_one_call(
         else {
             continue;
         };
-        let Some(root) = remap.get(composite).copied() else {
+        let Some(path) = extract_path(instruction) else {
             continue;
         };
-        let Some(path) = instruction
-            .operands
-            .iter()
-            .skip(1)
-            .map(|operand| match operand {
-                Operand::LiteralBit32(index) => Some(*index),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
+        // A pointer reached through a nested by-value aggregate arrives as an extract of an
+        // extract: `sampler { ptr } = Sampler_h.1`, then `ptr = sampler.0`. The sidecar fact names
+        // the outermost aggregate and the whole path, so fold the chain -- inside the callee down
+        // to one of its parameters, then in the caller down to the aggregate the fact was recorded
+        // on -- before asking. An unfolded chain matched no fact, kept the integer payload slot,
+        // and a sample's sampler then fell to the image pass's synthesized default.
+        let (local_root, path) = fold_extract_chain(*composite, path, &callee_definitions);
+        let Some(root) = remap.get(&local_root).copied() else {
             continue;
         };
+        let (root, path) = fold_extract_chain(root, path, &definitions);
         if let Some(source) = ctx
             .emit_sidecar
             .aggregate_pointer_values
@@ -1365,6 +1370,48 @@ fn inline_one_call(
         &byte_view_plan,
         &elided_aggregate_extracts,
     )
+}
+
+/// The literal index path of one `OpCompositeExtract`, or `None` for a dynamic one.
+fn extract_path(instruction: &Instruction) -> Option<Vec<u32>> {
+    instruction
+        .operands
+        .iter()
+        .skip(1)
+        .map(|operand| match operand {
+            Operand::LiteralBit32(index) => Some(*index),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Fold a chain of literal `OpCompositeExtract`s ending at `value` into its root aggregate and the
+/// concatenated path: `extract(extract(a, [1]), [0])` asked at `[..]` is `a` asked at `[1, 0, ..]`.
+/// Stops at the first value `definitions` does not define as such an extract.
+fn fold_extract_chain(
+    mut value: Word,
+    mut path: Vec<u32>,
+    definitions: &HashMap<Word, &Instruction>,
+) -> (Word, Vec<u32>) {
+    let mut visited = HashSet::new();
+    while visited.insert(value) {
+        let Some(definition) = definitions.get(&value) else {
+            break;
+        };
+        if definition.class.opcode != Op::CompositeExtract {
+            break;
+        }
+        let (Some(Operand::IdRef(composite)), Some(prefix)) =
+            (definition.operands.first(), extract_path(definition))
+        else {
+            break;
+        };
+        let mut full = prefix;
+        full.extend_from_slice(&path);
+        path = full;
+        value = *composite;
+    }
+    (value, path)
 }
 
 fn resolve_inserted_object(

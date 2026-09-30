@@ -1195,6 +1195,47 @@ impl Emitter {
         let result_type = self.type_id(&result_ty)?;
         let result = self.result_id(&name, &result_ty)?;
         let composite_id = self.value_id_in(&composite.value, &composite.ty, instructions)?;
+        // An extract that yields a nested aggregate carries the logical pointers that aggregate
+        // holds, re-rooted under the remaining path -- the mirror of `emit_insertvalue_typed`, which
+        // folds a nested aggregate's pointers into its container. Without this the payload slot is
+        // all that survives: a pointer reached through two levels (CoreImage's
+        // `Sampler_h { texture2d { ptr }, sampler { ptr }, .. }`, extracted field by field into a
+        // helper) resolves to the integer placeholder instead of its descriptor, and the image pass
+        // then substitutes its synthesized default sampler for the guest's own.
+        if !matches!(result_ty, LlType::Ptr(_)) {
+            if let LlValue::Local(composite_name) = &composite.value {
+                let nested = self
+                    .aggregate_pointer_values
+                    .get(composite_name)
+                    .map(|pointers| {
+                        pointers
+                            .iter()
+                            .filter_map(|(path, pointer)| {
+                                path.strip_prefix(indices)
+                                    .filter(|suffix| !suffix.is_empty())
+                                    .map(|suffix| (suffix.to_vec(), pointer.clone()))
+                            })
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                if !nested.is_empty() {
+                    if !self.bda_device_pointers {
+                        for (path, pointer) in &nested {
+                            let source =
+                                self.value_id_in(&pointer.value, &pointer.ty, instructions)?;
+                            self.emit_sidecar.aggregate_pointer_values.push(
+                                crate::emit_sidecar::AggregatePointerValue {
+                                    aggregate: result,
+                                    source,
+                                    indices: path.clone(),
+                                },
+                            );
+                        }
+                    }
+                    self.aggregate_pointer_values.insert(name.clone(), nested);
+                }
+            }
+        }
         if self.bda_device_pointers {
             if let LlValue::Local(composite_name) = &composite.value {
                 if let Some(addresses) = self.bda_aggregate_addresses.get(composite_name).cloned() {

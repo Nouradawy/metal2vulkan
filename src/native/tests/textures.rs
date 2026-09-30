@@ -1215,6 +1215,152 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     let _ = std::fs::remove_dir_all(tmp);
 }
 
+/// CoreImage's stitched kernels carry each texture and sampler through a two-level by-value
+/// aggregate -- `Sampler_h { texture2d { ptr }, sampler { ptr }, .. }` -- built by one helper and
+/// taken apart field by field in another. The pointer inside the nested member has to survive the
+/// outer extract: before it did, the sample's sampler resolved to the aggregate's integer payload
+/// slot, the image pass substituted its synthesized `get_read_sampler` default (an extra binding
+/// no reflection names), and the device bound a normalized default in place of the guest's
+/// sampler. On macOS 26 that emptied every System Settings sidebar glyph.
+///
+/// Two textures and two samplers, so neither side can be satisfied by a "the only sampled image"
+/// fallback: each `OpSampledImage` must pair texture N with sampler N, and no sampler binding may
+/// exist beyond the two the kernel declares (Metal indices 0 and 2, bindings 160 and 162).
+#[test]
+fn native_nested_aggregate_sampler_and_texture_reach_their_descriptors() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+%"struct.metal::sampler" = type { ptr addrspace(2) }
+%SamplerH = type { %"struct.metal::texture2d", %"struct.metal::sampler", <2 x float> }
+
+define void @k(ptr addrspace(1) %tex0, ptr addrspace(1) %tex1, ptr addrspace(2) %samp0, ptr addrspace(2) %samp2, ptr addrspace(1) %out) {
+entry:
+  %h0 = call fastcc %SamplerH @builder(ptr addrspace(1) %tex0, ptr addrspace(2) %samp0, <2 x float> <float 2.500000e-01, float 2.500000e-01>)
+  %h1 = call fastcc %SamplerH @builder(ptr addrspace(1) %tex1, ptr addrspace(2) %samp2, <2 x float> <float 7.500000e-01, float 7.500000e-01>)
+  %c0 = call fastcc <4 x float> @apply(%SamplerH %h0)
+  %c1 = call fastcc <4 x float> @apply(%SamplerH %h1)
+  %sum = fadd <4 x float> %c0, %c1
+  store <4 x float> %sum, ptr addrspace(1) %out, align 16
+  ret void
+}
+
+define internal fastcc %SamplerH @builder(ptr addrspace(1) %t, ptr addrspace(2) %s, <2 x float> %uv) {
+  %a = insertvalue %SamplerH poison, ptr addrspace(1) %t, 0, 0
+  %b = insertvalue %SamplerH %a, ptr addrspace(2) %s, 1, 0
+  %c = insertvalue %SamplerH %b, <2 x float> %uv, 2
+  ret %SamplerH %c
+}
+
+define internal fastcc <4 x float> @apply(%SamplerH %h) {
+  %t = extractvalue %SamplerH %h, 0
+  %s = extractvalue %SamplerH %h, 1
+  %uv = extractvalue %SamplerH %h, 2
+  %color = call fastcc <4 x float> @sample(%"struct.metal::texture2d" %t, %"struct.metal::sampler" %s, <2 x float> %uv)
+  ret <4 x float> %color
+}
+
+define internal fastcc <4 x float> @sample(%"struct.metal::texture2d" %t, %"struct.metal::sampler" %s, <2 x float> %uv) {
+  %tp = extractvalue %"struct.metal::texture2d" %t, 0
+  %sp = extractvalue %"struct.metal::sampler" %s, 0
+  %r = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tp, ptr addrspace(2) %sp, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %r, 0
+  ret <4 x float> %color
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex0"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex1"}
+!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"samp0"}
+!6 = !{i32 3, !"air.sampler", !"air.location_index", i32 2, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"samp2"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_nested_aggregate_sampler_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
+        .expect("translate sampler and texture carried through a nested aggregate");
+    let asm = disassemble(&spv).expect("disassemble");
+
+    // `%var` -> binding, then `%loaded` -> binding of the variable it loads.
+    let mut binding_of: HashMap<String, u32> = HashMap::new();
+    for line in asm.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if let ["OpDecorate", var, "Binding", binding] = words.as_slice() {
+            binding_of.insert((*var).to_string(), binding.parse().expect("binding"));
+        }
+    }
+    let mut loaded: HashMap<String, u32> = HashMap::new();
+    for line in asm.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if let [result, "=", "OpLoad", _, pointer, ..] = words.as_slice() {
+            if let Some(binding) = binding_of.get(*pointer) {
+                loaded.insert((*result).to_string(), *binding);
+            }
+        }
+    }
+    let mut pairs: Vec<(u32, u32)> = asm
+        .lines()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            match words.as_slice() {
+                [_, "=", "OpSampledImage", _, image, sampler] => Some((
+                    *loaded.get(*image).unwrap_or(&u32::MAX),
+                    *loaded.get(*sampler).unwrap_or(&u32::MAX),
+                )),
+                _ => None,
+            }
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let texture0 = crate::reflect::DescriptorLayout::default()
+        .sampled_texture_binding(0)
+        .expect("texture 0 binding");
+    let texture1 = crate::reflect::DescriptorLayout::default()
+        .sampled_texture_binding(1)
+        .expect("texture 1 binding");
+    let sampler0 = crate::reflect::DescriptorLayout::default()
+        .sampler_binding(0)
+        .expect("sampler 0 binding");
+    let sampler2 = crate::reflect::DescriptorLayout::default()
+        .sampler_binding(2)
+        .expect("sampler 2 binding");
+    assert_eq!(
+        pairs,
+        vec![(texture0, sampler0), (texture1, sampler2)],
+        "{asm}"
+    );
+    let sampler_bindings: HashSet<u32> = binding_of
+        .values()
+        .copied()
+        .filter(|binding| {
+            let layout = crate::reflect::DescriptorLayout::default();
+            (layout.samplers.start..layout.samplers.end).contains(binding)
+        })
+        .collect();
+    assert_eq!(
+        sampler_bindings,
+        HashSet::from([sampler0, sampler2]),
+        "no synthesized sampler may appear beside the two the kernel declares:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
 #[test]
 fn native_texture_and_sampler_binding_bands_cover_high_and_last_abi_indices() {
     let ll = r#"
