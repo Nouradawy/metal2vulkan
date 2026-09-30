@@ -686,9 +686,41 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
         }
     }
 
-    let single = KERNEL
+    // The ordinary spelling of one sampler is the pointer parameter itself. Rewriting only the
+    // metadata count while the body still loads element 5 of a by-value array is not that: the
+    // load resolves to no descriptor either way, and it used to "translate" only because the
+    // sample silently took the synthesized default sampler. It now refuses like the array does.
+    let byval_single = KERNEL
         .replace("i32 COUNT", "i32 1")
         .replace("SAMPLER_TYPE", "sampler");
+    match translate_sanitized_native(&byval_single, Stage::Kernel, &tmp()) {
+        Ok(spv) => panic!(
+            "a sample through an element load that resolves to no sampler descriptor translated \
+             ({} bytes) instead of refusing",
+            spv.len()
+        ),
+        Err(e) => assert!(
+            e.contains("does not resolve to a Metal sampler argument"),
+            "the diagnostic should say why; got: {e}"
+        ),
+    }
+    let single = KERNEL
+        .replace(
+            "ptr readonly byval([8 x ptr addrspace(2)]) captures(none) %samps",
+            "ptr addrspace(2) %samps",
+        )
+        .replace(
+            "  %slot = getelementptr inbounds [8 x ptr addrspace(2)], ptr %samps, i32 0, i32 5\n  \
+             %s = load ptr addrspace(2), ptr %slot, align 8\n",
+            "",
+        )
+        .replace("ptr addrspace(2) %s,", "ptr addrspace(2) %samps,")
+        .replace("i32 COUNT", "i32 1")
+        .replace("SAMPLER_TYPE", "sampler");
+    assert!(
+        !single.contains("byval") && !single.contains("%slot"),
+        "the single-sampler rewrite must not leave the array spelling behind:\n{single}"
+    );
     assert!(
         translate_sanitized_native(&single, Stage::Kernel, &tmp()).is_ok(),
         "the same kernel with an ordinary single sampler must translate"

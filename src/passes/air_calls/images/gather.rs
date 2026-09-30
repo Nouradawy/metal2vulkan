@@ -167,7 +167,7 @@ pub(in crate::passes) fn lower_gather_2d(
     }
 
     let si_ty = ctx.ty_sampled_image(img_ty);
-    let samp = valid_sampler_value(ctx, samp, &mut out)?;
+    let samp = valid_sampler_value(ctx, samp, &mut out, SamplerUse::Gather)?;
     let si = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::SampledImage,
@@ -429,10 +429,24 @@ pub(in crate::passes) fn pixel_gather_fetch_offset(
     Ok((None, Some(shifted)))
 }
 
+/// What an image instruction does with the sampler operand [`valid_sampler_value`] resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::passes) enum SamplerUse {
+    Sample,
+    Gather,
+    DepthSample,
+    DepthCompare,
+    /// A cube texel read lowered as a nearest sample: Metal's `read` is sampler-less.
+    CubeRead,
+    /// A float LOD query.
+    LodQuery,
+}
+
 pub(in crate::passes) fn valid_sampler_value(
     ctx: &mut Ctx,
     samp: Word,
     out: &mut Vec<Instruction>,
+    usage: SamplerUse,
 ) -> Result<Word, String> {
     validate_runtime_sampler_specialization(ctx, samp)?;
     let sty = ctx.ty_sampler();
@@ -443,11 +457,25 @@ pub(in crate::passes) fn valid_sampler_value(
         return Err("air.sample_texture sampler operand is not a sampler".into());
     }
 
-    // AIR can select between embedded `__air_sampler_state` globals before sampling. The native
-    // pointer-select fallback leaves that selected sampler as a private placeholder, and same-pass
-    // `air.get_read_sampler()` replacement can still look pointer-typed to this query. Neither form is
-    // a legal OpSampledImage sampler operand, so materialize the same default sampler resource used by
-    // sampler-less reads.
+    // What is left is a pointer this pass cannot trace to a descriptor: a sampler selected between
+    // embedded `__air_sampler_state` globals (the native pointer-select fallback leaves a private
+    // placeholder), one loaded out of a by-value sampler array, or one whose aggregate carrier lost
+    // track of it. Substituting the translator's default read sampler keeps the module valid but
+    // samples with a filter, addressing mode and coordinate normalization nobody asked for -- it
+    // emptied every macOS 26 System Settings sidebar glyph, a CoreImage downsample reading past the
+    // edge through the default. So only the two uses whose Metal form has no sampler of its own may
+    // take it: a cube `read` lowered as a nearest sample, and an LOD query that needs a sampler only
+    // to form the operand pair. A real sample or gather refuses by name.
+    if !matches!(usage, SamplerUse::CubeRead | SamplerUse::LodQuery) {
+        let origin = value_inst(ctx, samp)
+            .map(|inst| format!("{:?}", inst.class.opcode))
+            .unwrap_or_else(|| "no defining instruction".to_string());
+        return Err(format!(
+            "{usage:?}: sampler operand %{samp} ({origin}) does not resolve to a Metal sampler \
+             argument or an AIR constexpr sampler state; the translator's default read sampler \
+             would change its filter, addressing and coordinate normalization"
+        ));
+    }
     let var = ctx.default_read_sampler()?;
     let loaded = ctx.module.fresh_id();
     out.push(Instruction::new(

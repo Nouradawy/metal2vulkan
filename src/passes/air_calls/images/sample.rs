@@ -216,7 +216,7 @@ pub(in crate::passes) fn lower_sample(
     let si_ty = ctx.ty_sampled_image(img_ty);
     let si = ctx.module.fresh_id();
     let color = ctx.module.fresh_id();
-    let samp = valid_sampler_value(ctx, samp, &mut out)?;
+    let samp = valid_sampler_value(ctx, samp, &mut out, SamplerUse::Sample)?;
     out.push(Instruction::new(
         Op::SampledImage,
         Some(si_ty),

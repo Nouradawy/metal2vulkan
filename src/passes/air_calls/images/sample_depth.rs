@@ -109,7 +109,7 @@ pub(in crate::passes) fn lower_sample_depth(
         let si_ty = ctx.ty_sampled_image(img_ty);
         let si = ctx.module.fresh_id();
         let color = ctx.module.fresh_id();
-        let samp = valid_sampler_value(ctx, samp, &mut out)?;
+        let samp = valid_sampler_value(ctx, samp, &mut out, SamplerUse::DepthSample)?;
         out.push(Instruction::new(
             Op::SampledImage,
             Some(si_ty),
@@ -314,7 +314,7 @@ pub(in crate::passes) fn lower_sample_compare_depth(
         let si_ty = ctx.ty_sampled_image(img_ty);
         let si = ctx.module.fresh_id();
         let color = ctx.module.fresh_id();
-        let valid_sampler = valid_sampler_value(ctx, samp, &mut out)?;
+        let valid_sampler = valid_sampler_value(ctx, samp, &mut out, SamplerUse::DepthCompare)?;
         out.push(Instruction::new(
             Op::SampledImage,
             Some(si_ty),

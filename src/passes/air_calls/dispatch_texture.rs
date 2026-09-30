@@ -1020,7 +1020,7 @@ pub(in crate::passes) fn lower_calculate_lod_texture_2d(
         ));
     }
     let samp = if comp == crate::passes::ImageComp::Float {
-        valid_sampler_value(ctx, args[1], &mut out)?
+        valid_sampler_value(ctx, args[1], &mut out, SamplerUse::LodQuery)?
     } else {
         // Vulkan rejects linear-filter samplers paired with integer sampled images even for LOD
         // queries. The query only needs a valid sampler/image pair, not the AIR filter mode, so use

@@ -2324,8 +2324,12 @@ declare { float, i8 } @air.sample_depth_2d_array.f32(ptr addrspace(1), ptr addrs
     let _ = std::fs::remove_dir_all(tmp);
 }
 
+/// A sample whose sampler is a `select` between two embedded `__air_sampler_state` globals. The
+/// native pointer-select fallback keeps no descriptor for the selected pointer, and the image pass
+/// used to answer that with its synthesized default read sampler: a valid module sampling with a
+/// filter neither constexpr state names. It is an honest FALLBACK now, naming the use.
 #[test]
-fn native_fragment_selected_static_sampler_uses_valid_sampler_operand() {
+fn native_fragment_selected_static_sampler_refuses_the_default_substitute() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 
@@ -2359,24 +2363,20 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpTypeSampler"), "{asm}");
-    assert!(asm.contains("OpSampledImage"), "{asm}");
-    for line in asm.lines().filter(|line| line.contains("OpSampledImage")) {
-        assert!(!line.contains("Private"), "{line}");
-    }
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
+    let err = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp)
+        .expect_err("a selected constexpr sampler has no descriptor to sample through");
+    assert!(err.contains("Sample:"), "{err}");
+    assert!(
+        err.contains("does not resolve to a Metal sampler argument"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
+/// The depth-comparison form of the selected constexpr sampler: refused the same way, naming the
+/// comparison use.
 #[test]
-fn native_fragment_selected_static_sampler_compare_depth_uses_valid_sampler_operand() {
+fn native_fragment_selected_static_sampler_compare_depth_refuses_the_default_substitute() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 
@@ -2413,20 +2413,14 @@ declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr add
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpTypeSampler"), "{asm}");
-    assert!(asm.contains("OpSampledImage"), "{asm}");
-    for line in asm.lines().filter(|line| line.contains("OpSampledImage")) {
-        assert!(!line.contains("Private"), "{line}");
-    }
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
+    let err = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp)
+        .expect_err("a selected constexpr sampler has no descriptor to sample through");
+    assert!(err.contains("DepthCompare:"), "{err}");
+    assert!(
+        err.contains("does not resolve to a Metal sampler argument"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
