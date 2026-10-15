@@ -2723,6 +2723,8 @@ impl ShaderReflection {
                 VertRole::VertexInput(_)
                 | VertRole::VertexId
                 | VertRole::InstanceId
+                | VertRole::BaseInstance
+                | VertRole::BaseVertex
                 | VertRole::PatchControlPoints
                 | VertRole::PatchInput(_)
                 | VertRole::PositionInPatch

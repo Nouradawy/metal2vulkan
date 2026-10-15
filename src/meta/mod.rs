@@ -376,6 +376,11 @@ pub enum VertRole {
     VertexId,
     /// `[[instance_id]]` -> Input BuiltIn InstanceIndex (32-bit uint).
     InstanceId,
+    /// `[[base_instance]]` -> Input BuiltIn BaseInstance (32-bit uint, `DrawParameters`). Metal's
+    /// `instance_id` already includes it, as Vulkan's `InstanceIndex` includes `firstInstance`.
+    BaseInstance,
+    /// `[[base_vertex]]` -> Input BuiltIn BaseVertex (32-bit uint, `DrawParameters`).
+    BaseVertex,
     /// Opaque Metal patch handle consumed only by the metadata-named control-point accessor.
     PatchControlPoints,
     /// Per-patch user input at the AIR location.
@@ -1997,6 +2002,8 @@ pub const FRAGMENT_INPUT_ROLES: &[&str] = &[
 pub const VERTEX_INPUT_ROLES: &[&str] = &[
     "amplification_count",
     "amplification_id",
+    "base_instance",
+    "base_vertex",
     "buffer",
     "indirect_buffer",
     "instance_id",
@@ -2590,6 +2597,8 @@ fn parse_air_vertex_meta_with_nodes(
                 ),
                 "vertex_id" => VertRole::VertexId,
                 "instance_id" => VertRole::InstanceId,
+                "base_instance" => VertRole::BaseInstance,
+                "base_vertex" => VertRole::BaseVertex,
                 "patch_control_point_input" => {
                     let refs = refs_in(node);
                     let function = refs

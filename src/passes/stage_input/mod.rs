@@ -521,6 +521,8 @@ pub(super) fn build_stage_input(
                 Some(VertRole::Sampler(_)) => s == "sampler",
                 Some(VertRole::VertexId) => s == "vertex_id",
                 Some(VertRole::InstanceId) => s == "instance_id",
+                Some(VertRole::BaseInstance) => s == "base_instance",
+                Some(VertRole::BaseVertex) => s == "base_vertex",
                 Some(VertRole::PatchControlPoints) => s == "patch_control_points",
                 Some(VertRole::PatchInput(_)) => s == "patch_input",
                 Some(VertRole::PositionInPatch) => s == "position_in_patch",
@@ -1519,16 +1521,27 @@ pub(super) fn build_stage_input(
             decorate_patch(&mut ctx.module, var);
             ctx.interface.push(var);
             bindings.push((*pid, ParamBinding::LoadVar { var, ty: *pty }));
-        } else if role_is("vertex_id") || role_is("instance_id") {
+        } else if role_is("vertex_id")
+            || role_is("instance_id")
+            || role_is("base_instance")
+            || role_is("base_vertex")
+        {
             // `[[vertex_id]]`/`[[instance_id]]` -> Input BuiltIn VertexIndex/InstanceIndex. Vulkan
             // requires this builtin to be a 32-bit int Input; the AIR `uint` param lowers to `%uint`,
             // which we use as both the var type and the load type. The body then reads the loaded value
             // (and may OpUConvert it to ulong before indexing — left intact). Without this the param
             // would fall through to ZeroValue/OpUndef and every vertex would read the same LUT entry.
+            // `[[base_instance]]`/`[[base_vertex]]` -> BaseInstance/BaseVertex: the same 32-bit uint Input
+            // shape, under `DrawParameters` (module cleanup declares it). Metal's `instance_id`/`vertex_id`
+            // already include the bases, exactly as Vulkan's InstanceIndex/VertexIndex do.
             let builtin = if role_is("vertex_id") {
                 BuiltIn::VertexIndex
-            } else {
+            } else if role_is("instance_id") {
                 BuiltIn::InstanceIndex
+            } else if role_is("base_instance") {
+                BuiltIn::BaseInstance
+            } else {
+                BuiltIn::BaseVertex
             };
             let uint_ty = ctx.ty_uint();
             // The builtin var is always a 32-bit uint (Vulkan's VertexIndex/InstanceIndex type). If the

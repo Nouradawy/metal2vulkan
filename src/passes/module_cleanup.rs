@@ -378,6 +378,24 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
             }
         }
     }
+    let has_draw_parameters = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+            && matches!(
+                instruction.operands.get(2),
+                Some(&Operand::BuiltIn(BuiltIn::BaseInstance | BuiltIn::BaseVertex))
+            )
+    });
+    if has_draw_parameters {
+        // Core since SPIR-V 1.3; below it the capability needs SPV_KHR_shader_draw_parameters.
+        want.push(Capability::DrawParameters);
+        if let Some(header) = ctx.module.header.as_mut() {
+            let version = header.version();
+            if version < (1, 3) {
+                header.set_version(1, 3);
+            }
+        }
+    }
     let has_layer = ctx.module.annotations.iter().any(|instruction| {
         instruction.class.opcode == Op::Decorate
             && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
