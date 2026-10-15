@@ -353,6 +353,8 @@ struct Ctx {
     /// Exact-thread dispatches use specialization constants; whole-workgroup dispatches use
     /// ordinary constants.
     kernel_local_size_ids: Option<[Word; 3]>,
+    /// The `get_num_samples()` specialization constant, once per module (see `raster_sample_count_spec`).
+    raster_sample_count_spec_id: Option<Word>,
     kernel_workgroup_size_id: Option<Word>,
     /// Shared source for AIR grid builtins and exact boundary-region decomposition.
     kernel_dispatch: crate::reflect::KernelDispatch,
@@ -449,6 +451,7 @@ impl Ctx {
             descriptor_layout: options.descriptor_layout,
             kernel_local_size: options.kernel_local_size,
             kernel_local_size_ids: None,
+            raster_sample_count_spec_id: None,
             kernel_workgroup_size_id: None,
             kernel_dispatch: options
                 .kernel_dispatch
@@ -1353,6 +1356,35 @@ impl Ctx {
         };
         self.kernel_local_size_ids = Some(ids);
         ids
+    }
+
+    /// A `uint` specialization constant, default 1, decorated with
+    /// [`crate::reflect::RASTER_SAMPLE_COUNT_SPEC_ID`]: the pipeline's rasterization sample count when the
+    /// translation was not given it. One per module.
+    pub(in crate::passes) fn raster_sample_count_spec(&mut self) -> Word {
+        if let Some(id) = self.raster_sample_count_spec_id {
+            return id;
+        }
+        let uint_ty = self.ty_uint();
+        let id = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::SpecConstant,
+            Some(uint_ty),
+            Some(id),
+            vec![Operand::LiteralBit32(1)],
+        ));
+        self.module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(id),
+                Operand::Decoration(Decoration::SpecId),
+                Operand::LiteralBit32(crate::reflect::RASTER_SAMPLE_COUNT_SPEC_ID),
+            ],
+        ));
+        self.raster_sample_count_spec_id = Some(id);
+        id
     }
 
     fn kernel_workgroup_size_id(&mut self) -> Word {

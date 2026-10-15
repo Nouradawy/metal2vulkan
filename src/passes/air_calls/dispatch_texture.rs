@@ -943,7 +943,10 @@ pub(in crate::passes) fn lower_get_num_samples_texture(
 
 /// `air.get_num_samples.i32(flags)` returns graphics pipeline state, not a property of an image
 /// operand. Vulkan exposes no equivalent shader query, so translation embeds the exact value the
-/// caller supplied in [`TransformOptions::raster_sample_count`].
+/// caller supplied in [`TransformOptions::raster_sample_count`] - or, when the caller translates once
+/// for every pipeline that shares the module (a translation cache keyed by the shader), a
+/// specialization constant the pipeline sets to its `rasterizationSamples`
+/// ([`crate::reflect::RASTER_SAMPLE_COUNT_SPEC_ID`]).
 pub(in crate::passes) fn lower_raster_sample_count(
     ctx: &mut Ctx,
     name: &str,
@@ -955,11 +958,11 @@ pub(in crate::passes) fn lower_raster_sample_count(
     if ctx.stage != Stage::Fragment {
         return Err(format!("{name} requires fragment stage"));
     }
-    let samples = ctx.raster_sample_count.ok_or_else(|| {
-        format!(
-            "{name} requires TransformOptions::raster_sample_count to match the graphics pipeline"
-        )
-    })?;
+    let Some(samples) = ctx.raster_sample_count else {
+        let uint = ctx.ty_uint();
+        let value = ctx.raster_sample_count_spec();
+        return Ok(vec![copy_or_bitcast_result(rty, res, uint, value)]);
+    };
     if !matches!(samples, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
         return Err(format!(
             "{name} raster sample count {samples} is not a Vulkan sample-count value"

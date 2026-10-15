@@ -97,6 +97,12 @@ pub const KERNEL_DISPATCH_PUSH_CONSTANT_SIZE: u32 = 48;
 /// region. Consumers must specialize all three values when creating each region pipeline.
 pub const KERNEL_LOCAL_SIZE_SPEC_IDS: [u32; 3] = [0, 1, 2];
 
+/// Vulkan specialization-constant id carrying the graphics pipeline's rasterization sample count, for a
+/// fragment shader that calls `get_num_samples()` when the translation was not told the count. Consumers
+/// specialize it with the pipeline's `rasterizationSamples`; unspecialized it reads 1. A pipeline whose
+/// module does not declare it may still name it - Vulkan ignores a map entry no constant uses.
+pub const RASTER_SAMPLE_COUNT_SPEC_ID: u32 = 0x4d53_0001;
+
 /// Default byte offset of the exact-thread dispatch-region payload.
 pub const DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET: u32 = 0;
 
