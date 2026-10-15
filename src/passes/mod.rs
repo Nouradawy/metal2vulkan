@@ -373,7 +373,7 @@ struct Ctx {
     default_sampler_var: Option<Word>,
     /// Descriptor variables the translator invented to give an AIR value a legal SPIR-V type, with
     /// no Metal argument behind them, mapped to the binding each was decorated with. Retracted when
-    /// unconsumed (see [`stage_input::drop_unconsumed_placeholder_descriptor_loads`]); the ones that
+    /// unconsumed (the unconsumed-handle sweep in `module_cleanup`); the ones that
     /// survive are reported to reflection, since no Metal argument would otherwise describe them.
     placeholder_descriptor_vars: HashMap<Word, u32>,
     /// Loaded sampler value ids with an exact static or pipeline-provided state.
@@ -2705,13 +2705,12 @@ pub(crate) fn transform_with_options_and_sidecar(
     // sealing synthesized before global liveness runs.
     decorate_ptr_access_chain_base_strides(&mut ctx);
     ctx.module.types_global_values.append(&mut ctx.new_globals);
-    // `air.get_read_sampler()` and `air.get_null_texture_*()` each needed a real descriptor to type
-    // their result; where nothing ever consumed that value, retract the synthesis before liveness
-    // runs so the descriptor goes too.
-    stage_input::drop_unconsumed_placeholder_descriptor_loads(&mut ctx);
     // The closures above are the last of this boundary's instruction changes, and any of them can
     // delete a variable's last use. Re-establish global liveness against the finished bodies before
-    // the collection that would otherwise root a stranded variable at its own interface entry.
+    // the collection that would otherwise root a stranded variable at its own interface entry. That
+    // includes retracting handle loads nothing consumes -- an unused texture or sampler parameter,
+    // or a synthesized `air.get_read_sampler()` / `air.get_null_texture_*()` placeholder -- so the
+    // descriptor goes with them.
     module_cleanup::drop_unreferenced_global_variables(&mut ctx.module);
     module_cleanup::gc_dead_globals(&mut ctx);
     debug_phase!("complete");

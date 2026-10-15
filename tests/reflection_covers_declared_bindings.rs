@@ -27,7 +27,8 @@ use metal2vulkan::meta::TextureDimension;
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::{
     DescriptorBindingRange, DescriptorLayout, ResourceKind, ShaderReflection,
-    DEFAULT_DESCRIPTOR_LAYOUT, SAMPLER_BINDING_RANGE, TEXTURE_BINDING_RANGE,
+    DEFAULT_DESCRIPTOR_LAYOUT, SAMPLER_BINDING_BASE, SAMPLER_BINDING_RANGE, TEXTURE_BINDING_BASE,
+    TEXTURE_BINDING_RANGE,
 };
 use metal2vulkan::translate_sanitized_native_reflected;
 use std::collections::BTreeSet;
@@ -304,6 +305,99 @@ fn a_placeholder_texture_the_shader_reads_is_reported_as_a_descriptor() {
         .expect("a consumer needs the shape of the image it has to bind");
     assert_eq!(shape.dimension, TextureDimension::D2);
     assert!(!shape.arrayed && !shape.writable);
+}
+
+/// A kernel that declares two textures and two samplers and samples with only the first of each.
+///
+/// Metal lets a function declare a resource it never touches, and the interface pass binds a
+/// variable for every `texture` and `sampler` parameter. The entry prologue loads each of them, so
+/// without a sweep the second pair stays in the module: a variable, a `DescriptorSet`/`Binding`,
+/// and an entry-point interface entry for a resource nothing reads, which a consumer building its
+/// layout from the module has to satisfy on every dispatch.
+const SECOND_TEXTURE_AND_SAMPLER_UNUSED: &str = r#"target triple = "spirv-unknown-vulkan1.2"
+
+define void @sample_first(ptr addrspace(1) %used_tex, ptr addrspace(1) %unused_tex, ptr addrspace(2) %used_sampler, ptr addrspace(2) %unused_sampler, ptr addrspace(1) %out) {
+entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %used_tex, ptr addrspace(2) %used_sampler, <2 x float> zeroinitializer)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  %x = extractelement <4 x float> %color, i64 0
+  store float %x, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @sample_first, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"used_tex"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"unused_tex"}
+!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"used_sampler"}
+!6 = !{i32 3, !"air.sampler", !"air.location_index", i32 1, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"unused_sampler"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
+"#;
+
+/// The ids the entry point lists on its interface, and the ids of every module-scope variable, from
+/// the crate's disassembly (raw ids, one instruction per line).
+fn interface_and_variables(spirv: &[u8]) -> (BTreeSet<String>, BTreeSet<String>) {
+    let text = metal2vulkan::disassemble(spirv).expect("disassemble the translated module");
+    let mut interface = BTreeSet::new();
+    let mut variables = BTreeSet::new();
+    for line in text.lines() {
+        let tokens = line.split_whitespace().collect::<Vec<_>>();
+        if tokens.first() == Some(&"OpEntryPoint") {
+            // OpEntryPoint <model> <function> "<name>" <interface ids...>
+            interface.extend(tokens.iter().skip(4).map(|id| (*id).to_string()));
+        } else if tokens.get(1) == Some(&"=") && tokens.get(2) == Some(&"OpVariable") {
+            variables.insert(tokens[0].to_string());
+        }
+    }
+    (interface, variables)
+}
+
+#[test]
+fn a_texture_and_sampler_the_shader_never_uses_are_not_declared() {
+    let (spirv, reflection) = translate_sanitized_native_reflected(
+        SECOND_TEXTURE_AND_SAMPLER_UNUSED,
+        Stage::Kernel,
+        &scratch("second_texture_and_sampler_unused"),
+        TransformOptions::default(),
+    )
+    .expect("the sampling kernel translates");
+
+    // Reflection reports what Metal declared, which is a superset of what the module binds; it
+    // must still cover every binding the module does declare.
+    let declared =
+        assert_reflection_covers_declarations("the sampling kernel", &spirv, &reflection);
+    let (texture_base, sampler_base) = (TEXTURE_BINDING_BASE, SAMPLER_BINDING_BASE);
+    let textures = declared
+        .iter()
+        .filter(|(_, binding)| TEXTURE_BINDING_RANGE.contains(*binding))
+        .map(|(_, binding)| *binding)
+        .collect::<Vec<_>>();
+    let samplers = declared
+        .iter()
+        .filter(|(_, binding)| SAMPLER_BINDING_RANGE.contains(*binding))
+        .map(|(_, binding)| *binding)
+        .collect::<Vec<_>>();
+    assert_eq!(textures, [texture_base], "only the sampled texture");
+    assert_eq!(samplers, [sampler_base], "only the sampling sampler");
+    assert_eq!(declared.len(), 3, "sampled texture, sampler, output buffer");
+
+    // The variables that remain are exactly the interface: nothing is listed that is gone, and
+    // nothing that remains is unlisted.
+    let (interface, variables) = interface_and_variables(&spirv);
+    assert_eq!(interface, variables);
+    assert_eq!(variables.len(), 3);
+    let text = metal2vulkan::disassemble(&spirv).expect("disassemble");
+    assert_eq!(text.matches("OpTypeImage").count(), 1, "{text}");
+    assert_eq!(text.matches("OpTypeSampler").count(), 1, "{text}");
+    assert_eq!(
+        text.matches("OpLoad").count(),
+        2,
+        "image and sampler only: {text}"
+    );
 }
 
 /// A fragment shader that reads its render target back through the implicit imageblock.

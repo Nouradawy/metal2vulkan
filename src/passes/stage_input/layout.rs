@@ -57,7 +57,8 @@ impl Ctx {
     }
 
     /// Record a descriptor the translator invented purely to give an AIR value a legal SPIR-V type,
-    /// with no Metal argument behind it. See [`drop_unconsumed_placeholder_descriptor_loads`].
+    /// with no Metal argument behind it. Its loads are retracted with the
+    /// descriptor when nothing consumes the value (`module_cleanup::drop_unreferenced_global_variables`).
     fn placeholder_descriptor(&mut self, pointee_ty: Word, binding: u32) -> Word {
         let var = self.descriptor_variable(pointee_ty, binding);
         self.placeholder_descriptor_vars.insert(var, binding);
@@ -363,53 +364,6 @@ fn decorate_layout_recursive(ctx: &mut Ctx, ty: Word, defs: &HashMap<Word, Instr
         }
         _ => {}
     }
-}
-
-/// Retire a descriptor the translator invented when nothing consumed the value it was created to
-/// type.
-///
-/// Two passes synthesize a resource with no Metal argument behind it, purely so an AIR value has a
-/// legal SPIR-V type. `Ctx::default_read_sampler` materializes an `OpTypeSampler` because AIR
-/// threads a sampler pointer into `texture.read(coord)`, which in Metal is sampler-less, and
-/// `lower_read` discards it. `Ctx::default_null_image_of` materializes an `OpTypeImage` for
-/// `air.get_null_texture_*()`, whose result a phi may merge away or `air.is_null_texture` may fold
-/// to a constant. When every load of such a variable feeds nothing, the descriptor is a demand on
-/// the consumer for a resource the shader never uses — and reflection cannot report it, because no
-/// Metal argument corresponds to it, so a consumer building its layout from `ShaderReflection`
-/// omits a binding the module declares.
-///
-/// This is not general dead-code elimination, which this pipeline deliberately does not do: it
-/// retracts descriptors the translator itself synthesized, and only where the synthesis turned out
-/// to be unnecessary. A load whose result IS consumed keeps its descriptor. Dropping the loads is
-/// enough — `drop_unreferenced_global_variables` then removes each variable, its decorations, and
-/// its entry-point interface entry.
-///
-/// The rule is stated over `Ctx::placeholder_descriptor_vars` rather than over one named variable,
-/// so a third synthesized placeholder is covered by registering it, not by copying this pass.
-pub(in crate::passes) fn drop_unconsumed_placeholder_descriptor_loads(ctx: &mut Ctx) {
-    if ctx.placeholder_descriptor_vars.is_empty() {
-        return;
-    }
-    let referenced = crate::passes::module_cleanup::function_referenced_ids(&ctx.module);
-    let placeholders = std::mem::take(&mut ctx.placeholder_descriptor_vars);
-    let unconsumed_load = |instruction: &Instruction| {
-        instruction.class.opcode == Op::Load
-            && matches!(
-                instruction.operands.first(),
-                Some(Operand::IdRef(variable)) if placeholders.contains_key(variable)
-            )
-            && instruction
-                .result_id
-                .is_some_and(|id| !referenced.contains(&id))
-    };
-    for function in &mut ctx.module.functions {
-        for block in &mut function.blocks {
-            block
-                .instructions
-                .retain(|instruction| !unconsumed_load(instruction));
-        }
-    }
-    ctx.placeholder_descriptor_vars = placeholders;
 }
 
 pub(in crate::passes) fn layout_ty_size_align(

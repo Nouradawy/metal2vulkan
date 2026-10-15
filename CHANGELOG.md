@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A `texture` or `sampler` parameter the Metal function never uses no longer leaves a descriptor in
+  the module. The interface pass binds a `UniformConstant` variable for every such parameter and
+  the entry prologue loads it once; with no consumer for the loaded handle the load still counted
+  as a reference, so the variable, its `DescriptorSet`/`Binding`, and its entry-point interface
+  entry survived, and a consumer building its layout from the module had to satisfy a binding the
+  shader never reads. Handle values (images, samplers, sampled images, arrays of them) that
+  nothing consumes -- the load and any `OpSampledImage`/`OpImage`/`OpCopyObject`/`OpPhi`/`OpSelect`
+  chain hanging off it -- are now removed before global liveness, together with their names and
+  decorations, so `drop_unreferenced_global_variables` takes the variable too. A handle that is
+  sampled, read, written, stored, or passed to a call keeps everything. Reflection still lists
+  every resource Metal declares, so it may report a binding the module no longer declares (the
+  documented direction); this also retires the narrower placeholder-load retraction for
+  `air.get_read_sampler()` / `air.get_null_texture_*()`, which the general rule subsumes.
 - A helper that receives a pointer derived from a raw buffer -- `getelementptr`, even with offset
   0, rather than the buffer parameter itself -- now reads and writes that buffer at the caller's
   location instead of reading zero. A raw pointer's SSA value is only a Private placeholder; its

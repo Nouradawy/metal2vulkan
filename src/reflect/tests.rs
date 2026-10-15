@@ -595,7 +595,8 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     )
     .expect("translate");
     let asm = crate::disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("Binding 160"), "{asm}");
+    // `runtime_sampler` is never sampled with, so no descriptor is declared for it.
+    assert!(!asm.contains("Binding 160"), "{asm}");
     assert!(asm.contains("Binding 161"), "{asm}");
     assert!(asm.contains("Binding 162"), "{asm}");
     assert!(asm.contains("Binding 192"), "{asm}");
@@ -658,7 +659,9 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     )
     .expect("translate custom sampler layout");
     let custom_asm = crate::disassemble(&custom_spv).expect("disassemble custom sampler layout");
-    for binding in [800, 801, 802] {
+    // The runtime sampler at 800 is never sampled with, so only the two static samplers bind.
+    assert!(!custom_asm.contains("Binding 800"), "{custom_asm}");
+    for binding in [801, 802] {
         assert!(
             custom_asm.contains(&format!("Binding {binding}")),
             "{custom_asm}"

@@ -927,7 +927,9 @@ attributes #3 = { convergent nounwind memory(argmem: write) }
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("Binding 480"), "{asm}");
-    assert!(asm.contains("Binding 481"), "{asm}");
+    // The second field is never written, so nothing consumes its handle and no descriptor is
+    // declared for it.
+    assert!(!asm.contains("Binding 481"), "{asm}");
     assert_eq!(asm.matches("OpImageWrite").count(), 1, "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -1130,17 +1132,24 @@ declare i1 @air.is_null_texture_2d(ptr addrspace(1))
 fn native_kernel_texture_sampler_metadata_bindings() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
-define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler) {
+define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
 entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> zeroinitializer)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  %x = extractelement <4 x float> %color, i64 0
+  store float %x, ptr addrspace(1) %out, align 4
   ret void
 }
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
 
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.texture", !"air.location_index", i32 5, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"tex"}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 5, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
 !4 = !{i32 1, !"air.sampler", !"air.location_index", i32 2, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_kernel_texture_sampler_{}",
@@ -1365,19 +1374,29 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 fn native_texture_and_sampler_binding_bands_cover_high_and_last_abi_indices() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
-define void @k(ptr addrspace(1) %tex40, ptr addrspace(1) %tex127, ptr addrspace(2) %sampler8, ptr addrspace(2) %sampler15) {
+define void @k(ptr addrspace(1) %tex40, ptr addrspace(1) %tex127, ptr addrspace(2) %sampler8, ptr addrspace(2) %sampler15, ptr addrspace(1) %out) {
 entry:
+  %a = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex40, ptr addrspace(2) %sampler8, <2 x float> zeroinitializer)
+  %b = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex127, ptr addrspace(2) %sampler15, <2 x float> zeroinitializer)
+  %ac = extractvalue { <4 x float>, i8 } %a, 0
+  %bc = extractvalue { <4 x float>, i8 } %b, 0
+  %sum = fadd <4 x float> %ac, %bc
+  %x = extractelement <4 x float> %sum, i64 0
+  store float %x, ptr addrspace(1) %out, align 4
   ret void
 }
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
 
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !4, !5, !6}
-!3 = !{i32 0, !"air.texture", !"air.location_index", i32 40, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"tex40"}
-!4 = !{i32 1, !"air.texture", !"air.location_index", i32 127, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"tex127"}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 40, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex40"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 127, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex127"}
 !5 = !{i32 2, !"air.sampler", !"air.location_index", i32 8, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler8"}
 !6 = !{i32 3, !"air.sampler", !"air.location_index", i32 15, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler15"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_high_texture_sampler_bindings_{}",
@@ -1446,17 +1465,24 @@ target triple = "spirv-unknown-vulkan1.2"
 @dest_enabled = internal addrspace(2) global i8 1, align 1
 @source_enabled = internal addrspace(2) global i8 1, align 1
 
-define void @k(ptr addrspace(1) %dest, ptr addrspace(1) %source) {
+define void @k(ptr addrspace(1) %dest, ptr addrspace(1) %source, ptr addrspace(2) %sampler) {
 entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %source, ptr addrspace(2) %sampler, <2 x float> zeroinitializer)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %dest, <2 x i32> zeroinitializer, <4 x float> %color, i32 0, i32 2)
   ret void
 }
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
 
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !4}
+!2 = !{!3, !4, !7}
 !3 = !{i32 0, !"air.function_constant", !5, !"air.texture", !"air.location_index", ptr addrspace(2) @dest_location, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"dest"}
 !4 = !{i32 1, !"air.function_constant", !6, !"air.texture", !"air.location_index", ptr addrspace(2) @source_location, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"source"}
+!7 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
 !5 = !{ptr addrspace(2) @dest_enabled, !"bool", !"dest_enabled"}
 !6 = !{ptr addrspace(2) @source_enabled, !"bool", !"source_enabled"}
 "#;
@@ -1879,7 +1905,9 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
         crate::translate_sanitized_native_reflected(ll, Stage::Fragment, &tmp, options)
             .expect("fragment specialization");
     let asm = disassemble(&spv).expect("disassemble fragment specialization");
-    assert!(asm.contains("Binding 163"), "{asm}");
+    // Pixel sampling fetches texels and never uses the sampler, so no sampler descriptor is
+    // declared even though the runtime state is bound to Metal index 3.
+    assert!(!asm.contains("Binding 163"), "{asm}");
     assert!(asm.contains("OpSMod"), "{asm}");
     assert!(!asm.contains("OpSampledImage"), "{asm}");
     assert_eq!(
@@ -3706,7 +3734,7 @@ declare { <4 x float>, i8 } @air.gather_depth_2d_array.v4f32(ptr addrspace(1), p
 }
 
 #[test]
-fn native_kernel_unused_texture1d_uses_metadata_dimension() {
+fn native_kernel_unused_texture1d_declares_no_descriptor() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 
@@ -3730,9 +3758,10 @@ entry:
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpTypeImage"), "{asm}");
-    assert!(asm.contains(" 1D "), "{asm}");
-    assert!(asm.contains("Binding 32"), "{asm}");
+    // Nothing reads the texture, so the module declares no image, binding, or interface entry for it.
+    assert!(!asm.contains("OpTypeImage"), "{asm}");
+    assert!(!asm.contains("Binding 32"), "{asm}");
+    assert!(!asm.contains("UniformConstant"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()

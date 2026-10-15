@@ -143,6 +143,12 @@ whose length is a function constant rather than part of the type name, reports t
 capacity (`TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT`, 128) and expects `descriptorBindingPartiallyBound`
 or 128 valid descriptors.
 
+Reflection lists every resource the Metal function declares, but the module declares only the
+`texture`/`sampler` descriptors its code consumes: a parameter the function never samples, reads,
+or writes has no variable, `Binding` decoration, or interface entry in the SPIR-V. A layout built
+from reflection may therefore contain a binding the module omits; that is valid, and nothing needs
+to be bound there.
+
 Descriptor types for `bindings`:
 
 | Kind | Vulkan descriptor type |

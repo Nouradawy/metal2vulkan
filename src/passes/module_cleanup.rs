@@ -109,8 +109,172 @@ fn targets_any(instruction: &Instruction, removed: &HashSet<Word>) -> bool {
     matches!(instruction.operands.first(), Some(Operand::IdRef(id)) if removed.contains(id))
 }
 
+/// The types whose values are opaque descriptor handles: images, samplers, sampled images, and
+/// arrays of them. A pointer to one is NOT in the set — a pointer is an address, not a handle.
+fn opaque_handle_types(module: &Module) -> HashSet<Word> {
+    let mut handles = HashSet::new();
+    // A type is defined before any array of it, so one pass in module order closes the set.
+    for instruction in &module.types_global_values {
+        let Some(id) = instruction.result_id else {
+            continue;
+        };
+        let is_handle = match instruction.class.opcode {
+            Op::TypeImage | Op::TypeSampler | Op::TypeSampledImage => true,
+            Op::TypeArray | Op::TypeRuntimeArray => matches!(
+                instruction.operands.first(),
+                Some(Operand::IdRef(element)) if handles.contains(element)
+            ),
+            _ => false,
+        };
+        if is_handle {
+            handles.insert(id);
+        }
+    }
+    handles
+}
+
+/// Whether `instruction` only produces a handle value from its operands, so that deleting it when
+/// nothing reads the result changes no observable behavior.
+///
+/// A volatile load is the one `OpLoad` that is not pure.
+fn is_pure_handle_producer(instruction: &Instruction) -> bool {
+    match instruction.class.opcode {
+        Op::CopyObject | Op::SampledImage | Op::Image | Op::Phi | Op::Select => true,
+        Op::Load => !instruction.operands.iter().any(|operand| {
+            matches!(
+                operand,
+                Operand::MemoryAccess(access) if access.contains(spirv::MemoryAccess::VOLATILE)
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// Delete the opaque-handle values nothing consumes, together with the `OpName`/`OpDecorate`
+/// records about them. Returns whether anything was removed.
+///
+/// Every `texture` and `sampler` parameter of an entry point becomes a `UniformConstant` variable
+/// that the entry prologue loads once. When the Metal function never samples, reads, or writes that
+/// parameter, the loaded handle has no consumer — yet the load is a reference to the variable, so
+/// the variable, its `DescriptorSet`/`Binding` decorations, and its entry-point interface entry
+/// all stay, and the module demands a descriptor the shader never touches. A consumer that builds
+/// its layout from the module then finds an unbound resource at that binding on every draw.
+///
+/// Liveness is transitive from the consumers, not "appears as an operand": a handle is live when
+/// something that is not itself a pure handle producer reads it (a sample, a store, a call
+/// argument), or when a live producer reads it. That
+/// collects a whole dead chain (`OpLoad` → `OpSampledImage` → `OpCopyObject`) and a dead phi cycle
+/// in one pass, so no fixed-point loop is needed. A debug name or decoration about a handle is not
+/// a consumer.
+///
+/// This is deliberately narrower than general dead-value elimination, which the pipeline does not
+/// perform: only values of opaque handle type are candidates, and only the pure producers of such
+/// values. Anything with an effect — a store, a call, an image read or write — is a consumer, and
+/// a handle it names stays live. It also covers the synthesized placeholder descriptors
+/// (`air.get_read_sampler()`, `air.get_null_texture_*()`) whose value nothing uses.
+fn drop_unconsumed_handle_values(module: &mut Module) -> bool {
+    let handle_types = opaque_handle_types(module);
+    if handle_types.is_empty() {
+        return false;
+    }
+    let is_candidate = |instruction: &Instruction| {
+        instruction.result_id.is_some()
+            && instruction
+                .result_type
+                .is_some_and(|ty| handle_types.contains(&ty))
+            && is_pure_handle_producer(instruction)
+    };
+    let id_operands = |instruction: &Instruction| {
+        instruction
+            .operands
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::IdRef(id) | Operand::IdScope(id) | Operand::IdMemorySemantics(id) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Candidate result id -> the ids it reads.
+    let mut producers: HashMap<Word, Vec<Word>> = HashMap::new();
+    let mut pending: Vec<Word> = Vec::new();
+    for function in &module.functions {
+        for instruction in function.all_inst_iter() {
+            match instruction.result_id {
+                Some(result) if is_candidate(instruction) => {
+                    producers.insert(result, id_operands(instruction));
+                }
+                _ => pending.extend(id_operands(instruction)),
+            }
+        }
+    }
+    if producers.is_empty() {
+        return false;
+    }
+    // Module-scope consumers (initializers, spec-constant operations, the entry interface,
+    // execution modes). Debug names and decoration targets are not consumers; the extra operands
+    // of a decoration (`OpDecorateId`) can be real references, so those count.
+    for section in [
+        &module.entry_points,
+        &module.execution_modes,
+        &module.debug_string_source,
+        &module.debug_module_processed,
+        &module.types_global_values,
+    ] {
+        for instruction in section {
+            pending.extend(id_operands(instruction));
+        }
+    }
+    for instruction in &module.annotations {
+        pending.extend(id_operands(instruction).into_iter().skip(1));
+    }
+
+    let mut live = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !live.insert(id) {
+            continue;
+        }
+        if let Some(reads) = producers.get(&id) {
+            pending.extend(reads.iter().copied().filter(|read| !live.contains(read)));
+        }
+    }
+
+    let removed = producers
+        .keys()
+        .copied()
+        .filter(|id| !live.contains(id))
+        .collect::<HashSet<_>>();
+    if removed.is_empty() {
+        return false;
+    }
+    for function in &mut module.functions {
+        for block in &mut function.blocks {
+            block.instructions.retain(|instruction| {
+                !(is_candidate(instruction)
+                    && instruction
+                        .result_id
+                        .is_some_and(|id| removed.contains(&id)))
+            });
+        }
+    }
+    module
+        .annotations
+        .retain(|instruction| !targets_any(instruction, &removed));
+    module
+        .debug_names
+        .retain(|instruction| !targets_any(instruction, &removed));
+    true
+}
+
 /// Drop every global `OpVariable` no instruction references, together with its entry-point interface
 /// entry, its decorations, and its debug names. Returns whether anything was removed.
+///
+/// A descriptor variable is referenced by the entry prologue's `OpLoad` even when nothing consumes
+/// the loaded handle, so the rule first retracts the handle values nothing consumes
+/// ([`drop_unconsumed_handle_values`]); only then is "no instruction references it" true of a
+/// texture or sampler parameter the shader never uses.
 ///
 /// `finalize` applies this rule once, against the bodies as they stand when it builds the entry
 /// point. Instruction-deleting work runs after it at two boundaries — the pointer and access-chain
@@ -129,8 +293,8 @@ pub(crate) fn drop_unreferenced_global_variables(module: &mut Module) -> bool {
     /// `OpEntryPoint` operands: execution model, entry function id, name, then the interface ids.
     const INTERFACE_START: usize = 3;
 
+    let mut changed = drop_unconsumed_handle_values(module);
     let referenced = function_referenced_ids(module);
-    let mut changed = false;
     for entry_point in &mut module.entry_points {
         let before = entry_point.operands.len();
         entry_point.operands = std::mem::take(&mut entry_point.operands)
@@ -383,7 +547,9 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
             && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
             && matches!(
                 instruction.operands.get(2),
-                Some(&Operand::BuiltIn(BuiltIn::BaseInstance | BuiltIn::BaseVertex))
+                Some(&Operand::BuiltIn(
+                    BuiltIn::BaseInstance | BuiltIn::BaseVertex
+                ))
             )
     });
     if has_draw_parameters {
@@ -970,5 +1136,411 @@ mod tests {
 
         assert!(ctx.module.types_global_values.is_empty());
         assert!(ctx.module.annotations.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod unconsumed_handle_tests {
+    use super::*;
+    use crate::spirv_module::{Block, Function, ModuleHeader};
+
+    const FLOAT: Word = 1;
+    const IMAGE: Word = 2;
+    const SAMPLER: Word = 3;
+    const SAMPLED_IMAGE: Word = 4;
+    const IMAGE_POINTER: Word = 5;
+    const SAMPLER_POINTER: Word = 6;
+    const COORD: Word = 7;
+    const IMAGE_ARRAY: Word = 8;
+    /// The first id the fixtures hand out to variables.
+    const FIRST_VARIABLE: Word = 10;
+    const ENTRY: Word = 40;
+
+    fn handle_module(descriptors: &[(Word, Word)]) -> Module {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(FLOAT),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeImage,
+                None,
+                Some(IMAGE),
+                vec![
+                    Operand::IdRef(FLOAT),
+                    Operand::Dim(spirv::Dim::Dim2D),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(1),
+                    Operand::ImageFormat(spirv::ImageFormat::Unknown),
+                ],
+            ),
+            Instruction::new(Op::TypeSampler, None, Some(SAMPLER), vec![]),
+            Instruction::new(
+                Op::TypeSampledImage,
+                None,
+                Some(SAMPLED_IMAGE),
+                vec![Operand::IdRef(IMAGE)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(IMAGE_POINTER),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(IMAGE),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(SAMPLER_POINTER),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(SAMPLER),
+                ],
+            ),
+            Instruction::new(Op::ConstantNull, Some(FLOAT), Some(COORD), vec![]),
+            Instruction::new(
+                Op::TypeRuntimeArray,
+                None,
+                Some(IMAGE_ARRAY),
+                vec![Operand::IdRef(IMAGE)],
+            ),
+        ];
+        let mut entry_operands = vec![
+            Operand::ExecutionModel(spirv::ExecutionModel::Fragment),
+            Operand::IdRef(ENTRY),
+            Operand::LiteralString("main".to_string()),
+        ];
+        for (index, (variable, pointer)) in descriptors.iter().enumerate() {
+            module.types_global_values.push(Instruction::new(
+                Op::Variable,
+                Some(*pointer),
+                Some(*variable),
+                vec![Operand::StorageClass(StorageClass::UniformConstant)],
+            ));
+            module.annotations.push(Instruction::new(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(*variable),
+                    Operand::Decoration(spirv::Decoration::Binding),
+                    Operand::LiteralBit32(index as u32),
+                ],
+            ));
+            module.debug_names.push(Instruction::new(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(*variable),
+                    Operand::LiteralString(format!("resource{index}")),
+                ],
+            ));
+            entry_operands.push(Operand::IdRef(*variable));
+        }
+        module
+            .entry_points
+            .push(Instruction::new(Op::EntryPoint, None, None, entry_operands));
+        module
+    }
+
+    fn load(ty: Word, result: Word, variable: Word) -> Instruction {
+        Instruction::new(
+            Op::Load,
+            Some(ty),
+            Some(result),
+            vec![Operand::IdRef(variable)],
+        )
+    }
+
+    fn with_body(mut module: Module, instructions: Vec<Instruction>) -> Module {
+        let mut block = Block::new();
+        block.instructions = instructions;
+        let mut function = Function::new();
+        function.blocks.push(block);
+        module.functions.push(function);
+        module
+    }
+
+    fn body_results(module: &Module) -> HashSet<Word> {
+        module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .filter_map(|instruction| instruction.result_id)
+            .collect()
+    }
+
+    fn variables(module: &Module) -> HashSet<Word> {
+        module
+            .types_global_values
+            .iter()
+            .filter(|instruction| instruction.class.opcode == Op::Variable)
+            .filter_map(|instruction| instruction.result_id)
+            .collect()
+    }
+
+    fn interface(module: &Module) -> HashSet<Word> {
+        module.entry_points[0].operands[3..]
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn records_about(records: &[Instruction]) -> HashSet<Word> {
+        records
+            .iter()
+            .filter_map(|instruction| match instruction.operands.first() {
+                Some(Operand::IdRef(id)) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Two textures and two samplers; only the first of each pair is sampled. The second pair is
+    /// loaded, combined, copied, and merged by a phi that feeds itself -- a chain and a cycle no
+    /// instruction outside them reads.
+    #[test]
+    fn a_dead_handle_chain_takes_its_variable_binding_name_and_interface_entry() {
+        let (tex0, tex1, samp0, samp1) = (10, 11, 12, 13);
+        let module = handle_module(&[
+            (tex0, IMAGE_POINTER),
+            (tex1, IMAGE_POINTER),
+            (samp0, SAMPLER_POINTER),
+            (samp1, SAMPLER_POINTER),
+        ]);
+        let (image0, sampler0, combined0, sample) = (20, 21, 22, 23);
+        let (image1, sampler1, combined1, copy, phi) = (24, 25, 26, 27, 28);
+        let mut module = with_body(
+            module,
+            vec![
+                load(IMAGE, image0, tex0),
+                load(SAMPLER, sampler0, samp0),
+                Instruction::new(
+                    Op::SampledImage,
+                    Some(SAMPLED_IMAGE),
+                    Some(combined0),
+                    vec![Operand::IdRef(image0), Operand::IdRef(sampler0)],
+                ),
+                Instruction::new(
+                    Op::ImageSampleImplicitLod,
+                    Some(FLOAT),
+                    Some(sample),
+                    vec![Operand::IdRef(combined0), Operand::IdRef(COORD)],
+                ),
+                load(IMAGE, image1, tex1),
+                load(SAMPLER, sampler1, samp1),
+                Instruction::new(
+                    Op::SampledImage,
+                    Some(SAMPLED_IMAGE),
+                    Some(combined1),
+                    vec![Operand::IdRef(image1), Operand::IdRef(sampler1)],
+                ),
+                Instruction::new(
+                    Op::CopyObject,
+                    Some(SAMPLED_IMAGE),
+                    Some(copy),
+                    vec![Operand::IdRef(combined1)],
+                ),
+                Instruction::new(
+                    Op::Phi,
+                    Some(IMAGE),
+                    Some(phi),
+                    vec![
+                        Operand::IdRef(image1),
+                        Operand::IdRef(ENTRY),
+                        Operand::IdRef(phi),
+                        Operand::IdRef(ENTRY),
+                    ],
+                ),
+                Instruction::new(Op::Return, None, None, vec![]),
+            ],
+        );
+
+        assert!(drop_unreferenced_global_variables(&mut module));
+
+        assert_eq!(
+            body_results(&module),
+            HashSet::from([image0, sampler0, combined0, sample])
+        );
+        assert_eq!(variables(&module), HashSet::from([tex0, samp0]));
+        assert_eq!(interface(&module), HashSet::from([tex0, samp0]));
+        assert_eq!(
+            records_about(&module.annotations),
+            HashSet::from([tex0, samp0])
+        );
+        assert_eq!(
+            records_about(&module.debug_names),
+            HashSet::from([tex0, samp0])
+        );
+        // Nothing left to remove.
+        assert!(!drop_unreferenced_global_variables(&mut module));
+    }
+
+    /// A name or a decoration about a handle is not a use of it.
+    #[test]
+    fn a_name_and_a_decoration_on_the_dead_load_do_not_keep_it() {
+        let tex = FIRST_VARIABLE;
+        let image = 20;
+        let mut module = with_body(
+            handle_module(&[(tex, IMAGE_POINTER)]),
+            vec![
+                load(IMAGE, image, tex),
+                Instruction::new(Op::Return, None, None, vec![]),
+            ],
+        );
+        module.debug_names.push(Instruction::new(
+            Op::Name,
+            None,
+            None,
+            vec![
+                Operand::IdRef(image),
+                Operand::LiteralString("texture".to_string()),
+            ],
+        ));
+        module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(image),
+                Operand::Decoration(spirv::Decoration::NonUniform),
+            ],
+        ));
+
+        assert!(drop_unreferenced_global_variables(&mut module));
+
+        assert!(body_results(&module).is_empty());
+        assert!(variables(&module).is_empty());
+        assert!(interface(&module).is_empty());
+        assert!(module.annotations.is_empty());
+        assert!(module.debug_names.is_empty());
+    }
+
+    /// Every way a handle can be consumed keeps its load and its descriptor, and a handle array
+    /// loaded whole is as removable as a single handle once nothing reads it.
+    #[test]
+    fn a_consumed_handle_keeps_its_load_and_variable() {
+        let (written, passed, stored, volatile, array) = (10, 11, 12, 13, 14);
+        let (helper, private, array_pointer) = (50, 51, 52);
+        let mut module = handle_module(&[
+            (written, IMAGE_POINTER),
+            (passed, IMAGE_POINTER),
+            (stored, IMAGE_POINTER),
+            (volatile, IMAGE_POINTER),
+            (array, array_pointer),
+        ]);
+        // The array pointer type follows the array type it points at and precedes the variables.
+        module.types_global_values.insert(
+            8,
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(array_pointer),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(IMAGE_ARRAY),
+                ],
+            ),
+        );
+        let mut module = with_body(
+            module,
+            vec![
+                load(IMAGE, 20, written),
+                Instruction::new(
+                    Op::ImageWrite,
+                    None,
+                    None,
+                    vec![
+                        Operand::IdRef(20),
+                        Operand::IdRef(COORD),
+                        Operand::IdRef(COORD),
+                    ],
+                ),
+                load(IMAGE, 21, passed),
+                Instruction::new(
+                    Op::FunctionCall,
+                    Some(FLOAT),
+                    Some(22),
+                    vec![Operand::IdRef(helper), Operand::IdRef(21)],
+                ),
+                load(IMAGE, 23, stored),
+                Instruction::new(
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(private), Operand::IdRef(23)],
+                ),
+                // An unused volatile load is an access the shader asked for.
+                Instruction::new(
+                    Op::Load,
+                    Some(IMAGE),
+                    Some(24),
+                    vec![
+                        Operand::IdRef(volatile),
+                        Operand::MemoryAccess(spirv::MemoryAccess::VOLATILE),
+                    ],
+                ),
+                load(IMAGE_ARRAY, 25, array),
+                Instruction::new(Op::Return, None, None, vec![]),
+            ],
+        );
+
+        assert!(drop_unreferenced_global_variables(&mut module));
+
+        assert_eq!(
+            body_results(&module),
+            HashSet::from([20, 21, 22, 23, 24]),
+            "only the unread whole-array load goes"
+        );
+        assert_eq!(
+            variables(&module),
+            HashSet::from([written, passed, stored, volatile])
+        );
+    }
+
+    /// Only handles are candidates: an unused load of ordinary data stays exactly as it was.
+    #[test]
+    fn an_unused_load_of_a_non_handle_is_left_alone() {
+        let buffer = FIRST_VARIABLE;
+        let mut module = handle_module(&[]);
+        module.types_global_values.push(Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(60),
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(FLOAT),
+            ],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::Variable,
+            Some(60),
+            Some(buffer),
+            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+        ));
+        let mut module = with_body(
+            module,
+            vec![
+                load(FLOAT, 20, buffer),
+                Instruction::new(Op::Return, None, None, vec![]),
+            ],
+        );
+
+        assert!(!drop_unconsumed_handle_values(&mut module));
+
+        assert_eq!(body_results(&module), HashSet::from([20]));
     }
 }
