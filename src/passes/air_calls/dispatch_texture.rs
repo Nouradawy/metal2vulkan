@@ -165,16 +165,22 @@ pub(in crate::passes) fn lower_atomic_integer_rmw(
 
 /// Pair the inverse GLSL.std.450 operations and vector width for one AIR packed-vector format.
 /// Keeping the format table here prevents pack and unpack dispatch from drifting independently.
+///
+/// The packed pixel types (`rgba8unorm<float4>`, `rg16snorm<float2>`, ...) reach AIR as
+/// `air.pack.unorm.rgba8.*` / `air.pack.snorm.rg16.*`: component 0 in the least significant
+/// field, the same layout and normalized conversion as the `4x8` / `2x16` functions, so they share
+/// the GLSL.std.450 pair. sRGB and the mixed-width formats (rgb565, rgb10a2, rg11b10f, rgb9e5) are
+/// not this shape and stay out of the table.
 fn packed_format(name: &str) -> Option<(GLSLstd450, GLSLstd450, u32)> {
     use GLSLstd450 as G;
 
-    if name.contains("unorm4x8") {
+    if name.contains("unorm4x8") || name.contains(".unorm.rgba8.") {
         Some((G::PackUnorm4x8, G::UnpackUnorm4x8, 4))
-    } else if name.contains("snorm4x8") {
+    } else if name.contains("snorm4x8") || name.contains(".snorm.rgba8.") {
         Some((G::PackSnorm4x8, G::UnpackSnorm4x8, 4))
-    } else if name.contains("unorm2x16") {
+    } else if name.contains("unorm2x16") || name.contains(".unorm.rg16.") {
         Some((G::PackUnorm2x16, G::UnpackUnorm2x16, 2))
-    } else if name.contains("snorm2x16") {
+    } else if name.contains("snorm2x16") || name.contains(".snorm.rg16.") {
         Some((G::PackSnorm2x16, G::UnpackSnorm2x16, 2))
     } else if name.contains("half2x16") {
         Some((G::PackHalf2x16, G::UnpackHalf2x16, 2))
@@ -1267,6 +1273,19 @@ mod tests {
             assert_eq!(actual_count, component_count, "{name}");
         }
         assert!(packed_format("air.unpack.unorm.rgb10a2.v4f32").is_none());
+        // The packed pixel types share the 4x8 / 2x16 pair; sRGB does not.
+        for (name, pack_op) in [
+            ("air.pack.unorm.rgba8.v4f32", GLSLstd450::PackUnorm4x8),
+            ("air.unpack.unorm.rgba8.v4f32", GLSLstd450::PackUnorm4x8),
+            ("air.pack.snorm.rgba8.v4f16", GLSLstd450::PackSnorm4x8),
+            ("air.pack.unorm.rg16.v2f32", GLSLstd450::PackUnorm2x16),
+            ("air.unpack.snorm.rg16.v2f32", GLSLstd450::PackSnorm2x16),
+        ] {
+            let (actual, _, _) = packed_format(name).unwrap_or_else(|| panic!("classify {name}"));
+            assert_eq!(actual as u32, pack_op as u32, "{name}");
+        }
+        assert!(packed_format("air.pack.srgba8.v4f32").is_none());
+        assert!(packed_format("air.pack.unorm.rgb565.v3f32").is_none());
     }
 
     #[test]

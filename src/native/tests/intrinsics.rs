@@ -458,6 +458,59 @@ declare i32 @air.pack.unorm4x8.v4f32(<4 x float>)
     }
 }
 
+/// Mish 2026-10-18 (Memoji avatar): `rgba8unorm<float4>` stores reach AIR as `air.pack.unorm.rgba8`.
+#[test]
+fn native_air_pack_unorm_rgba8_lowers_to_glsl_extinst() {
+    let ll = r#"
+source_filename = "pack_unorm_rgba8"
+target datalayout = "e-p:64:64"
+target triple = "air64-apple-macosx14.0.0"
+
+define void @main(ptr addrspace(1) %out) {
+entry:
+  %packed = tail call i32 @air.pack.unorm.rgba8.v4f32(<4 x float> <float 0.000000e+00, float 5.000000e-01, float 1.000000e+00, float 2.500000e-01>)
+  store i32 %packed, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare i32 @air.pack.unorm.rgba8.v4f32(<4 x float>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @main, !1, !2}
+!1 = !{}
+!2 = !{!3}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_native_pack_unorm_rgba8_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let module = load_bytes(emit_vulkan_spirv(ll).expect("native emit")).expect("load native spv");
+    let out = passes::transform(
+        module,
+        Stage::Kernel,
+        None,
+        None,
+        meta::parse_air_kernel_meta(ll).as_ref(),
+        meta::entry_name(ll, "kernel").as_deref(),
+    )
+    .expect("interface transform")
+    .assemble()
+    .iter()
+    .flat_map(|w| w.to_le_bytes())
+    .collect::<Vec<_>>();
+    let asm = disassemble(&out).expect("disassemble transformed");
+    assert!(asm.contains("PackUnorm4x8"), "{asm}");
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
+    }
+}
+
 #[test]
 fn native_air_pack_unorm_rgb565_f16_lowers_to_exact_fields() {
     let ll = r#"
