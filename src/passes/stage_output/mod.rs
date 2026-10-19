@@ -637,7 +637,21 @@ pub(in crate::passes) fn rewrite_return(
     }
 
     let mut outputs: Vec<OutputWrite> = vec![];
-    let rdef = defs.get(&ret_ty).cloned();
+    // `defs` is the type snapshot taken before stage-input lowering, kept so the rewrite reads the
+    // return struct's original member types. A return type that lowering itself introduced (an
+    // entry whose result reaches it through an inlined helper writing a local struct) has no
+    // snapshot entry, and answering "no definition" there emitted no outputs at all: the vertex
+    // stage returned nothing, gl_Position was undefined and every draw of it rasterized nothing
+    // (Chrome/Skia Graphite path covers and strokes). Such a type has no older form, so its live
+    // definition is the original one.
+    let rdef = defs.get(&ret_ty).cloned().or_else(|| {
+        ctx.module
+            .types_global_values
+            .iter()
+            .chain(&ctx.new_globals)
+            .find(|inst| inst.result_id == Some(ret_ty))
+            .cloned()
+    });
 
     // AIR states an output because the shader writes it. A member whose role has no lowering used
     // to be skipped silently, which turns the value the shader computed into one nothing carries —
@@ -1184,6 +1198,94 @@ fn make_output_var(ctx: &mut Ctx, ty: Word) -> Word {
 mod tests {
     use super::*;
     use crate::passes::resources::rewrites::combined_type_defs;
+
+    /// Stage-input lowering may retype the entry's return to a struct it creates (a value copy of
+    /// a type that is also a decorated buffer block), so the pre-lowering snapshot does not hold
+    /// it. The vertex outputs must still be built from that struct: answering "no definition" used
+    /// to emit no outputs at all, leaving gl_Position undefined for every draw of the pipeline.
+    #[test]
+    fn a_vertex_return_type_absent_from_the_snapshot_still_reaches_its_outputs() {
+        let mut module = Module::new();
+        module.header = Some(crate::spirv_module::ModuleHeader::new(100));
+        let mut ctx = Ctx::new(module);
+        let float = ctx.ty_float();
+        let v4 = ctx.ty_vecf(4);
+        let ret_ty = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeStruct,
+            None,
+            Some(ret_ty),
+            vec![Operand::IdRef(v4), Operand::IdRef(v4)],
+        ));
+        let one = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::Constant,
+            Some(float),
+            Some(one),
+            vec![Operand::LiteralBit32(1.0f32.to_bits())],
+        ));
+        let lanes = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::ConstantComposite,
+            Some(v4),
+            Some(lanes),
+            vec![Operand::IdRef(one); 4],
+        ));
+        let (fn_ty, func, label, value) = (
+            ctx.module.fresh_id(),
+            ctx.module.fresh_id(),
+            ctx.module.fresh_id(),
+            ctx.module.fresh_id(),
+        );
+        ctx.new_globals.push(Instruction::new(
+            Op::TypeFunction,
+            None,
+            Some(fn_ty),
+            vec![Operand::IdRef(ret_ty)],
+        ));
+        ctx.module.functions.push(Function {
+            def: Some(Instruction::new(
+                Op::Function,
+                Some(ret_ty),
+                Some(func),
+                vec![
+                    Operand::FunctionControl(FunctionControl::NONE),
+                    Operand::IdRef(fn_ty),
+                ],
+            )),
+            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
+            parameters: vec![],
+            blocks: vec![Block {
+                label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
+                instructions: vec![
+                    Instruction::new(
+                        Op::CompositeConstruct,
+                        Some(ret_ty),
+                        Some(value),
+                        vec![Operand::IdRef(lanes), Operand::IdRef(lanes)],
+                    ),
+                    Instruction::new(Op::ReturnValue, None, None, vec![Operand::IdRef(value)]),
+                ],
+            }],
+        });
+        let vert = crate::meta::VertMeta {
+            output_roles: vec![VertOutRole::Position, VertOutRole::Varying(0)],
+            ..Default::default()
+        };
+        // The snapshot predates the return type, as the one `build_stage_input` takes does.
+        let snapshot = HashMap::new();
+
+        rewrite_return(&mut ctx, 0, &Stage::Vertex, None, Some(&vert), &snapshot)
+            .expect("rewrite the return");
+
+        let stores = ctx.module.functions[0].blocks[0]
+            .instructions
+            .iter()
+            .filter(|inst| inst.class.opcode == Op::Store)
+            .count();
+        assert_eq!(stores, 2, "position and the varying are both written");
+        assert_eq!(ctx.interface.len(), 2, "both outputs join the interface");
+    }
 
     #[test]
     fn scalar_bool_fragment_output_uses_uint_interface_and_select() {
