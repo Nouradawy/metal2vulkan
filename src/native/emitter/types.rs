@@ -550,11 +550,21 @@ impl Emitter {
             },
             LlValue::Int(value) => match self.resolve_type(ty)? {
                 LlType::Int(bits) => self.const_int(bits, *value),
-                other => self.int_literal_bits_as_float(*value, &other),
+                LlType::Float if *value == 0 => self.const_float32(0.0),
+                LlType::Half if *value == 0 => self.const_float16_bits(0),
+                LlType::BFloat if *value == 0 => self.const_int(16, 0),
+                other => Err(format!(
+                    "native emitter: integer literal {value} used as non-int type {other:?}"
+                )),
             },
             LlValue::SignedInt(value) => match self.resolve_type(ty)? {
                 LlType::Int(bits) => self.const_signed_int(bits, *value),
-                other => self.int_literal_bits_as_float(*value as u64, &other),
+                LlType::Float if *value == 0 => self.const_float32(0.0),
+                LlType::Half if *value == 0 => self.const_float16_bits(0),
+                LlType::BFloat if *value == 0 => self.const_int(16, 0),
+                other => Err(format!(
+                    "native emitter: integer literal {value} used as non-int type {other:?}"
+                )),
             },
             LlValue::Hex(bits) => match self.resolve_type(ty)? {
                 LlType::Int(width) => self.const_int(width, *bits),
@@ -1038,23 +1048,6 @@ impl Emitter {
             }
             other => Err(format!(
                 "native emitter: integer constant requested for non-int type {other:?}"
-            )),
-        }
-    }
-
-    /// Materializes an integer literal that lands in a floating-point slot.
-    ///
-    /// AIR reaches this shape by punning a pointer: a function-constant initializer declares
-    /// `global i16`, the static initializer stores the supplied integer into it, and the entry
-    /// point spells `load half` from the same global. LLVM reads that as a reinterpretation of
-    /// the stored bytes, not as a numeric conversion, so the literal carries a bit pattern.
-    fn int_literal_bits_as_float(&mut self, value: u64, ty: &LlType) -> Result<Word, String> {
-        match ty {
-            LlType::Float => self.const_float32_bits(value as u32),
-            LlType::Half => self.const_float16_bits(value as u16),
-            LlType::BFloat => self.const_int(16, value & 0xffff),
-            other => Err(format!(
-                "native emitter: integer literal {value} used as non-int type {other:?}"
             )),
         }
     }

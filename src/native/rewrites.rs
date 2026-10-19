@@ -972,30 +972,6 @@ pub(crate) fn construct_cfg_functions_module(
             .then_some(function.def.as_ref().and_then(|def| def.result_id))
             .flatten()
     }));
-    // The two proxies above name a MISSING owner (a conditional with no merge, a back edge with no
-    // loop). A construct can also be owned and still badly nested, and that is what helper inlining
-    // produces: the callee's `OpReturn` becomes a branch to the caller's continuation, so a
-    // selection arm that used to terminate the function now leaves the construct through a block
-    // that is not its merge. Ask the owned contract itself which functions a control-flow rewrite is
-    // answerable for, instead of enumerating the ways one can be broken -- the same question, in the
-    // same words, that the module-wide gate asks a few steps later.
-    let value_types = module
-        .all_inst_iter()
-        .filter_map(|instruction| Some((instruction.result_id?, instruction.result_type?)))
-        .collect::<HashMap<_, _>>();
-    selected.extend(module.functions.iter().filter_map(|function| {
-        crate::native::owned_cfg::owned_function_construction_error(function, &value_types)?;
-        function.def.as_ref().and_then(|def| def.result_id)
-    }));
-    // A function that is already structured needs no construction, and neither construction offers
-    // one for it, so leaving it in `selected` turns "nothing to do" into "no construction was
-    // available" -- which the caller reads as a module-level failure.
-    selected.retain(|id| {
-        !module.functions.iter().any(|function| {
-            function.def.as_ref().and_then(|def| def.result_id) == Some(*id)
-                && function_is_already_structured(function)
-        })
-    });
     if selected.is_empty() {
         return Ok(());
     }
@@ -1151,31 +1127,6 @@ pub(crate) fn unowned_selection_header_labels(
         .collect()
 }
 
-/// Whether a function is one block ending without a successor, and so is already structured.
-///
-/// Such a function has no selection to merge and no loop to close. Neither the nesting structurizer
-/// nor the state-machine construction can change it, and neither needs to.
-///
-/// It still reaches selection, because `construction_names` is decided by typed source planning --
-/// before helper inlining and constant folding run. By the time construction happens, a named
-/// function can have collapsed to its entry block. The state-machine construction then declines it,
-/// correctly and by name (`too-few-blocks`), and with nothing else selected the caller reports that
-/// no construction was available. That is a module-level failure, and the recovery is to rebuild
-/// EVERY buffer in the module as raw bytes: 79 of the 14579 corpus sources lose their typed buffer
-/// representation this way, for a function that was already fine.
-fn function_is_already_structured(function: &crate::spirv_module::Function) -> bool {
-    let [block] = function.blocks.as_slice() else {
-        return false;
-    };
-    !matches!(
-        block
-            .instructions
-            .last()
-            .map(|instruction| instruction.class.opcode),
-        Some(Op::Branch | Op::BranchConditional | Op::Switch)
-    )
-}
-
 pub(crate) fn function_has_unowned_backedge(function: &crate::spirv_module::Function) -> bool {
     let labels = function
         .blocks
@@ -1234,7 +1185,7 @@ pub(crate) fn function_has_unowned_backedge(function: &crate::spirv_module::Func
             predecessors[successor].push(block);
         }
     }
-    let (reachable, dominance, _) = crate::dominators::dominance(&successors, &predecessors);
+    let (reachable, dominance, _) = super::dominators::dominance(&successors, &predecessors);
     let loop_headers = function
         .blocks
         .iter()
@@ -1555,8 +1506,7 @@ mod tests {
                     Some(21),
                     vec![Operand::IdRef(4), Operand::IdRef(6)],
                 ),
-                "native emitter: owned IAdd operands do not match its result type: operand 1 is \
-                 %6, of type %2 (TypeFloat 32), but the result type is %1 (TypeInt 32 0)",
+                "native emitter: owned IAdd operands do not match its result type",
             ),
             (
                 inst(
@@ -1583,13 +1533,11 @@ mod tests {
                     Some(21),
                     vec![Operand::IdRef(7), Operand::IdRef(4)],
                 ),
-                "native emitter: owned LogicalAnd operands do not match its result type: \
-                 operand 1 is %4, of type %1 (TypeInt 32 0), but the result type is %3 (TypeBool)",
+                "native emitter: owned LogicalAnd operands do not match its result type",
             ),
             (
                 inst(Op::CopyObject, Some(1), Some(21), vec![Operand::IdRef(6)]),
-                "native emitter: owned CopyObject operands do not match its result type: \
-                 operand 0 is %6, of type %2 (TypeFloat 32), but the result type is %1 (TypeInt 32 0)",
+                "native emitter: owned CopyObject operands do not match its result type",
             ),
             (
                 inst(
@@ -1675,10 +1623,7 @@ mod tests {
 
         assert_eq!(
             owned_invalid_error(&module).as_deref(),
-            Some(
-                "native emitter: owned IAdd operands do not match its result type: operand 0 is \
-                 %4, of type %1 (TypeInt 32 0), but the result type is %2 (TypeFloat 32)"
-            )
+            Some("native emitter: owned IAdd operands do not match its result type")
         );
         let bytes = module
             .assemble()
@@ -1982,69 +1927,6 @@ mod tests {
         construct_cfg_functions_module(&mut module, &HashSet::from(["inlined_helper".to_string()]))
             .expect("unselected module remains unchanged");
         assert_eq!(module.functions[0].blocks.len(), 2);
-    }
-
-    /// Typed source planning names the functions to construct before helper inlining and constant
-    /// folding run, so a named function can be one block by the time construction happens. Neither
-    /// construction changes such a function and neither needs to, but reporting that as "no
-    /// construction was available" makes the caller rebuild every buffer in the module as raw
-    /// bytes. 79 of the 14579 corpus sources took that recovery for a function already fine.
-    #[test]
-    fn a_named_function_folded_to_one_returning_block_needs_no_construction() {
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(20));
-        let mut function = Function::new();
-        function.def = Some(inst(Op::Function, None, Some(15), vec![]));
-        function.blocks = vec![Block {
-            label: Some(inst(Op::Label, None, Some(16), vec![])),
-            instructions: vec![inst(Op::Return, None, None, vec![])],
-        }];
-        module.functions.push(function);
-        module.debug_names.push(inst(
-            Op::Name,
-            None,
-            None,
-            vec![
-                Operand::IdRef(15),
-                Operand::LiteralString("folded_helper".to_string()),
-            ],
-        ));
-
-        construct_cfg_functions_module(&mut module, &HashSet::from(["folded_helper".to_string()]))
-            .expect("a single returning block is already structured");
-        assert_eq!(module.functions[0].blocks.len(), 1);
-    }
-
-    /// The exception: one block can still branch to ITSELF, which is a loop with no structured
-    /// merge. That one is not already structured and must stay selected.
-    #[test]
-    fn a_named_function_whose_one_block_branches_to_itself_stays_selected() {
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(20));
-        let mut function = Function::new();
-        function.def = Some(inst(Op::Function, None, Some(15), vec![]));
-        function.blocks = vec![Block {
-            label: Some(inst(Op::Label, None, Some(16), vec![])),
-            instructions: vec![inst(Op::Branch, None, None, vec![Operand::IdRef(16)])],
-        }];
-        module.functions.push(function);
-        module.debug_names.push(inst(
-            Op::Name,
-            None,
-            None,
-            vec![
-                Operand::IdRef(15),
-                Operand::LiteralString("self_loop".to_string()),
-            ],
-        ));
-
-        let error =
-            construct_cfg_functions_module(&mut module, &HashSet::from(["self_loop".to_string()]))
-                .expect_err("a self-branching block is not already structured");
-        assert!(
-            error.contains("cannot be constructed"),
-            "expected the selection to survive to the decline, got {error}"
-        );
     }
 
     #[test]

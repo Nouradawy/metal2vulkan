@@ -61,117 +61,6 @@ fn is_location_debug(opcode: Op) -> bool {
     matches!(opcode, Op::Line | Op::NoLine)
 }
 
-/// Successor block labels of one owned `Block`, read from its terminator. Branch/BranchConditional
-/// arms in operand order; switch default + case targets sorted and deduped. Non-terminating or
-/// unstructured-terminator blocks yield no successors.
-///
-/// Lives here, beside `Block` itself, because BOTH the native emitter and the final passes ask this
-/// question of the same carrier. The passes layer must not depend on `native` (that would invert the
-/// ownership direction), which is why each side used to keep a byte-identical private copy -- but a
-/// crate-level module both already import `Block` from is not that dependency. `native::cfg::graph`
-/// and `passes::spirv_cfg` re-export these under their local names, so no call site moved.
-pub(crate) fn block_successors(block: &Block) -> Vec<Word> {
-    fn id_ref(operand: &Operand) -> Option<Word> {
-        match operand {
-            Operand::IdRef(id) => Some(*id),
-            _ => None,
-        }
-    }
-    let Some(inst) = block.instructions.last() else {
-        return Vec::new();
-    };
-    match inst.class.opcode {
-        Op::Branch => inst.operands.first().and_then(id_ref).into_iter().collect(),
-        Op::BranchConditional => inst
-            .operands
-            .iter()
-            .skip(1)
-            .take(2)
-            .filter_map(id_ref)
-            .collect(),
-        Op::Switch => {
-            let mut out = Vec::new();
-            if let Some(default) = inst.operands.get(1).and_then(id_ref) {
-                out.push(default);
-            }
-            let mut idx = 3;
-            while idx < inst.operands.len() {
-                if let Some(target) = inst.operands.get(idx).and_then(id_ref) {
-                    out.push(target);
-                }
-                idx += 2;
-            }
-            out.sort_unstable();
-            out.dedup();
-            out
-        }
-        _ => Vec::new(),
-    }
-}
-
-/// Forward-edge adjacency of an owned SPIR-V function body keyed by block label id
-/// (via [`block_successors`]). Blocks without a label id are skipped.
-pub(crate) fn block_successors_by_label(blocks: &[Block]) -> HashMap<Word, Vec<Word>> {
-    blocks
-        .iter()
-        .filter_map(|block| Some((block.label.as_ref()?.result_id?, block_successors(block))))
-        .collect()
-}
-
-/// Element type and length of an `OpTypeArray`, or `None` for any other type or a length whose
-/// constant is not a 32-bit literal. One definition for both the emitter's AIR struct-offset check
-/// and the stage-input layout pass.
-pub(crate) fn array_type(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<(Word, u32)> {
-    let def = defs.get(&ty)?;
-    if def.class.opcode != Op::TypeArray {
-        return None;
-    }
-    let elem = match def.operands.first()? {
-        Operand::IdRef(elem) => *elem,
-        _ => return None,
-    };
-    let len_const = match def.operands.get(1)? {
-        Operand::IdRef(len_const) => *len_const,
-        _ => return None,
-    };
-    let len = defs
-        .get(&len_const)
-        .and_then(|constant| match constant.operands.first() {
-            Some(Operand::LiteralBit32(len)) => Some(*len),
-            _ => None,
-        })?;
-    Some((elem, len))
-}
-
-/// Width of an `OpTypeInt`, or `None` if `ty` is not one. A missing width literal reads as 32.
-pub(crate) fn type_int_width(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<u32> {
-    let def = defs.get(&ty)?;
-    (def.class.opcode == Op::TypeInt).then(|| match def.operands.first() {
-        Some(Operand::LiteralBit32(width)) => *width,
-        _ => 32,
-    })
-}
-
-/// Width of an `OpTypeFloat`, or `None` if `ty` is not one. A missing width literal reads as 32.
-pub(crate) fn type_float_width(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<u32> {
-    let def = defs.get(&ty)?;
-    (def.class.opcode == Op::TypeFloat).then(|| match def.operands.first() {
-        Some(Operand::LiteralBit32(width)) => *width,
-        _ => 32,
-    })
-}
-
-/// The storage classes in which `OpPtrAccessChain` is legal (it needs an array-stride-decorated
-/// pointer, which only these carry).
-pub(crate) fn ptr_access_chain_allowed_storage(storage: spirv::StorageClass) -> bool {
-    matches!(
-        storage,
-        spirv::StorageClass::Workgroup
-            | spirv::StorageClass::StorageBuffer
-            | spirv::StorageClass::PhysicalStorageBuffer
-    )
-}
-
 pub(crate) fn is_block_terminator(opcode: Op) -> bool {
     matches!(
         opcode,
@@ -687,7 +576,7 @@ pub(crate) type Module = SpirvModule;
 #[derive(Clone, Copy)]
 enum LiteralType {
     Integer { signed: bool },
-    Float { width: u32 },
+    Float,
 }
 
 #[derive(Default)]
@@ -709,10 +598,7 @@ impl LiteralTypeTracker {
                 }
                 _ => None,
             },
-            Op::TypeFloat => match instruction.operands.as_slice() {
-                [Operand::LiteralBit32(width), ..] => Some(LiteralType::Float { width: *width }),
-                _ => None,
-            },
+            Op::TypeFloat => Some(LiteralType::Float),
             _ => instruction
                 .result_type
                 .and_then(|result_type| self.types.get(&result_type).copied()),
@@ -758,19 +644,12 @@ fn disassemble_constant(instruction: &Instruction, literal_types: &LiteralTypeTr
         Operand::LiteralBit32(value) => match literal_type {
             LiteralType::Integer { signed: true } => (value as i32).to_string(),
             LiteralType::Integer { signed: false } => value.to_string(),
-            // A `half` literal lives in the low 16 bits of the word, so reading the whole word as
-            // an `f32` prints a subnormal: 65504 came out as 0.000000000000000000000000000000000000000044481.
-            // Nothing crashed on that, but it made every half constant unreadable, and it is why
-            // no test asserted the VALUE of one -- only that some constant was there.
-            LiteralType::Float { width: 16 } => {
-                crate::float16::f16_bits_to_f32(value as u16).to_string()
-            }
-            LiteralType::Float { .. } => f32::from_bits(value).to_string(),
+            LiteralType::Float => f32::from_bits(value).to_string(),
         },
         Operand::LiteralBit64(value) => match literal_type {
             LiteralType::Integer { signed: true } => (value as i64).to_string(),
             LiteralType::Integer { signed: false } => value.to_string(),
-            LiteralType::Float { .. } => f64::from_bits(value).to_string(),
+            LiteralType::Float => f64::from_bits(value).to_string(),
         },
         _ => return instruction.disassemble(),
     };
@@ -990,50 +869,6 @@ mod tests {
     use spirv::{
         AddressingModel, Capability, ExecutionModel, FunctionControl, GlslStd450Op, MemoryModel,
     };
-
-    /// Constants are disassembled at the width of their own type.
-    ///
-    /// A `half` literal sits in the low 16 bits of a 32-bit word, so reading the word as an `f32`
-    /// turns every one of them into a subnormal -- 65504 printed as 4.4481e-41. The three widths
-    /// share one code path and only the float ones need the width: narrow integer literals are
-    /// already sign- or zero-extended to fill the word.
-    #[test]
-    fn constants_disassemble_at_the_width_of_their_type() {
-        let mut module = SpirvModule::new();
-        module.header = Some(ModuleHeader::new(9));
-        let mut ty = |id: Word, opcode: Op, operands: Vec<Operand>| {
-            module
-                .types_global_values
-                .push(Instruction::new(opcode, None, Some(id), operands));
-        };
-        ty(1, Op::TypeFloat, vec![Operand::LiteralBit32(16)]);
-        ty(2, Op::TypeFloat, vec![Operand::LiteralBit32(32)]);
-        ty(
-            3,
-            Op::TypeInt,
-            vec![Operand::LiteralBit32(16), Operand::LiteralBit32(1)],
-        );
-        for (id, ty_id, bits) in [
-            (4u32, 1u32, 0x7bffu32), // half 65504
-            (5, 1, 0x7c00),          // half +inf
-            (6, 1, 0xbc00),          // half -1
-            (7, 2, 0x3f80_0000),     // float 1
-            (8, 3, 0xffff_ffff),     // short -1, sign-extended
-        ] {
-            module.types_global_values.push(Instruction::new(
-                Op::Constant,
-                Some(ty_id),
-                Some(id),
-                vec![Operand::LiteralBit32(bits)],
-            ));
-        }
-        let asm = module.disassemble();
-        assert!(asm.contains("%4 = OpConstant  %1  65504"), "{asm}");
-        assert!(asm.contains("%5 = OpConstant  %1  inf"), "{asm}");
-        assert!(asm.contains("%6 = OpConstant  %1  -1"), "{asm}");
-        assert!(asm.contains("%7 = OpConstant  %2  1"), "{asm}");
-        assert!(asm.contains("%8 = OpConstant  %3  -1"), "{asm}");
-    }
 
     fn fixture_words() -> Vec<Word> {
         let mut module = SpirvModule::new();

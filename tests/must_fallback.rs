@@ -469,49 +469,6 @@ entry:
         translate_sanitized_native(&constant, Stage::Kernel, &tmp()).is_ok(),
         "a bare function-constant parameter has no role to reject"
     );
-
-    // ...and the wrapper in front of a real role is not the same thing. Only a gate this module's
-    // own initializers drive to ZERO leaves the parameter out of the variant; behind a predicate the
-    // evaluator cannot fold, the unmodelled role is still one the emitter reads as a zero.
-    let gated = |constructor: &str| {
-        KERNEL
-            .replace(
-                r#"!"air.ROLE""#,
-                r#"!"air.function_constant", !5, !"air.system_value_that_does_not_exist""#,
-            )
-            .replace(
-                "!air.kernel",
-                &format!(
-                    "@gate = internal addrspace(2) global i8 0, align 1\n\
-                     @mirror = internal addrspace(2) global i8 undef, align 1\n\
-                     define internal void @ctor() #0 section \"air.static_init\" {{\n\
-                     {constructor}\n  ret void\n}}\n\
-                     !5 = !{{ptr addrspace(2) @gate, !\"bool\", !\"gate\"}}\n!air.kernel"
-                ),
-            )
-    };
-    let disabled = gated("  store i8 0, ptr addrspace(2) @gate, align 1");
-    assert!(
-        translate_sanitized_native(&disabled, Stage::Kernel, &tmp()).is_ok(),
-        "a gate this module drives to zero leaves the parameter out; there is nothing to reject"
-    );
-    // Read before written, out of a mirror global with no initializer to fold: the corpus's own
-    // spelling of a predicate this evaluator cannot decide.
-    let unresolved = gated(
-        "  %v = load i8, ptr addrspace(2) @mirror, align 1\n  \
-         store i8 %v, ptr addrspace(2) @gate, align 1",
-    );
-    match translate_sanitized_native(&unresolved, Stage::Kernel, &tmp()) {
-        Ok(spv) => panic!(
-            "expected a clean FALLBACK but translate succeeded ({} bytes); a function-constant \
-             wrapper is not evidence the parameter is absent",
-            spv.len()
-        ),
-        Err(e) => assert!(
-            e.contains("air.system_value_that_does_not_exist"),
-            "the diagnostic should name the wrapped role; got: {e}"
-        ),
-    }
 }
 
 /// A builtin entry parameter whose type is not the builtin's type.
@@ -522,9 +479,12 @@ entry:
 /// `[[front_facing]]` it could not wire called every triangle back-facing — in a module that
 /// validated and reflected as though the builtin were connected.
 ///
-/// Unlike an unmodelled role, this branch is unreachable on real AIR: Metal fixes each attribute's
-/// type, and over 2880 corpus sources no module takes it. So the rejection costs nothing and exists
-/// to keep the silent zero from coming back.
+/// `[[front_facing]]` is the one reachable exception: macOS 26's own fragment shaders carry it as
+/// an integer, so an integer parameter translates as a select of the boolean builtin (see
+/// `native_fragment_integer_front_facing_selects_from_the_bool_builtin`) and only a type that is
+/// neither bool nor integer is refused. For the others the branch is unreachable on real AIR —
+/// Metal fixes each attribute's type — and the rejection exists to keep the silent zero from
+/// coming back.
 #[test]
 fn a_builtin_parameter_of_the_wrong_type_fallbacks() {
     const FRAGMENT: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
@@ -558,6 +518,7 @@ entry:
         ("position", "float4", "<4 x float>"),
         ("point_coord", "float2", "<2 x float>"),
         ("front_facing", "bool", "i1"),
+        ("front_facing", "uint", "i32"),
     ] {
         assert!(
             translate_sanitized_native(&build(role, name, ty), Stage::Fragment, &tmp()).is_ok(),
@@ -569,7 +530,7 @@ entry:
     for (role, name, ty, needle) in [
         ("position", "float2", "<2 x float>", "float4"),
         ("point_coord", "float4", "<4 x float>", "float2"),
-        ("front_facing", "uint", "i32", "bool"),
+        ("front_facing", "float", "float", "bool"),
     ] {
         match translate_sanitized_native(&build(role, name, ty), Stage::Fragment, &tmp()) {
             Ok(spv) => panic!(
@@ -670,78 +631,6 @@ define fastcc void @store_vec(ptr %0) {
     assert_fallback(ll, "no dynamic-struct-index rewrite repaired");
 }
 
-/// A sampler whose exact state the shader picks at run time.
-///
-/// The emitter cannot represent a select between two `__air_sampler_state` globals as a SPIR-V
-/// pointer value, so it leaves a private placeholder and both states are gone by the time the
-/// sample lowers. The only sampler left to hand `OpSampledImage` is the translator's own
-/// nearest/clamp default -- a different filter and address mode than either branch asked for, in a
-/// module that validates, binds and reflects as though the shader had asked for that default. Nine
-/// of 14579 local corpus sources reach it.
-///
-/// Pinned from both sides over one template: sampling through either state UNCONDITIONALLY is the
-/// ordinary constexpr-sampler path and must keep translating, so a future recovery of the selected
-/// form has to change this test rather than pass it by accident.
-#[test]
-fn a_runtime_selected_sampler_state_fallbacks() {
-    const FRAGMENT: &str = r#"target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant i64 -9188470239253757879, align 8
-@__air_sampler_state.1 = internal addrspace(2) constant i64 -9188470239253755831, align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex) {
-entry:
-  %edge = extractelement <2 x float> %coord, i64 0
-  %wide = fcmp oge float %edge, 1.000000e+00
-SAMPLER_CHOICE
-  %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) SAMPLER_OPERAND, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %color = extractvalue { <4 x float>, i8 } %sample, 0
-  ret <4 x float> %color
-}
-declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-!air.fragment = !{!0}
-!air.sampler_states = !{!7, !8}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
-!7 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.1}
-"#;
-
-    let selected = FRAGMENT
-        .replace(
-            "SAMPLER_CHOICE",
-            "  %s = select i1 %wide, ptr addrspace(2) @__air_sampler_state, \
-             ptr addrspace(2) @__air_sampler_state.1",
-        )
-        .replace("SAMPLER_OPERAND", "%s");
-    match translate_sanitized_native(&selected, Stage::Fragment, &tmp()) {
-        Ok(spv) => panic!(
-            "expected a clean FALLBACK but translate succeeded ({} bytes); a sample through a \
-             default sampler neither branch asked for is a silently wrong module",
-            spv.len()
-        ),
-        Err(e) => assert!(
-            e.contains("sampler operand is a pointer"),
-            "FALLBACK diagnostic should name the unrecovered sampler operand; got: {e}"
-        ),
-    }
-
-    for state in ["@__air_sampler_state", "@__air_sampler_state.1"] {
-        let fixed = FRAGMENT
-            .replace("SAMPLER_CHOICE", "")
-            .replace("SAMPLER_OPERAND", state);
-        assert!(
-            translate_sanitized_native(&fixed, Stage::Fragment, &tmp()).is_ok(),
-            "sampling unconditionally through {state} must keep translating"
-        );
-    }
-}
-
 /// A sampler argument AIR states occupies more than one descriptor.
 ///
 /// `air.location_index` carries two operands, the Metal slot and the descriptor count, and Metal
@@ -752,15 +641,15 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 /// sources declare one.
 ///
 /// Pinned from both sides over one template, so the boundary is what is fixed: the ordinary
-/// single-sampler spelling of the same kernel -- one declared descriptor, sampled straight off the
-/// entry parameter -- must keep translating.
+/// single-sampler spelling of the same kernel must keep translating.
 #[test]
 fn a_sampler_descriptor_array_fallbacks() {
     const KERNEL: &str = r#"target triple = "spirv-unknown-vulkan1.2"
 
-define void @k(ptr addrspace(1) %tex, SAMPLER_PARAM, ptr addrspace(1) %out) {
+define void @k(ptr addrspace(1) %tex, ptr readonly byval([8 x ptr addrspace(2)]) captures(none) %samps, ptr addrspace(1) %out) {
 entry:
-SAMPLER_ELEMENT
+  %slot = getelementptr inbounds [8 x ptr addrspace(2)], ptr %samps, i32 0, i32 5
+  %s = load ptr addrspace(2), ptr %slot, align 8
   %sample = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %s, <2 x float> zeroinitializer, i1 false, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
   %color = extractvalue { <4 x float>, i8 } %sample, 0
   store <4 x float> %color, ptr addrspace(1) %out, align 16
@@ -778,15 +667,7 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
 
     let array = KERNEL
         .replace("i32 COUNT", "i32 8")
-        .replace("SAMPLER_TYPE", "array<sampler, 8>")
-        .replace(
-            "SAMPLER_PARAM",
-            "ptr readonly byval([8 x ptr addrspace(2)]) captures(none) %samps",
-        )
-        .replace(
-            "SAMPLER_ELEMENT",
-            "  %slot = getelementptr inbounds [8 x ptr addrspace(2)], ptr %samps, i32 0, i32 5\n               %s = load ptr addrspace(2), ptr %slot, align 8",
-        );
+        .replace("SAMPLER_TYPE", "array<sampler, 8>");
     match translate_sanitized_native(&array, Stage::Kernel, &tmp()) {
         Ok(spv) => panic!(
             "expected a clean FALLBACK but translate succeeded ({} bytes); a sample through a \
@@ -805,11 +686,41 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
         }
     }
 
-    let single = KERNEL
+    // The ordinary spelling of one sampler is the pointer parameter itself. Rewriting only the
+    // metadata count while the body still loads element 5 of a by-value array is not that: the
+    // load resolves to no descriptor either way, and it used to "translate" only because the
+    // sample silently took the synthesized default sampler. It now refuses like the array does.
+    let byval_single = KERNEL
         .replace("i32 COUNT", "i32 1")
-        .replace("SAMPLER_TYPE", "sampler")
-        .replace("SAMPLER_PARAM", "ptr addrspace(2) %s")
-        .replace("SAMPLER_ELEMENT", "");
+        .replace("SAMPLER_TYPE", "sampler");
+    match translate_sanitized_native(&byval_single, Stage::Kernel, &tmp()) {
+        Ok(spv) => panic!(
+            "a sample through an element load that resolves to no sampler descriptor translated \
+             ({} bytes) instead of refusing",
+            spv.len()
+        ),
+        Err(e) => assert!(
+            e.contains("does not resolve to a Metal sampler argument"),
+            "the diagnostic should say why; got: {e}"
+        ),
+    }
+    let single = KERNEL
+        .replace(
+            "ptr readonly byval([8 x ptr addrspace(2)]) captures(none) %samps",
+            "ptr addrspace(2) %samps",
+        )
+        .replace(
+            "  %slot = getelementptr inbounds [8 x ptr addrspace(2)], ptr %samps, i32 0, i32 5\n  \
+             %s = load ptr addrspace(2), ptr %slot, align 8\n",
+            "",
+        )
+        .replace("ptr addrspace(2) %s,", "ptr addrspace(2) %samps,")
+        .replace("i32 COUNT", "i32 1")
+        .replace("SAMPLER_TYPE", "sampler");
+    assert!(
+        !single.contains("byval") && !single.contains("%slot"),
+        "the single-sampler rewrite must not leave the array spelling behind:\n{single}"
+    );
     assert!(
         translate_sanitized_native(&single, Stage::Kernel, &tmp()).is_ok(),
         "the same kernel with an ordinary single sampler must translate"
@@ -882,335 +793,5 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
         )
         .is_ok(),
         "the same kernel whose two statements of the length agree must translate"
-    );
-}
-
-/// A texture write reachable only when a `[[function_constant]]` VALUE matches, which pins the
-/// difference between a predicate AIR answers and a value AIR does not.
-///
-/// `air.is_function_constant_defined` folding to `false` is AIR's own answer for a constant nobody
-/// supplied, and the pair above depends on it. Reading the constant's *value* is a different
-/// question: AIR leaves the `air.fc_initializer` global `undef`, and `meta::globals` reads that as
-/// zero so the same dead-region fold can run. Zero is not a default the shader declared, so when it
-/// is what removed the entry's every texture write, the module we would emit cannot write the
-/// texture its AIR writes -- 55 of the 14579 local corpus sources, 28 of which regain an image
-/// write the moment any value is put in place of the `undef`.
-///
-/// Pinned as a pair over one template differing in a single token, the sentinel the folded zero is
-/// compared against:
-///
-/// - sentinel 0 -> the folded value selects the write, and the kernel translates;
-/// - sentinel 1 -> it selects nothing, and the kernel must FALLBACK rather than report success.
-///
-/// Deleting the check turns the second into a silent success that writes nothing; widening it to
-/// fire whenever a module has function constants turns the first into a FALLBACK.
-const FC_VALUE_GATED_WRITE: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
-
-@size.MTL_FC_INIT_0_t = internal addrspace(2) externally_initialized constant i16 undef, section "air.fc_initializer", align 2
-@kSamplingSize = internal unnamed_addr addrspace(2) global i16 0, align 2
-@tg = internal addrspace(3) global float undef, align 4
-@tgi = internal addrspace(3) global i32 undef, align 4
-
-declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
-declare i32 @air.atomic.local.add.u.i32(ptr addrspace(3), i32, i32, i32, i1)
-
-define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
-  %1 = load i16, ptr addrspace(2) @size.MTL_FC_INIT_0_t, align 2
-  store i16 %1, ptr addrspace(2) @kSamplingSize, align 2
-  ret void
-}
-
-define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out, <2 x i32> %gid) {
-entry:
-  %s = load i16, ptr addrspace(2) @kSamplingSize, align 2
-  %c = icmp eq i16 %s, SENTINEL
-  br i1 %c, label %write, label %done
-
-write:
-  GATED
-  br label %done
-
-done:
-  ALWAYS
-  ret void
-}
-
-!air.kernel = !{!0}
-!air.function_constants = !{!6}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"tex"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
-!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
-!6 = !{ptr addrspace(2) @size.MTL_FC_INIT_0_t, !"ushort", !"kSamplingSize", i32 0, i1 true}
-"#;
-
-const TEXTURE_WRITE: &str = "call void @air.write_texture_2d.v4f32(ptr addrspace(1) %tex, <2 x i32> %gid, <4 x float> zeroinitializer, i32 0, i32 2)";
-const DEVICE_STORE: &str = "store float 1.000000e+00, ptr addrspace(1) %out, align 4";
-/// Threadgroup scratch: a real store, to memory that dies with the dispatch.
-const THREADGROUP_STORE: &str = "store float 1.000000e+00, ptr addrspace(3) @tg, align 4";
-/// The same, as a threadgroup counter rather than a store -- an atomic read-modify-write is the
-/// other arm of [`module_has_an_observable_effect`], and the one the corpus does not exercise.
-const THREADGROUP_ATOMIC: &str = "%bump = call i32 @air.atomic.local.add.u.i32(ptr addrspace(3) \
-                                  @tgi, i32 1, i32 0, i32 1, i1 true)";
-
-/// `FC_VALUE_GATED_WRITE` with the sentinel the folded constant is compared against, the write the
-/// constant gates, and any write that runs unconditionally.
-fn fc_value_gated_write(sentinel: &str, gated: &str, ungated: &str) -> String {
-    for placeholder in ["SENTINEL", "GATED", "ALWAYS"] {
-        assert!(
-            FC_VALUE_GATED_WRITE.contains(placeholder),
-            "the {placeholder} placeholder must survive edits to the template"
-        );
-    }
-    FC_VALUE_GATED_WRITE
-        .replace("SENTINEL", sentinel)
-        .replace("GATED", gated)
-        .replace("ALWAYS", ungated)
-}
-
-fn assert_translates(ll: &str, why: &str) {
-    let spv = translate_sanitized_native(ll, Stage::Kernel, &tmp())
-        .unwrap_or_else(|error| panic!("{why}; got FALLBACK: {error}"));
-    assert!(!spv.is_empty(), "{why}; got an empty module");
-}
-
-const ERASED: &str =
-    "no write survived folding 1 function constant(s) the caller supplied no value for";
-
-#[test]
-fn a_function_constant_value_that_selects_the_write_still_translates() {
-    assert_translates(
-        &fc_value_gated_write("0", TEXTURE_WRITE, ""),
-        "the folded constant selects the write, so the module writes its texture",
-    );
-}
-
-#[test]
-fn a_function_constant_value_that_erases_every_write_fallbacks() {
-    assert_fallback(&fc_value_gated_write("1", TEXTURE_WRITE, ""), ERASED);
-}
-
-/// The same erasure reached through a device buffer store rather than a texture write. 81 of the
-/// 117 corpus sources the check names are this form, so pinning only the texture one would leave
-/// most of it untested.
-#[test]
-fn a_function_constant_value_that_erases_every_device_store_fallbacks() {
-    assert_fallback(&fc_value_gated_write("1", DEVICE_STORE, ""), ERASED);
-}
-
-/// A store into threadgroup memory is not the write the AIR promised. `Workgroup` scratch dies with
-/// the dispatch, so a folded module that keeps only its staging stores can no more be observed by
-/// the caller than one that keeps only its allocas -- and it is the shape that actually occurs:
-/// 17 corpus sources emit no store outside `Function`, `Private` and `Workgroup` while their AIR
-/// writes a device buffer or a texture (`b118683b` writes 157 textures in its AIR and emits 852
-/// Private stores, 4 Function and 2 Workgroup, and no image write at all).
-///
-/// Counting `Workgroup` was what let all 17 report success.
-#[test]
-fn a_threadgroup_store_is_not_the_write_the_air_promised() {
-    assert_fallback(
-        &fc_value_gated_write("1", DEVICE_STORE, THREADGROUP_STORE),
-        ERASED,
-    );
-}
-
-/// The atomic arm of the same rule. `OpAtomicIAdd` on a `Workgroup` pointer is a threadgroup
-/// counter: no more visible to a caller than the threadgroup store above, and the emitted module
-/// really does contain one (`%52 = OpAtomicIAdd %uint %tgi ...`) with nothing else surviving.
-///
-/// No corpus source needs this -- measured over all 14579, none has a local-storage atomic or
-/// `OpCopyMemory` as its only surviving effect, and making the rule uniform moves nothing. It is
-/// here because the asymmetry is what caused the bug the test above pins: stores were classified by
-/// storage class and atomics were counted wherever they appeared, so a folded module that kept a
-/// threadgroup counter would answer "something survived" for the same wrong reason 17 sources did.
-#[test]
-fn a_threadgroup_atomic_is_not_the_write_the_air_promised() {
-    assert_fallback(
-        &fc_value_gated_write("1", DEVICE_STORE, THREADGROUP_ATOMIC),
-        ERASED,
-    );
-}
-
-/// The control for the test above, and the reason it is not simply a wider refusal: the same module
-/// with the constant selecting its device store keeps translating. The threadgroup store is not
-/// what is being refused -- having nothing else is.
-#[test]
-fn a_threadgroup_store_alongside_a_live_device_store_keeps_the_module() {
-    assert_translates(
-        &fc_value_gated_write("0", DEVICE_STORE, THREADGROUP_STORE),
-        "the folded constant selects the device store, so threadgroup scratch beside it is \
-         irrelevant",
-    );
-}
-
-/// And the direction that keeps the check from being a blanket refusal of function-constant
-/// shaders: one surviving observable write is enough, whatever kind it is and whether or not the
-/// gated one died. Narrowing the emitted-side predicate back to image writes alone fails this,
-/// which is how four corpus modules were over-refused before the predicate was widened.
-#[test]
-fn one_surviving_write_of_another_kind_keeps_the_module() {
-    assert_translates(
-        &fc_value_gated_write("1", TEXTURE_WRITE, DEVICE_STORE),
-        "the device store runs unconditionally, so the module still writes",
-    );
-    assert_translates(
-        &fc_value_gated_write("1", DEVICE_STORE, TEXTURE_WRITE),
-        "the texture write runs unconditionally, so the module still writes",
-    );
-}
-
-/// A Metal imageblock is threadgroup tile memory the render pass resolves into its attachments when
-/// the tile finishes. Vulkan has no resolve step and this translator has no attachment to resolve
-/// into, so imageblock cells are staged in per-invocation `Private` (or per-threadgroup
-/// `Workgroup`) memory. That is the right model for a kernel that stages a cell and then writes a
-/// texture or a device buffer -- but a Metal tile CLEAR kernel writes nothing else, and it used to
-/// translate into a module that validates, reflects no resource at all, and clears nothing. 16 of
-/// the 14579 local corpus sources are that shape (`vst::splat::hw_rasterizer::clearColor*Kernel`,
-/// `xdr::*_block`, `DaVinci::resetLM`, `CC_WarpedDataClear`).
-///
-/// `ALWAYS` is any write that runs beside the imageblock store.
-const IMAGEBLOCK_ONLY_WRITE: &str = r#"target triple = "spirv-unknown-vulkan1.2"
-%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
-
-define void @k(%"struct.metal::_imageblock_base" %blk, <2 x i16> %tid, ptr addrspace(1) %out) {
-entry:
-  %cell = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
-  store <4 x half> zeroinitializer, ptr addrspace(4) %cell, align 8
-  ALWAYS
-  ret void
-}
-
-declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !6}
-!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ColorBlock, layout_explicit>", !"air.arg_name", !"colorBlock"}
-!4 = !{i32 0, i32 8, i32 0, !"half4", !"color"}
-!5 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-!6 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
-"#;
-
-fn imageblock_only_write(ungated: &str) -> String {
-    assert!(
-        IMAGEBLOCK_ONLY_WRITE.contains("ALWAYS"),
-        "the ALWAYS placeholder must survive edits to the template"
-    );
-    IMAGEBLOCK_ONLY_WRITE.replace("ALWAYS", ungated)
-}
-
-#[test]
-fn an_imageblock_is_not_a_write_a_caller_can_observe() {
-    assert_fallback(
-        &imageblock_only_write(""),
-        "the entry's only write is into an imageblock",
-    );
-}
-
-/// The control, and the reason this is not a blanket refusal of tile kernels: the same imageblock
-/// store beside one device store keeps translating. 66 corpus sources stage a cell and then write
-/// something a caller owns, and none of them may be refused for staging one.
-#[test]
-fn an_imageblock_store_alongside_a_device_store_keeps_the_module() {
-    assert_translates(
-        &imageblock_only_write(DEVICE_STORE),
-        "the device store runs unconditionally, so staging an imageblock cell beside it is \
-         irrelevant",
-    );
-}
-
-/// A write the AIR spells only as an INTRINSIC. `air_declares_an_observable_write` used to know
-/// two spellings -- `air.write_texture*` and a store through an `addrspace(1)` pointer -- and a
-/// kernel whose every write is an `air.atomic.global.*` has neither, so the AIR-side half of the
-/// pair answered "this module never claimed to write" and the emitted-side half was never asked.
-/// Three corpus kernels (`binFragmentsKernel`, `binFragmentsSpatialKernel`,
-/// `gatherNDGradient_base`) shipped that way, each with every function constant it folds declared
-/// REQUIRED, so the zero-variant they translated to is one Metal itself refuses to build.
-///
-/// `GATED` is the write the folded constant gates and `ALWAYS` one that runs regardless.
-const FC_GATED_DEVICE_ATOMIC: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
-
-@size.MTL_FC_INIT_0_t = internal addrspace(2) externally_initialized constant i16 undef, section "air.fc_initializer", align 2
-@kSamplingSize = internal unnamed_addr addrspace(2) global i16 0, align 2
-
-declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1) captures(none), i32, i32, i32, i1)
-declare i32 @air.atomic.global.load.u.i32(ptr addrspace(1) captures(none), i32, i32)
-
-define internal void @_GLOBAL__sub_I_fc() section "air.static_init" {
-  %1 = load i16, ptr addrspace(2) @size.MTL_FC_INIT_0_t, align 2
-  store i16 %1, ptr addrspace(2) @kSamplingSize, align 2
-  ret void
-}
-
-define void @k(ptr addrspace(1) %out, <2 x i32> %gid) {
-entry:
-  %s = load i16, ptr addrspace(2) @kSamplingSize, align 2
-  %c = icmp eq i16 %s, SENTINEL
-  br i1 %c, label %write, label %done
-
-write:
-  GATED
-  br label %done
-
-done:
-  ALWAYS
-  ret void
-}
-
-!air.kernel = !{!0}
-!air.function_constants = !{!4}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
-!5 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
-!4 = !{ptr addrspace(2) @size.MTL_FC_INIT_0_t, !"ushort", !"kSamplingSize", i32 0, i1 true}
-"#;
-
-const DEVICE_ATOMIC_ADD: &str =
-    "%bump = call i32 @air.atomic.global.add.u.i32(ptr addrspace(1) %out, i32 1, i32 0, i32 2, i1 true)";
-/// The one device atomic that leaves no value behind.
-const DEVICE_ATOMIC_LOAD: &str =
-    "%seen = call i32 @air.atomic.global.load.u.i32(ptr addrspace(1) %out, i32 0, i32 2)";
-
-fn fc_gated_device_atomic(sentinel: &str, gated: &str, ungated: &str) -> String {
-    for placeholder in ["SENTINEL", "GATED", "ALWAYS"] {
-        assert!(
-            FC_GATED_DEVICE_ATOMIC.contains(placeholder),
-            "the {placeholder} placeholder must survive edits to the template"
-        );
-    }
-    FC_GATED_DEVICE_ATOMIC
-        .replace("SENTINEL", sentinel)
-        .replace("GATED", gated)
-        .replace("ALWAYS", ungated)
-}
-
-#[test]
-fn a_device_atomic_is_a_write_the_air_promised() {
-    assert_fallback(&fc_gated_device_atomic("1", DEVICE_ATOMIC_ADD, ""), ERASED);
-}
-
-/// The control: the same atomic selected by the folded constant keeps translating, so this is not
-/// a blanket refusal of kernels that use device atomics.
-#[test]
-fn a_surviving_device_atomic_keeps_the_module() {
-    assert_translates(
-        &fc_gated_device_atomic("0", DEVICE_ATOMIC_ADD, ""),
-        "the folded constant selects the atomic, so the module still bumps its counter",
-    );
-}
-
-/// And the other direction of the one exclusion the marker list makes. A kernel whose only device
-/// atomic is a LOAD leaves no value behind; it is a no-op in Metal too, and refusing it would be
-/// refusing a shader that does exactly what it says.
-#[test]
-fn a_kernel_whose_only_device_atomic_is_a_load_still_translates() {
-    assert_translates(
-        &fc_gated_device_atomic("1", DEVICE_ATOMIC_LOAD, ""),
-        "an atomic load is not a write, so nothing was erased",
     );
 }

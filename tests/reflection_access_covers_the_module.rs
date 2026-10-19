@@ -11,14 +11,10 @@
 //! reconciled: 20 buffers reflected `ReadOnly` were stored through, 9 reflected `WriteOnly` were
 //! loaded from, and 3 reflected `Unused` were both.
 //!
-//! One direction is always a defect: an access narrower than what the module does. The other is a
-//! defect only where the walk is provably complete. Under Logical addressing, with no pointer
-//! rooted at the descriptor escaping into an operand slot the walk cannot follow, the walk saw
-//! every access, and the reflected access is exactly what it saw -- the same proof that lets the
-//! module decorate that descriptor `NonWritable` (`tests/nonwritable_covers_the_module.rs`).
-//! Everywhere else the walk can miss an access through a device address it cannot attribute, so it
-//! only widens and a `ReadWrite` on a buffer the module only reads stays legal. This file checks
-//! the direction that is never legal.
+//! Only one direction is a defect. Reflection may report `ReadWrite` for a buffer the module only
+//! reads: the walk that resolves an access to its descriptor follows the pointer graph it can, and
+//! an access through a device address it cannot attribute would be missed, so a narrower answer
+//! would be a guess. This file checks the direction that is not.
 
 use metal2vulkan::passes::{Stage, TransformOptions};
 use metal2vulkan::reflect::{ResourceAccess, ResourceKind, ShaderReflection};
@@ -27,16 +23,10 @@ use std::path::{Path, PathBuf};
 
 /// A kernel that contradicts both of its declared buffer accesses.
 ///
-/// `declared_read` carries AIR's `air.read` and is only stored through; `declared_write` carries
-/// `air.write` and is both loaded from and stored to. Both are ordinary Metal — AIR's declared
-/// access is not a guarantee about the body — and both used to be reported as the declaration
-/// rather than as what the shader does.
-///
-/// The two buffers separate the two failure modes. `declared_write` catches an access reported
-/// narrower than the module: it must be `ReadWrite`. `declared_read` catches the declaration
-/// leaking into the answer: the body never loads it, so `ReadOnly` would be a lie and `ReadWrite`
-/// would be the declaration's `air.read` ORed onto the module's store — an access no instruction
-/// performs, which is what a consumer would then stage and barrier for.
+/// `declared_read` carries AIR's `air.read` and is stored through; `declared_write` carries
+/// `air.write` and is loaded from. Both are ordinary Metal — AIR's declared access is not a
+/// guarantee about the body — and both used to be reported as the declaration rather than as what
+/// the shader does.
 const CONTRADICTED_ACCESS: &str = r#"target triple = "spirv-unknown-vulkan1.2"
 define void @k(ptr addrspace(1) %declared_read, ptr addrspace(1) %declared_write) {
 entry:
@@ -55,29 +45,18 @@ entry:
 "#;
 
 #[test]
-fn a_declared_access_the_body_contradicts_is_replaced_by_what_the_body_does() {
+fn a_declared_access_the_body_contradicts_is_widened_to_what_the_body_does() {
     let (spirv, reflection) = translate(CONTRADICTED_ACCESS, Stage::Kernel, "contradicted_access");
     assert_access_covers_the_module("the contradicted-access kernel", &spirv, &reflection);
 
-    for (metal_index, expected, why) in [
-        (
-            0u32,
-            ResourceAccess::WriteOnly,
-            "the module only stores through buffer 0; its air.read declaration is not an access",
-        ),
-        (
-            1,
-            ResourceAccess::ReadWrite,
-            "the module both loads and stores through buffer 1",
-        ),
-    ] {
+    for metal_index in [0, 1] {
         let resource = reflection
             .binding_at(ResourceKind::Buffer, metal_index)
             .unwrap_or_else(|| panic!("buffer {metal_index} is reflected"));
         assert_eq!(
             resource.access,
-            Some(expected),
-            "buffer {metal_index}: {why}"
+            Some(ResourceAccess::ReadWrite),
+            "buffer {metal_index} is both read and written by the module"
         );
     }
 }

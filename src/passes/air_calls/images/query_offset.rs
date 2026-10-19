@@ -160,18 +160,17 @@ pub(in crate::passes) fn find_sample_offset_arg(
     None
 }
 
-/// Fold a run-time texel offset into a coordinate that a normalized `OpImageSample`/`OpImageGather`
-/// will consume, by dividing each component by the image extent.
-///
-/// Every caller reaches this only after the pixel-coordinate lowerings have returned: those build
-/// their own texel-domain coordinate and add the offset in texels. Which domain applies is decided
-/// by the sampler state's coordinate mode, never by an operand of the call. The `i1` AIR passes
-/// before the offset is `has_offset`, the same flag `sample_level_flag` names one slot to the
-/// right: Apple's headers pass a literal `true` there wherever the MSL overload takes an offset
-/// (all 65345 2D and 3D sample and gather calls in the corpus), `false` where it cannot -- a
-/// `texture1d` has a single `sample(sampler, float)` and no offset parameter, so all 1287 1D calls
-/// pass `false` -- and the cube forms carry no offset operand at all, which puts `has_level` at
-/// that index in their 655 calls instead.
+pub(in crate::passes) fn sample_uses_normalized_coords(
+    ctx: &Ctx,
+    arrayed: bool,
+    args: &[Word],
+) -> bool {
+    let idx = if arrayed { 4 } else { 3 };
+    args.get(idx)
+        .and_then(|arg| const_bool_value(ctx, *arg))
+        .unwrap_or(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::passes) fn apply_dynamic_sample_offset(
     ctx: &mut Ctx,
@@ -179,37 +178,43 @@ pub(in crate::passes) fn apply_dynamic_sample_offset(
     arrayed: bool,
     coord: Word,
     offset: Word,
+    normalized: bool,
     spatial: usize,
     out: &mut Vec<Instruction>,
 ) -> Result<Word, String> {
     let coord_lanes = spatial + usize::from(arrayed);
     let coord_components = sample_coord_components(ctx, coord, coord_lanes as u32, out)?;
     let offset_components = dynamic_i32_offset_components(ctx, offset, spatial, out)?;
-    let lod = ctx.const_uint(0);
-    let size = query_image_size(ctx, img, spatial, arrayed, lod, out);
+    let size = if normalized {
+        let lod = ctx.const_uint(0);
+        Some(query_image_size(ctx, img, spatial, arrayed, lod, out))
+    } else {
+        None
+    };
     let mut adjusted = Vec::with_capacity(coord_lanes);
     for idx in 0..spatial {
         let Operand::IdRef(coord_component) = coord_components[idx] else {
             return Err("air.sample_texture coord component is not an id".into());
         };
-        let size_component = image_size_component(ctx, size, idx, spatial, arrayed, out)?;
-        let size_f = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::ConvertUToF,
-            Some(ctx.ty_float()),
-            Some(size_f),
-            vec![Operand::IdRef(size_component)],
-        ));
-        let delta = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FDiv,
-            Some(ctx.ty_float()),
-            Some(delta),
-            vec![
-                Operand::IdRef(offset_components[idx]),
-                Operand::IdRef(size_f),
-            ],
-        ));
+        let mut delta = offset_components[idx];
+        if let Some(size) = size {
+            let size_component = image_size_component(ctx, size, idx, spatial, arrayed, out)?;
+            let size_f = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::ConvertUToF,
+                Some(ctx.ty_float()),
+                Some(size_f),
+                vec![Operand::IdRef(size_component)],
+            ));
+            let normalized_delta = ctx.module.fresh_id();
+            out.push(Instruction::new(
+                Op::FDiv,
+                Some(ctx.ty_float()),
+                Some(normalized_delta),
+                vec![Operand::IdRef(delta), Operand::IdRef(size_f)],
+            ));
+            delta = normalized_delta;
+        }
         let shifted = ctx.module.fresh_id();
         out.push(Instruction::new(
             Op::FAdd,

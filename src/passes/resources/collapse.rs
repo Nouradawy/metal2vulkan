@@ -77,6 +77,33 @@ pub(in crate::passes) fn apply_bindings(
                 ));
                 splices.push((pid, converted));
             }
+            ParamBinding::LoadBoolAsInt {
+                var,
+                bool_ty,
+                param_ty,
+            } => {
+                let lid = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Load,
+                    Some(bool_ty),
+                    Some(lid),
+                    vec![Operand::IdRef(var)],
+                ));
+                let one = ctx.const_int_of(param_ty, 1);
+                let zero = ctx.const_int_of(param_ty, 0);
+                let selected = ctx.module.fresh_id();
+                loads.push(Instruction::new(
+                    Op::Select,
+                    Some(param_ty),
+                    Some(selected),
+                    vec![
+                        Operand::IdRef(lid),
+                        Operand::IdRef(one),
+                        Operand::IdRef(zero),
+                    ],
+                ));
+                splices.push((pid, selected));
+            }
             ParamBinding::LoadVarConverted {
                 var,
                 load_ty,
@@ -434,16 +461,8 @@ pub(in crate::passes) fn apply_bindings(
                     splices.push((pid, converted));
                 }
             }
-            ParamBinding::LoadKernelLocalSize { out_ty, lanes }
-            | ParamBinding::LoadKernelRequestedLocalSize { out_ty, lanes } => {
-                // The executing size follows the region's specialized local size; the requested one
-                // is the size the dispatch was decomposed from and stays put in a tail region.
-                let ids = match b {
-                    ParamBinding::LoadKernelRequestedLocalSize { .. } => {
-                        ctx.kernel_requested_local_size_ids()
-                    }
-                    _ => ctx.kernel_local_size_ids(),
-                };
+            ParamBinding::LoadKernelLocalSize { out_ty, lanes } => {
+                let ids = ctx.kernel_local_size_ids();
                 let uint_ty = ctx.ty_uint();
                 let value = if lanes == 1 {
                     ids[0]
@@ -480,7 +499,7 @@ pub(in crate::passes) fn apply_bindings(
                     splices.push((pid, converted));
                 }
             }
-            ParamBinding::LoadKernelGroupsPerThreadgroup { out_ty, lanes } => {
+            ParamBinding::LoadKernelSimdgroupsPerThreadgroup { out_ty } => {
                 let uint_ty = ctx.ty_uint();
                 let [local_x, local_y, local_z] = ctx.kernel_local_size_ids();
                 let local_xy = ctx.module.fresh_id();
@@ -497,8 +516,6 @@ pub(in crate::passes) fn apply_bindings(
                     Some(local_threads),
                     vec![Operand::IdRef(local_xy), Operand::IdRef(local_z)],
                 ));
-                // Round UP: a threadgroup whose local size is not a whole number of groups still
-                // runs a final partial one, and Metal counts it.
                 let rounded = ctx.module.fresh_id();
                 loads.push(Instruction::new(
                     Op::IAdd,
@@ -506,7 +523,7 @@ pub(in crate::passes) fn apply_bindings(
                     Some(rounded),
                     vec![
                         Operand::IdRef(local_threads),
-                        Operand::IdRef(ctx.const_uint(lanes - 1)),
+                        Operand::IdRef(ctx.const_uint(31)),
                     ],
                 ));
                 let groups = ctx.module.fresh_id();
@@ -514,10 +531,7 @@ pub(in crate::passes) fn apply_bindings(
                     Op::UDiv,
                     Some(uint_ty),
                     Some(groups),
-                    vec![
-                        Operand::IdRef(rounded),
-                        Operand::IdRef(ctx.const_uint(lanes)),
-                    ],
+                    vec![Operand::IdRef(rounded), Operand::IdRef(ctx.const_uint(32))],
                 ));
                 if out_ty == uint_ty {
                     splices.push((pid, groups));
@@ -1209,7 +1223,13 @@ fn is_float_type_live(ctx: &Ctx, ty: Word) -> bool {
     type_def_of(ctx, ty).is_some_and(|def| def.class.opcode == Op::TypeFloat)
 }
 
-use crate::passes::stage_input::input_attachment_vector_type;
+fn input_attachment_vector_type(ctx: &mut Ctx, component_ty: Word, lanes: u32) -> Word {
+    ctx.get_or_create(
+        Op::TypeVector,
+        None,
+        vec![Operand::IdRef(component_ty), Operand::LiteralBit32(lanes)],
+    )
+}
 
 pub(in crate::passes) fn rewrite_ulong_uint2_memory_reinterprets(
     ctx: &mut Ctx,

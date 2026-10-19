@@ -46,10 +46,11 @@ impl EmittedDominators {
                 }
             }
         }
-        let predecessors = crate::dominators::build_predecessors(&successors);
+        let predecessors = crate::native::dominators::build_predecessors(&successors);
         // Underscore-prefixed because the parent links are only read by the serialization-order
         // check, which is test-only; the intervals are what production queries.
-        let (_, intervals, _parents) = crate::dominators::dominance(&successors, &predecessors);
+        let (_, intervals, _parents) =
+            crate::native::dominators::dominance(&successors, &predecessors);
         Self {
             index,
             #[cfg(test)]
@@ -63,7 +64,7 @@ impl EmittedDominators {
         else {
             return false;
         };
-        crate::dominators::dominates_interval(&self.intervals, dominator, node)
+        crate::native::dominators::dominates_interval(&self.intervals, dominator, node)
     }
 
     /// Whether every reachable block's immediate dominator precedes it in serialized block order.

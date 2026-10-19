@@ -740,7 +740,7 @@ pub(in crate::passes) fn rewrite_pointer_storage(
                     if target_sc == StorageClass::StorageBuffer {
                         if let (Some(rid), Some((index, index_ty, lanes))) = (
                             rid,
-                            rooted_pointee_stride_plan(
+                            rooted_vector_stride_plan(
                                 ctx,
                                 &types,
                                 &value_types,
@@ -810,14 +810,13 @@ pub(in crate::passes) fn rewrite_pointer_storage(
         }
     }
 
-    // A vector-source GEP can be rooted at a narrower scalar after interface buffer reconstruction:
-    // `gep <N x E>, ptr %p, %record` then needs `%record * sizeof(<N x E>) / sizeof(*%p)` in the new
-    // pointee's units. The old result pointer type is the proof that the PtrAccessChain element
-    // operand carried a vector stride; after the rooted rewrite changes its pointee, preserve that
-    // byte offset explicitly. The later subword-store pass decomposes the mismatched vector store
-    // into scalar stores from this point.
-    for (result, index, index_ty, stride) in vector_stride_plans {
-        let factor = ctx.const_int_of(index_ty, i64::from(stride));
+    // A vector-source GEP can be rooted at a scalar lane after interface buffer reconstruction:
+    // `gep <N x E>, ptr %lane, %record` then needs `%record * N` in E units. The old result pointer
+    // type is the proof that the PtrAccessChain element operand carried a vector stride; after the
+    // rooted rewrite changes its pointee to E, preserve that byte offset explicitly. The later
+    // subword-store pass decomposes the mismatched vector store into N scalar stores from this point.
+    for (result, index, index_ty, lanes) in vector_stride_plans {
+        let factor = ctx.const_int_of(index_ty, i64::from(lanes));
         let scaled = ctx.module.fresh_id();
         let scale = Instruction::new(
             Op::IMul,
@@ -841,20 +840,7 @@ pub(in crate::passes) fn rewrite_pointer_storage(
     Ok(())
 }
 
-/// The factor a rooted `OpPtrAccessChain`'s element operand must be scaled by once
-/// `rewrite_pointer_storage` has narrowed the result pointee.
-///
-/// `OpPtrAccessChain` advances by whole pointees, exactly as the LLVM `getelementptr` it came from
-/// advances by whole source types. Retyping the result pointer therefore silently redefines what the
-/// element operand means, and the old pointer type is the only surviving proof of the stride the
-/// operand was written against. The factor is the old pointee's ALLOC size -- its store size rounded
-/// up to its own alignment, so a `<3 x float>` strides 16 bytes, not 12, which is what LLVM does and
-/// what a lane count would get wrong -- expressed in units of the new scalar pointee.
-///
-/// A byte pointee is the case that matters most: the interface reroot re-types a vector chain onto a
-/// raw `{ RuntimeArray<uint> }` block through a `uchar` view, and without the rescale every element
-/// step collapses to one byte.
-pub(in crate::passes) fn rooted_pointee_stride_plan(
+pub(in crate::passes) fn rooted_vector_stride_plan(
     ctx: &Ctx,
     types: &HashMap<Word, Instruction>,
     value_types: &HashMap<Word, Word>,
@@ -867,30 +853,25 @@ pub(in crate::passes) fn rooted_pointee_stride_plan(
         return None;
     }
     let old_pointee = pointer_pointee_including_new(ctx, types, old_ptr_ty)?;
-    if types.get(&old_pointee)?.class.opcode != Op::TypeVector {
+    let vector = types.get(&old_pointee)?;
+    if vector.class.opcode != Op::TypeVector {
         return None;
     }
-    if !matches!(
-        types.get(&new_pointee)?.class.opcode,
-        Op::TypeInt | Op::TypeFloat
-    ) {
+    let (Some(Operand::IdRef(element)), Some(Operand::LiteralBit32(lanes))) =
+        (vector.operands.first(), vector.operands.get(1))
+    else {
         return None;
-    }
-    let (old_size, old_align) = layout_ty_size_align(ctx, old_pointee, types);
-    let old_stride = round_up(old_size, old_align);
-    let (new_size, _) = layout_ty_size_align(ctx, new_pointee, types);
-    if new_size == 0 || !old_stride.is_multiple_of(new_size) {
-        return None;
-    }
-    let factor = old_stride / new_size;
-    if factor <= 1 {
+    };
+    if *lanes <= 1
+        || (*element != new_pointee && !types_structurally_match(ctx, types, *element, new_pointee))
+    {
         return None;
     }
     let Operand::IdRef(index) = operands[1] else {
         return None;
     };
     let index_ty = *value_types.get(&index)?;
-    (types.get(&index_ty)?.class.opcode == Op::TypeInt).then_some((index, index_ty, factor))
+    (types.get(&index_ty)?.class.opcode == Op::TypeInt).then_some((index, index_ty, *lanes))
 }
 
 pub(in crate::passes) fn rewritten_rooted_pointer_pointee(

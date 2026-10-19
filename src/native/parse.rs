@@ -895,16 +895,7 @@ pub(super) fn parse_identity_ptr_bitcast(line: &str) -> Option<(String, String)>
         return None;
     }
     let src_ty = src[..src.len() - base.len()].trim();
-    // Compare the PARSED types, not their text. A pointer's pointee is not part of this
-    // translator's pointer model -- `LlType::Ptr` carries only the address space -- so
-    // `bitcast i32 addrspace(1)* %p to i8 addrspace(1)*`, which is how the Metal frontend spells
-    // a reinterpreting cast in LLVM's pre-opaque syntax, is the same address identity that
-    // `bitcast ptr addrspace(1) %p to ptr addrspace(1)` is. Reading it as a non-identity kept the
-    // pointee-typed spelling off the byte-view path and gave the following GEP the BASE's element
-    // stride instead of its own. Text equality still stands in for a type neither side parses.
-    let identical =
-        src_ty == dst || matches!((parse_type(src_ty), parse_type(dst)), (Ok(a), Ok(b)) if a == b);
-    if !identical {
+    if src_ty != dst {
         return None;
     }
     Some((res, base.to_string()))
@@ -971,17 +962,8 @@ pub(super) fn parse_type(s: &str) -> Result<LlType, String> {
         }
     }
     if let Some(name) = s.strip_prefix('%') {
-        // LLVM escapes inside a quoted identifier as `\xx`, never `\"`, so the first closing
-        // quote ends the name. Requiring it to end the whole string is what stops the name from
-        // swallowing a trailing parameter attribute that is quoted too -- a parameter spelled
-        // `%"struct.metal::_atomic" addrspace(1)* nocapture "air-buffer-no-alias"` was read as
-        // one named type running from the first quote to the last.
-        if let Some(inner) = name
-            .strip_prefix('"')
-            .and_then(|rest| rest.strip_suffix('"'))
-            .filter(|inner| !inner.contains('"'))
-        {
-            return Ok(LlType::Named(format!("%\"{inner}\"")));
+        if name.starts_with('"') && name.ends_with('"') {
+            return Ok(LlType::Named(format!("%{name}")));
         }
         if !name.is_empty()
             && name
@@ -1018,29 +1000,7 @@ pub(super) fn parse_type(s: &str) -> Result<LlType, String> {
         let (len, elem) = split_vector_type(inner)?;
         return Ok(LlType::Array(Box::new(parse_type(elem)?), len));
     }
-    // LLVM's pre-opaque pointer spelling, which is what `xcrun metal -S -emit-llvm` still emits:
-    // `T*` and `T addrspace(N)*`. It carries the same information as `ptr`/`ptr addrspace(N)`
-    // plus a pointee our pointer model does not keep, so parse the pointee for validation only.
-    // Parsing it is what keeps the trailing `*` from being dropped by a caller that backtracks
-    // over type prefixes, which would silently hand back the pointee as if it were the type.
-    if let Some(pointee) = s.strip_suffix('*') {
-        let (pointee, space) = split_trailing_addrspace(pointee.trim_end())?;
-        parse_type(pointee)?;
-        return Ok(LlType::Ptr(space));
-    }
     Err(format!("native emitter: unsupported type `{s}`"))
-}
-
-/// Split a typed pointer's ` addrspace(N)` suffix off its pointee, defaulting to address space 0.
-fn split_trailing_addrspace(s: &str) -> Result<(&str, u32), String> {
-    let Some(open) = s.strip_suffix(')').and_then(|s| s.rfind(" addrspace(")) else {
-        return Ok((s, 0));
-    };
-    let digits = &s[open + " addrspace(".len()..s.len() - 1];
-    let space = digits
-        .parse()
-        .map_err(|e| format!("native emitter: bad addrspace in `{s}*`: {e}"))?;
-    Ok((&s[..open], space))
 }
 
 fn strip_leading_fast_math_flags(mut s: &str) -> &str {
@@ -1189,46 +1149,6 @@ mod parse_tests {
     }
 
     #[test]
-    fn parse_type_typed_pointers() {
-        // LLVM's pre-opaque spelling carries the address space on the pointee, and the pointee
-        // itself is dropped -- both spellings of one pointer have to land on the same type.
-        assert_eq!(parse_type("i32*").unwrap(), LlType::Ptr(0));
-        assert_eq!(parse_type("i32 addrspace(1)*").unwrap(), LlType::Ptr(1));
-        assert_eq!(parse_type("float addrspace(2)*").unwrap(), LlType::Ptr(2));
-        assert_eq!(
-            parse_type("<4 x float> addrspace(1)*").unwrap(),
-            LlType::Ptr(1)
-        );
-        assert_eq!(
-            parse_type("%struct.Foo addrspace(3)*").unwrap(),
-            LlType::Ptr(3)
-        );
-        assert_eq!(parse_type("i32 addrspace(1)**").unwrap(), LlType::Ptr(0));
-        // A pointee that is not a type is still a parse failure, so a stray `*` cannot pass.
-        assert!(parse_type("notatype*").is_err());
-        assert!(parse_type("i32 addrspace(x)*").is_err());
-    }
-
-    #[test]
-    fn parse_type_prefix_keeps_the_typed_pointer_star() {
-        // The prefix scan tries the longest candidate first, so before `parse_type` understood
-        // `i32 addrspace(1)*` it fell through to `i32` and handed back the POINTEE as the type.
-        assert_eq!(
-            parse_type_prefix(r#"i32 addrspace(1)* nocapture readonly "air-buffer-no-alias""#)
-                .unwrap(),
-            LlType::Ptr(1)
-        );
-        let (params, _) = parse_params(r#"i32 addrspace(1)* nocapture %0, i32 %1"#).unwrap();
-        assert_eq!(
-            params,
-            vec![
-                ("%0".to_string(), LlType::Ptr(1)),
-                ("%1".to_string(), LlType::Int(32)),
-            ]
-        );
-    }
-
-    #[test]
     fn parse_quoted_function_and_call_names() {
         let lines = [
             r#"define void @"re::df::pack"(ptr addrspace(1) %out) {"#,
@@ -1243,45 +1163,6 @@ mod parse_tests {
         let call =
             parse_call(r#"void @"helper::quoted"(ptr addrspace(1) %out)"#).expect("parse call");
         assert_eq!(call.callee, "helper::quoted");
-    }
-
-    #[test]
-    fn identity_ptr_bitcast_sees_through_the_pointee_typed_spelling() {
-        // `LlType::Ptr` carries only the address space, so a pointer bitcast within one address
-        // space is an address identity however its pointee is spelled. Comparing the type TEXT
-        // said no to the reinterpreting spelling the Metal frontend emits.
-        assert_eq!(
-            parse_identity_ptr_bitcast("%4 = bitcast i32 addrspace(1)* %0 to i8 addrspace(1)*"),
-            Some(("%4".to_string(), "%0".to_string()))
-        );
-        assert_eq!(
-            parse_identity_ptr_bitcast("%4 = bitcast ptr addrspace(1) %0 to ptr addrspace(1)"),
-            Some(("%4".to_string(), "%0".to_string()))
-        );
-        // Across address spaces, and between non-pointers, it is not an identity.
-        assert_eq!(
-            parse_identity_ptr_bitcast("%4 = bitcast i32 addrspace(1)* %0 to i8 addrspace(3)*"),
-            None
-        );
-        assert_eq!(
-            parse_identity_ptr_bitcast("%4 = bitcast i32 %0 to float"),
-            None
-        );
-    }
-
-    #[test]
-    fn parse_type_quoted_name_stops_at_its_own_closing_quote() {
-        // A parameter attribute is quoted too, so a name that ran to the LAST quote in the string
-        // swallowed the whole tail and produced a `Named` nothing could resolve. It has to stop at
-        // the first closing quote and leave the rest to the prefix scan.
-        assert!(parse_type(r#"%"struct.metal::_atomic" nocapture "air-buffer-no-alias""#).is_err());
-        assert_eq!(
-            parse_type_prefix(
-                r#"%"struct.metal::_atomic" addrspace(1)* nocapture "air-buffer-no-alias""#
-            )
-            .unwrap(),
-            LlType::Ptr(1)
-        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::store::CorpusStore;
 use base64::Engine as _;
 use std::path::Path;
 
-pub const ORACLE_ABI: &str = "metal-literal-resources-v24";
+pub const ORACLE_ABI: &str = "metal-literal-resources-v23";
 pub const QUALIFICATION_RUNS: usize = 3;
 
 pub fn qualify_case(
@@ -275,15 +275,15 @@ mod platform {
         MTLOrigin, MTLPackedFloat3, MTLPackedFloat4x3, MTLPipelineOption, MTLPixelFormat,
         MTLPrimitiveAccelerationStructureDescriptor, MTLPrimitiveTopologyClass, MTLPrimitiveType,
         MTLRegion, MTLRenderCommandEncoder, MTLRenderPassDescriptor, MTLRenderPipelineDescriptor,
-        MTLRenderPipelineState, MTLRenderStages, MTLResourceOptions, MTLResourceUsage,
-        MTLSamplerAddressMode, MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter,
-        MTLSamplerState, MTLSize, MTLStageInputOutputDescriptor, MTLStencilDescriptor,
-        MTLStencilOperation, MTLStepFunction, MTLStorageMode, MTLStoreAction,
-        MTLTessellationControlPointIndexType, MTLTessellationFactorFormat,
-        MTLTessellationFactorStepFunction, MTLTessellationPartitionMode, MTLTexture,
-        MTLTextureDescriptor, MTLTextureType, MTLTextureUsage, MTLTileRenderPipelineDescriptor,
-        MTLVertexDescriptor, MTLVertexFormat, MTLVertexStepFunction, MTLVisibleFunctionTable,
-        MTLVisibleFunctionTableDescriptor, MTLWinding,
+        MTLRenderPipelineState, MTLRenderStages, MTLResourceOptions, MTLSamplerAddressMode,
+        MTLSamplerDescriptor, MTLSamplerMinMagFilter, MTLSamplerMipFilter, MTLSamplerState,
+        MTLSize, MTLStageInputOutputDescriptor, MTLStencilDescriptor, MTLStencilOperation,
+        MTLStepFunction, MTLStorageMode, MTLStoreAction, MTLTessellationControlPointIndexType,
+        MTLTessellationFactorFormat, MTLTessellationFactorStepFunction,
+        MTLTessellationPartitionMode, MTLTexture, MTLTextureDescriptor, MTLTextureType,
+        MTLTextureUsage, MTLTileRenderPipelineDescriptor, MTLVertexDescriptor, MTLVertexFormat,
+        MTLVertexStepFunction, MTLVisibleFunctionTable, MTLVisibleFunctionTableDescriptor,
+        MTLWinding,
     };
     use std::cell::RefCell;
     use std::collections::HashMap;
@@ -430,10 +430,10 @@ mod platform {
         let device_buffer_array_elements =
             append_device_buffer_arrays(device, resources, &mut buffers)?;
         let argument_buffer_buffers = make_argument_buffer_buffers(device, resources)?;
-        let textures = make_textures(device, &context.queue, resources, reflection)?;
-        let texture_arrays = make_texture_arrays(device, &context.queue, resources, reflection)?;
+        let textures = make_textures(device, &context.queue, resources)?;
+        let texture_arrays = make_texture_arrays(device, &context.queue, resources)?;
         let argument_buffer_textures =
-            make_argument_buffer_textures(device, &context.queue, resources, reflection)?;
+            make_argument_buffer_textures(device, &context.queue, resources)?;
         encode_argument_buffer_buffers(&function, &buffers, &argument_buffer_buffers, reflection)?;
         encode_argument_buffer_textures(
             &function,
@@ -461,11 +461,6 @@ mod platform {
             .computeCommandEncoder()
             .ok_or_else(|| "computeCommandEncoder returned nil".to_string())?;
         encoder.setComputePipelineState(&pipeline);
-        argument_buffer_resources_resident_on_compute(
-            &encoder,
-            &argument_buffer_textures,
-            &argument_buffer_buffers,
-        );
         for (binding, buffer) in &buffers {
             unsafe {
                 encoder.setBuffer_offset_atIndex(Some(&**buffer), 0, *binding as usize);
@@ -530,11 +525,6 @@ mod platform {
                 size: mtl_size(dispatch.grid),
             });
         }
-        threads_per_threadgroup_within_limit(
-            dispatch.threads_per_threadgroup,
-            pipeline.maxTotalThreadsPerThreadgroup(),
-            "Metal compute",
-        )?;
         encoder.dispatchThreads_threadsPerThreadgroup(
             mtl_size(dispatch.grid),
             mtl_size(dispatch.threads_per_threadgroup),
@@ -595,15 +585,7 @@ mod platform {
         let pipeline_descriptor = MTLTileRenderPipelineDescriptor::new();
         unsafe { pipeline_descriptor.setTileFunction(&function) };
         unsafe { pipeline_descriptor.setRasterSampleCount(1) };
-        // `threadgroupSizeMatchesTileSize` lets Metal pick the threadgroup for the tile function
-        // instead of taking the one the case authored. A tile function with an *explicit*
-        // imageblock is sized from that imageblock rather than from the render pass, so Metal
-        // caps `maxTotalThreadsPerThreadgroup` far below the authored tile -- 4 instead of 256 for
-        // a 16x16 tile whose imageblock is 16 bytes a sample. `dispatchThreadsPerTile` past that
-        // cap is dropped with no error and a `Completed` command buffer, so the case reads back
-        // its own authored bytes. Pin the threadgroup to what the case dispatches and let Metal
-        // size the pipeline from the function.
-        pipeline_descriptor.setThreadgroupSizeMatchesTileSize(false);
+        pipeline_descriptor.setThreadgroupSizeMatchesTileSize(true);
         pipeline_descriptor
             .setRequiredThreadsPerThreadgroup(mtl_size(dispatch.threads_per_threadgroup));
         if let Some(linked) = &linked.descriptor {
@@ -634,10 +616,10 @@ mod platform {
         let device_buffer_array_elements =
             append_device_buffer_arrays(device, resources, &mut buffers)?;
         let argument_buffer_buffers = make_argument_buffer_buffers(device, resources)?;
-        let textures = make_textures(device, &context.queue, resources, reflection)?;
-        let texture_arrays = make_texture_arrays(device, &context.queue, resources, reflection)?;
+        let textures = make_textures(device, &context.queue, resources)?;
+        let texture_arrays = make_texture_arrays(device, &context.queue, resources)?;
         let argument_buffer_textures =
-            make_argument_buffer_textures(device, &context.queue, resources, reflection)?;
+            make_argument_buffer_textures(device, &context.queue, resources)?;
         encode_argument_buffer_buffers(&function, &buffers, &argument_buffer_buffers, reflection)?;
         encode_argument_buffer_textures(
             &function,
@@ -672,11 +654,6 @@ mod platform {
         }
         pass.setTileWidth(imageblock.dimensions[0] as usize);
         pass.setTileHeight(imageblock.dimensions[1] as usize);
-        // The tile memory a render pass reserves defaults to what its colour attachments need. A
-        // tile function with an explicit imageblock can need more -- 24 bytes a sample against the
-        // 18 that rgba16+rgba16+r16 attachments imply -- and Metal then refuses the pipeline on
-        // the encoder. The pipeline knows the number it needs, so ask it.
-        pass.setImageblockSampleLength(pipeline.imageblockSampleLength());
         pass.setRenderTargetWidth(dispatch.grid[0] as usize);
         pass.setRenderTargetHeight(dispatch.grid[1] as usize);
         let threadgroup_layout = tile_threadgroup_memory_layout(case)?;
@@ -706,12 +683,6 @@ mod platform {
             };
         }
         bind_tile_function_tables(&encoder, &metal_function_tables);
-        argument_buffer_resources_resident_on_render(
-            &encoder,
-            &argument_buffer_textures,
-            &argument_buffer_buffers,
-            MTLRenderStages::Tile,
-        );
         for (binding, texture) in &textures {
             unsafe { encoder.setTileTexture_atIndex(Some(&**texture), *binding as usize) };
         }
@@ -739,11 +710,6 @@ mod platform {
                 )
             };
         }
-        threads_per_threadgroup_within_limit(
-            dispatch.threads_per_threadgroup,
-            pipeline.maxTotalThreadsPerThreadgroup(),
-            "Metal tile",
-        )?;
         encoder.dispatchThreadsPerTile(mtl_size(dispatch.threads_per_threadgroup));
         encoder.endEncoding();
         command_buffer.commit();
@@ -834,20 +800,11 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         dimensions: [u32; 2],
     }
 
-    /// The name a generated imageblock helper must give a member for Metal to alias it onto the
-    /// AIR entry's own imageblock.
-    ///
-    /// Reflection reports one `semantic` per member in two spellings: `user(name)` when the Metal
-    /// source gave the member an explicit `[[user(...)]]` attribute, and the member's own declared
-    /// name when it did not. Both name the same thing to Metal, which matches imageblock members
-    /// by their user attribute where one exists and by the declared name otherwise. Accepting only
-    /// the wrapped form refused every custom fragment imageblock in the corpus, since none of them
-    /// carries an explicit attribute -- an authoring gap, not a Metal one.
-    pub(super) fn fragment_imageblock_semantic_name(semantic: &str) -> Result<&str, String> {
+    fn fragment_imageblock_semantic_name(semantic: &str) -> Result<&str, String> {
         let name = semantic
             .strip_prefix("user(")
             .and_then(|value| value.strip_suffix(')'))
-            .unwrap_or(semantic);
+            .ok_or_else(|| format!("invalid fragment imageblock semantic {semantic}"))?;
         if name.is_empty()
             || !name
                 .bytes()
@@ -1092,10 +1049,10 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         let device_buffer_array_elements =
             append_device_buffer_arrays(device, resources, &mut buffers)?;
         let argument_buffer_buffers = make_argument_buffer_buffers(device, resources)?;
-        let textures = make_textures(device, &context.queue, resources, reflection)?;
-        let texture_arrays = make_texture_arrays(device, &context.queue, resources, reflection)?;
+        let textures = make_textures(device, &context.queue, resources)?;
+        let texture_arrays = make_texture_arrays(device, &context.queue, resources)?;
         let argument_buffer_textures =
-            make_argument_buffer_textures(device, &context.queue, resources, reflection)?;
+            make_argument_buffer_textures(device, &context.queue, resources)?;
         encode_argument_buffer_buffers(&fragment, &buffers, &argument_buffer_buffers, reflection)?;
         encode_argument_buffer_textures(
             &fragment,
@@ -1180,12 +1137,6 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         }
         encoder.setRenderPipelineState(&pipeline);
         encoder.setDepthStencilState(Some(&*depth_stencil_state));
-        argument_buffer_resources_resident_on_render(
-            &encoder,
-            &argument_buffer_textures,
-            &argument_buffer_buffers,
-            MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-        );
         for (binding, buffer) in &buffers {
             unsafe {
                 encoder.setFragmentBuffer_offset_atIndex(Some(&**buffer), 0, *binding as usize)
@@ -1352,10 +1303,10 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         let device_buffer_array_elements =
             append_device_buffer_arrays(device, resources, &mut buffers)?;
         let argument_buffer_buffers = make_argument_buffer_buffers(device, resources)?;
-        let textures = make_textures(device, &context.queue, resources, reflection)?;
-        let texture_arrays = make_texture_arrays(device, &context.queue, resources, reflection)?;
+        let textures = make_textures(device, &context.queue, resources)?;
+        let texture_arrays = make_texture_arrays(device, &context.queue, resources)?;
         let argument_buffer_textures =
-            make_argument_buffer_textures(device, &context.queue, resources, reflection)?;
+            make_argument_buffer_textures(device, &context.queue, resources)?;
         encode_argument_buffer_buffers(&vertex, &buffers, &argument_buffer_buffers, reflection)?;
         encode_argument_buffer_textures(&vertex, &buffers, &argument_buffer_textures, reflection)?;
         encode_argument_buffer_function_tables(
@@ -1385,12 +1336,6 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
             .renderCommandEncoderWithDescriptor(&pass)
             .ok_or_else(|| "renderCommandEncoderWithDescriptor returned nil".to_string())?;
         encoder.setRenderPipelineState(&pipeline);
-        argument_buffer_resources_resident_on_render(
-            &encoder,
-            &argument_buffer_textures,
-            &argument_buffer_buffers,
-            MTLRenderStages::Vertex | MTLRenderStages::Fragment,
-        );
         for (slot, buffer) in &vertex_inputs.buffers {
             unsafe { encoder.setVertexBuffer_offset_atIndex(Some(&**buffer), 0, *slot) };
         }
@@ -1495,11 +1440,10 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
         let observation = case
             .vertex_observation
             .ok_or_else(|| "vertex case has no observation".to_string())?;
-        let position = crate::observation_contract::METAL_POSITION_FIELD;
-        let mut fields = format!("    float4 {position} [[position]];\n");
+        let mut fields = String::from("    float4 position [[position]];\n");
         let (return_type, expression) = match observation {
             crate::case::VertexObservation::Position => {
-                ("float4".to_string(), format!("input.{position}"))
+                ("float4".to_string(), "input.position".to_string())
             }
             crate::case::VertexObservation::Varying { location } => {
                 let varying = reflection
@@ -1601,20 +1545,15 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
             .roles
             .iter()
             .any(|(_, role)| matches!(role, metal2vulkan::meta::FragRole::RenderTargetArrayIndex));
-        let position = crate::observation_contract::METAL_POSITION_FIELD;
-        let viewport = crate::observation_contract::METAL_VIEWPORT_FIELD;
-        let layer = crate::observation_contract::METAL_LAYER_FIELD;
-        let mut fields = format!("    float4 {position} [[position]];\n");
-        let mut assignments = format!("    out.{position} = float4(p, 0.0, 1.0);\n");
+        let mut fields = String::from("    float4 position [[position]];\n");
+        let mut assignments = String::from("    out.position = float4(p, 0.0, 1.0);\n");
         if has_viewport {
-            fields.push_str(&format!("    uint {viewport} [[viewport_array_index]];\n"));
-            assignments.push_str(&format!("    out.{viewport} = 0;\n"));
+            fields.push_str("    uint viewport [[viewport_array_index]];\n");
+            assignments.push_str("    out.viewport = 0;\n");
         }
         if has_layer {
-            fields.push_str(&format!(
-                "    uint {layer} [[render_target_array_index]];\n"
-            ));
-            assignments.push_str(&format!("    out.{layer} = 0;\n"));
+            fields.push_str("    uint layer [[render_target_array_index]];\n");
+            assignments.push_str("    out.layer = 0;\n");
         }
         for (ordinal, location) in locations.into_iter().enumerate() {
             let type_name = meta
@@ -1773,52 +1712,10 @@ fragment half4 metal2vulkan_tile_coverage_fragment() { return half4(0.0h); }
 "#;
             let msl = fragment_passthrough_msl(ll).unwrap();
             assert!(
-                msl.contains("uint metal2vulkan_layer [[render_target_array_index]];"),
+                msl.contains("uint layer [[render_target_array_index]];"),
                 "{msl}"
             );
-            assert!(msl.contains("out.metal2vulkan_layer = 0;"), "{msl}");
-        }
-
-        // The AIR names a varying and Metal links an unattributed stage-in member by that name, so
-        // the observer cannot spend an ordinary identifier on a member the AIR never named. 486 of
-        // the 14579 corpus sources call a varying `position` or `layer`, and every one of them used
-        // to generate a struct with two members of that name and no compilable observer.
-        #[test]
-        fn generated_interfaces_keep_their_builtins_out_of_the_air_name_space() {
-            let ll = r#"
-!air.fragment = !{!0}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"half4"}
-!3 = !{!4, !5}
-!4 = !{i32 0, !"air.fragment_input", !"generated(position)", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.render_target_array_index", !"air.arg_type_name", !"ushort", !"air.arg_name", !"layer"}
-"#;
-            let msl = fragment_passthrough_msl(ll).unwrap();
-            assert!(
-                msl.contains("float4 metal2vulkan_position [[position]];"),
-                "{msl}"
-            );
-            assert!(msl.contains("float4 position;"), "{msl}");
-            assert!(
-                msl.contains("uint metal2vulkan_layer [[render_target_array_index]];"),
-                "{msl}"
-            );
-            let members = msl
-                .split_once("struct Metal2VulkanFragmentInput {")
-                .and_then(|(_, rest)| rest.split_once("};"))
-                .map(|(body, _)| {
-                    body.lines()
-                        .filter_map(|line| line.trim().strip_suffix(';'))
-                        .filter_map(|line| line.split_whitespace().nth(1))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap();
-            assert_eq!(members.len(), 3, "{msl}");
-            let mut unique = members.clone();
-            unique.sort_unstable();
-            unique.dedup();
-            assert_eq!(unique.len(), members.len(), "{msl}");
+            assert!(msl.contains("out.layer = 0;"), "{msl}");
         }
 
         #[test]
@@ -1852,16 +1749,10 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
         source: &SourceRow,
     ) -> Result<Library, String> {
         if let Some(name) = source.label.strip_prefix("public/") {
-            let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/public");
-            // A fixture whose AIR no MSL can spell -- an `llvm.agx3.*` intrinsic, say -- ships a
-            // hand-written `<name>.air.ll` beside its `<name>.ll`, and Metal reaches it through
-            // the same frontend a corpus blob does. The two halves only have to agree
-            // SEMANTICALLY: Metal runs this one and the translator reads the `.ll`.
-            let air_path = root.join(name).with_extension("air.ll");
-            if air_path.exists() {
-                return load_air_text_library(device, &air_path);
-            }
-            let metal_path = root.join(name).with_extension("metal");
+            let metal_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/public")
+                .join(name)
+                .with_extension("metal");
             let metal = fs::read_to_string(&metal_path)
                 .map_err(|error| format!("read {}: {error}", metal_path.display()))?;
             let source = NSString::from_str(&metal);
@@ -1878,38 +1769,6 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
             )
             .map_err(|error| format!("decode AIR blob: {error}"))?;
         load_air_blob_library(device, &blob, &source.label)
-    }
-
-    /// Assemble hand-written AIR text into a library, the way a corpus blob's `metallib` step
-    /// does. Metal's LLVM is TYPED-pointer only, so `<name>.air.ll` is written in the typed dialect
-    /// and never round-trips from the opaque `.ll` the translator reads.
-    fn load_air_text_library(
-        device: &ProtocolObject<dyn MTLDevice>,
-        air_ll: &std::path::Path,
-    ) -> Result<Library, String> {
-        let scratch = ScratchDir::new("metal-air-text")?;
-        let object = scratch.path().join("fixture.air");
-        let output = Command::new("xcrun")
-            .arg("metal")
-            .arg("-x")
-            .arg("ir")
-            .arg("-c")
-            .arg(air_ll)
-            .arg("-o")
-            .arg(&object)
-            .output()
-            .map_err(|error| format!("spawn xcrun metal -x ir: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "xcrun metal -x ir failed for {}: {}{}",
-                air_ll.display(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-        let blob =
-            fs::read(&object).map_err(|error| format!("read {}: {error}", object.display()))?;
-        load_air_blob_library(device, &blob, &air_ll.display().to_string())
     }
 
     fn load_air_blob_library(
@@ -2267,19 +2126,12 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
             .buffers
             .iter()
             .map(|resource| {
-                let bytes = crate::executor_contract::buffer_bytes_padded_to_declared_size(
-                    &resource.bytes,
-                    crate::executor_contract::reflected_buffer_declared_size(
-                        reflection,
-                        resource.binding,
-                    ),
-                );
-                let pointer = NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>())
+                let pointer = NonNull::new(resource.bytes.as_ptr().cast_mut().cast::<c_void>())
                     .ok_or_else(|| format!("buffer {} bytes pointer is null", resource.binding))?;
                 let buffer = unsafe {
                     device.newBufferWithBytes_length_options(
                         pointer,
-                        bytes.len(),
+                        resource.bytes.len(),
                         MTLResourceOptions::StorageModeShared,
                     )
                 }
@@ -2679,83 +2531,10 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
             .ok_or_else(|| format!("Metal function-constant lane count {lanes} is invalid"))
     }
 
-    /// The Metal usage a texture argument needs.
-    ///
-    /// A case's `role` says which bytes are authored and which resource is read back. It does not
-    /// say how the *shader* touches the texture, and Metal refuses a shader that reads a texture
-    /// whose usage omits `ShaderRead`: `reads texture (splatX[0]) whose usage (0x02) doesn't
-    /// specify MTLTextureUsageShaderRead (0x01)`. That access is an AIR fact, so take it from
-    /// reflection and union it with the role rather than deriving one from the other. Reflection
-    /// reports the access qualifier only as `writable`, which cannot separate `write` from
-    /// `read_write`; granting a write-only texture `ShaderRead` as well costs nothing, while
-    /// withholding it from a `read_write` one is undefined behaviour.
-    fn texture_shader_usage(role: ResourceRole, writable: Option<bool>) -> MTLTextureUsage {
-        let by_role = match role {
-            ResourceRole::Input => MTLTextureUsage::ShaderRead,
-            ResourceRole::Output => MTLTextureUsage::ShaderWrite,
-            ResourceRole::InOut => MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite,
-        };
-        match writable {
-            Some(true) => by_role | MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite,
-            Some(false) => by_role | MTLTextureUsage::ShaderRead,
-            None => by_role,
-        }
-    }
-
-    /// Whether AIR declares the texture at `metal_index` with a `write` or `read_write` access
-    /// qualifier. `None` when the entry declares no texture there at all.
-    ///
-    /// Reflection splits a texture argument across two kinds by that very qualifier -- `Texture`
-    /// for `sample`/`read` and `StorageImage` for `write`/`read_write` -- so a lookup that names
-    /// only one of them silently misses exactly the arguments this asks about.
-    fn reflected_texture_writable(
-        reflection: &metal2vulkan::reflect::ShaderReflection,
-        metal_index: u32,
-    ) -> Option<bool> {
-        reflection
-            .bindings
-            .iter()
-            .find(|binding| is_texture_kind(binding.kind) && binding.metal_index == metal_index)
-            .and_then(|binding| binding.texture_shape)
-            .map(|shape| shape.writable)
-    }
-
-    /// The reflected kinds a `[[texture(n)]]` argument can arrive as: a sampled texture, a
-    /// write-capable storage image, or a runtime-indexed descriptor array of either.
-    fn is_texture_kind(kind: metal2vulkan::reflect::ResourceKind) -> bool {
-        matches!(
-            kind,
-            metal2vulkan::reflect::ResourceKind::Texture
-                | metal2vulkan::reflect::ResourceKind::StorageImage
-                | metal2vulkan::reflect::ResourceKind::TextureArray
-        )
-    }
-
-    /// The same fact for a texture an argument buffer names, which reflection keys by the argument
-    /// buffer it was synthesized from rather than by a Metal index of its own.
-    fn reflected_argument_buffer_texture_writable(
-        reflection: &metal2vulkan::reflect::ShaderReflection,
-        buffer_binding: u32,
-        field_offset: u32,
-    ) -> Option<bool> {
-        reflection
-            .bindings
-            .iter()
-            .find(|binding| {
-                binding.kind == metal2vulkan::reflect::ResourceKind::EmbeddedArgBufferTexture
-                    && binding.embedded_source.is_some_and(|source| {
-                        source.buffer_index == buffer_binding && source.field_offset == field_offset
-                    })
-            })
-            .and_then(|binding| binding.texture_shape)
-            .map(|shape| shape.writable)
-    }
-
     fn make_textures(
         device: &ProtocolObject<dyn MTLDevice>,
         queue: &ProtocolObject<dyn MTLCommandQueue>,
         resources: &LiteralResources,
-        reflection: &metal2vulkan::reflect::ShaderReflection,
     ) -> Result<Vec<(u32, Texture)>, String> {
         resources
             .textures
@@ -2767,10 +2546,7 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
                     queue,
                     MetalTextureLiteral {
                         label: &label,
-                        usage: texture_shader_usage(
-                            resource.role,
-                            reflected_texture_writable(reflection, resource.binding),
-                        ),
+                        role: resource.role,
                         texture_type: resource.texture_type,
                         format: resource.format,
                         dimensions: resource.dimensions,
@@ -2971,13 +2747,11 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
         device: &ProtocolObject<dyn MTLDevice>,
         queue: &ProtocolObject<dyn MTLCommandQueue>,
         resources: &LiteralResources,
-        reflection: &metal2vulkan::reflect::ShaderReflection,
     ) -> Result<Vec<TextureArray>, String> {
         resources
             .texture_arrays
             .iter()
             .map(|array| {
-                let writable = reflected_texture_writable(reflection, array.binding);
                 let elements = array
                     .elements
                     .iter()
@@ -2989,7 +2763,7 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
                             queue,
                             MetalTextureLiteral {
                                 label: &label,
-                                usage: texture_shader_usage(resource.role, writable),
+                                role: resource.role,
                                 texture_type: resource.texture_type,
                                 format: resource.format,
                                 dimensions: resource.dimensions,
@@ -3034,62 +2808,10 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
             .collect()
     }
 
-    /// A resource an argument buffer names is reached through a handle, not through a binding, so
-    /// Metal does not know the encoder needs it until it is told. Until then the access is not
-    /// merely slow, it is invalid: `MTL_SHADER_VALIDATION=1` drops the write and the case reads
-    /// back its own authored bytes with a `qualified` status, while the plain path happens to
-    /// work. Both are the same bug; only one of them says so.
-    ///
-    /// `Read | Write` because the manifest's role describes what the *case* does with the
-    /// resource, not what the shader does with it -- the same reason
-    /// [`texture_shader_usage`] takes the access from AIR rather than from the role.
-    fn argument_buffer_resources_resident_on_compute(
-        encoder: &ProtocolObject<dyn objc2_metal::MTLComputeCommandEncoder>,
-        textures: &[ArgumentBufferTexture],
-        buffers: &[ArgumentBufferBuffer],
-    ) {
-        for (_, texture) in textures {
-            encoder.useResource_usage(
-                ProtocolObject::from_ref(&**texture),
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
-            );
-        }
-        for (_, buffer) in buffers {
-            encoder.useResource_usage(
-                ProtocolObject::from_ref(&**buffer),
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
-            );
-        }
-    }
-
-    /// The same residency on a render encoder, which needs the stages that will reach the handle.
-    fn argument_buffer_resources_resident_on_render(
-        encoder: &ProtocolObject<dyn MTLRenderCommandEncoder>,
-        textures: &[ArgumentBufferTexture],
-        buffers: &[ArgumentBufferBuffer],
-        stages: MTLRenderStages,
-    ) {
-        for (_, texture) in textures {
-            encoder.useResource_usage_stages(
-                ProtocolObject::from_ref(&**texture),
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
-                stages,
-            );
-        }
-        for (_, buffer) in buffers {
-            encoder.useResource_usage_stages(
-                ProtocolObject::from_ref(&**buffer),
-                MTLResourceUsage::Read | MTLResourceUsage::Write,
-                stages,
-            );
-        }
-    }
-
     fn make_argument_buffer_textures(
         device: &ProtocolObject<dyn MTLDevice>,
         queue: &ProtocolObject<dyn MTLCommandQueue>,
         resources: &LiteralResources,
-        reflection: &metal2vulkan::reflect::ShaderReflection,
     ) -> Result<Vec<ArgumentBufferTexture>, String> {
         resources
             .argument_buffer_textures
@@ -3101,14 +2823,7 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
                     queue,
                     MetalTextureLiteral {
                         label: &label,
-                        usage: texture_shader_usage(
-                            resource.role,
-                            reflected_argument_buffer_texture_writable(
-                                reflection,
-                                resource.buffer_binding,
-                                resource.field_offset,
-                            ),
-                        ),
+                        role: resource.role,
                         texture_type: resource.texture_type,
                         format: resource.format,
                         dimensions: resource.dimensions,
@@ -3123,7 +2838,7 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
 
     struct MetalTextureLiteral<'a> {
         label: &'a str,
-        usage: MTLTextureUsage,
+        role: ResourceRole,
         texture_type: TextureType,
         format: TextureFormat,
         dimensions: [u32; 3],
@@ -3138,7 +2853,7 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
     ) -> Result<Texture, String> {
         let MetalTextureLiteral {
             label,
-            usage,
+            role,
             texture_type,
             format,
             dimensions,
@@ -3161,10 +2876,15 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
         } else {
             MTLStorageMode::Private
         });
+        let shader_usage = match role {
+            ResourceRole::Input => MTLTextureUsage::ShaderRead,
+            ResourceRole::Output => MTLTextureUsage::ShaderWrite,
+            ResourceRole::InOut => MTLTextureUsage::ShaderRead | MTLTextureUsage::ShaderWrite,
+        };
         descriptor.setUsage(if layout.sample_count == 1 {
-            usage
+            shader_usage
         } else {
-            usage | MTLTextureUsage::RenderTarget
+            shader_usage | MTLTextureUsage::RenderTarget
         });
         if texture_type == TextureType::Buffer {
             let pointer = NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>())
@@ -3219,41 +2939,47 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
         format: TextureFormat,
         bytes: &[u8],
     ) -> Result<(), String> {
-        let span =
-            crate::literal::subresource_span(texture_type, [0, 0, 0], dimensions, sample_count)?;
-        let bytes_per_row = span.size[0] as usize * format.bytes_per_pixel();
-        let bytes_per_image = bytes_per_row * span.size[1] as usize;
-        let bytes_per_slice = bytes_per_image * span.size[2] as usize;
+        let layout = crate::literal::texture_layout(texture_type, dimensions, sample_count)?;
+        let bytes_per_row = dimensions[0] as usize * format.bytes_per_pixel();
+        let bytes_per_image = bytes_per_row * dimensions[1] as usize;
+        let pointer = NonNull::new(bytes.as_ptr().cast_mut().cast::<c_void>())
+            .ok_or_else(|| format!("{label} bytes pointer is null"))?;
         let region = MTLRegion {
             origin: MTLOrigin { x: 0, y: 0, z: 0 },
             size: MTLSize {
-                width: span.size[0] as usize,
-                height: span.size[1] as usize,
-                depth: span.size[2] as usize,
+                width: layout.width as usize,
+                height: layout.height as usize,
+                depth: layout.depth as usize,
             },
         };
-        // The length check is also what makes the per-slice pointer arithmetic below sound, and it
-        // is the only guard against a null base pointer now that the slice is known non-empty.
-        let needed = bytes_per_slice * span.slice_count as usize;
-        if bytes.len() < needed || needed == 0 {
-            return Err(format!(
-                "{label} supplies {} bytes but its extent needs {needed}",
-                bytes.len()
-            ));
-        }
-        for slice in 0..span.slice_count as usize {
-            let slice_pointer = unsafe {
-                NonNull::new_unchecked(bytes.as_ptr().add(slice * bytes_per_slice) as *mut c_void)
-            };
+        if texture_type == TextureType::D3 {
             unsafe {
                 texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
                     region,
                     0,
-                    span.base_slice as usize + slice,
-                    slice_pointer,
+                    0,
+                    pointer,
                     bytes_per_row,
                     bytes_per_image,
                 );
+            }
+        } else {
+            for slice in 0..layout.array_layers as usize {
+                let slice_pointer = unsafe {
+                    NonNull::new_unchecked(
+                        bytes.as_ptr().add(slice * bytes_per_image) as *mut c_void
+                    )
+                };
+                unsafe {
+                    texture.replaceRegion_mipmapLevel_slice_withBytes_bytesPerRow_bytesPerImage(
+                        region,
+                        0,
+                        slice,
+                        slice_pointer,
+                        bytes_per_row,
+                        bytes_per_image,
+                    );
+                }
             }
         }
         Ok(())
@@ -3279,7 +3005,6 @@ define <4 x half> @frag(<3 x float> %a, <3 x float> %b) {
             TextureFormat::Rg32Float => ("float2", "float2", "value", false),
             TextureFormat::Rgba16Float => ("half4", "half4", "value", false),
             TextureFormat::Rgba16Uint => ("ushort4", "uint4", "uint4(value)", false),
-            TextureFormat::Rgba16Sint => ("short4", "int4", "int4(value)", false),
             TextureFormat::R32Uint => ("uint", "uint", "value", false),
             TextureFormat::R32Sint => ("int", "int", "value", false),
             TextureFormat::R32Float => ("float", "float", "value", false),
@@ -3637,7 +3362,6 @@ fragment {result_type} metal2vulkan_literal_fragment(
             TextureFormat::Rg32Float => MTLPixelFormat::RG32Float,
             TextureFormat::Rgba16Float => MTLPixelFormat::RGBA16Float,
             TextureFormat::Rgba16Uint => MTLPixelFormat::RGBA16Uint,
-            TextureFormat::Rgba16Sint => MTLPixelFormat::RGBA16Sint,
             TextureFormat::R32Uint => MTLPixelFormat::R32Uint,
             TextureFormat::R32Sint => MTLPixelFormat::R32Sint,
             TextureFormat::R32Float => MTLPixelFormat::R32Float,
@@ -4140,67 +3864,67 @@ fragment {result_type} metal2vulkan_literal_fragment(
         origin: [u32; 3],
         dimensions: [u32; 3],
     ) -> Result<Vec<u8>, String> {
-        let span = crate::literal::subresource_span(texture_type, origin, dimensions, 1)?;
-        let bytes_per_row = span.size[0] as usize * format.bytes_per_pixel();
-        let bytes_per_image = bytes_per_row * span.size[1] as usize;
-        let bytes_per_slice = bytes_per_image * span.size[2] as usize;
-        let mut output = vec![0u8; bytes_per_slice * span.slice_count as usize];
-        let region = MTLRegion {
-            origin: MTLOrigin {
-                x: span.origin[0] as usize,
-                y: span.origin[1] as usize,
-                z: span.origin[2] as usize,
-            },
-            size: MTLSize {
-                width: span.size[0] as usize,
-                height: span.size[1] as usize,
-                depth: span.size[2] as usize,
-            },
-        };
-        for slice in 0..span.slice_count as usize {
-            let pointer = unsafe {
-                NonNull::new_unchecked(
-                    output
-                        .as_mut_ptr()
-                        .add(slice * bytes_per_slice)
-                        .cast::<c_void>(),
-                )
-            };
+        let bytes_per_row = dimensions[0] as usize * format.bytes_per_pixel();
+        let bytes_per_image = bytes_per_row * dimensions[1] as usize;
+        let mut output = vec![0u8; bytes_per_image * dimensions[2] as usize];
+        if texture_type == TextureType::D3 {
+            let pointer = NonNull::new(output.as_mut_ptr().cast::<c_void>())
+                .ok_or_else(|| "output texture pointer is null".to_string())?;
             unsafe {
                 texture.getBytes_bytesPerRow_bytesPerImage_fromRegion_mipmapLevel_slice(
                     pointer,
                     bytes_per_row,
                     bytes_per_image,
-                    region,
+                    MTLRegion {
+                        origin: MTLOrigin {
+                            x: origin[0] as usize,
+                            y: origin[1] as usize,
+                            z: origin[2] as usize,
+                        },
+                        size: MTLSize {
+                            width: dimensions[0] as usize,
+                            height: dimensions[1] as usize,
+                            depth: dimensions[2] as usize,
+                        },
+                    },
                     0,
-                    span.base_slice as usize + slice,
+                    0,
                 );
+            }
+        } else {
+            for selected_slice in 0..dimensions[2] as usize {
+                let pointer = unsafe {
+                    NonNull::new_unchecked(
+                        output
+                            .as_mut_ptr()
+                            .add(selected_slice * bytes_per_image)
+                            .cast::<c_void>(),
+                    )
+                };
+                unsafe {
+                    texture.getBytes_bytesPerRow_bytesPerImage_fromRegion_mipmapLevel_slice(
+                        pointer,
+                        bytes_per_row,
+                        bytes_per_image,
+                        MTLRegion {
+                            origin: MTLOrigin {
+                                x: origin[0] as usize,
+                                y: origin[1] as usize,
+                                z: 0,
+                            },
+                            size: MTLSize {
+                                width: dimensions[0] as usize,
+                                height: dimensions[1] as usize,
+                                depth: 1,
+                            },
+                        },
+                        0,
+                        origin[2] as usize + selected_slice,
+                    );
+                }
             }
         }
         Ok(output)
-    }
-
-    /// Metal drops a dispatch whose threadgroup is larger than the pipeline permits without
-    /// reporting an error: the command buffer still reaches `Completed`, so every output reads
-    /// back untouched and the case looks like a kernel that chose to write nothing. Refuse the
-    /// dispatch instead, naming both the authored threadgroup and the limit Metal computed.
-    pub(super) fn threads_per_threadgroup_within_limit(
-        threads_per_threadgroup: [u32; 3],
-        limit: usize,
-        what: &str,
-    ) -> Result<(), String> {
-        let total = threads_per_threadgroup
-            .iter()
-            .try_fold(1usize, |total, extent| total.checked_mul(*extent as usize))
-            .ok_or_else(|| {
-                format!("{what} threadgroup {threads_per_threadgroup:?} overflows a thread count")
-            })?;
-        if total > limit {
-            return Err(format!(
-                "{what} dispatch asks for {total} threads a threadgroup ({threads_per_threadgroup:?}),                  but the pipeline permits {limit}"
-            ));
-        }
-        Ok(())
     }
 
     fn mtl_size(size: [u32; 3]) -> MTLSize {
@@ -4229,43 +3953,6 @@ fragment {result_type} metal2vulkan_literal_fragment(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A dispatch Metal drops for being wider than the pipeline completes without an error, so the
-    /// executor has to refuse it itself. The tile pipeline for an explicit-imageblock function is
-    /// the case that found this: Metal capped it at 4 threads while the case dispatched 16x16.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_threadgroup_wider_than_the_pipeline_permits_is_refused() {
-        use super::platform::threads_per_threadgroup_within_limit as within;
-        assert_eq!(within([16, 16, 1], 256, "Metal tile"), Ok(()));
-        assert_eq!(within([16, 16, 1], 257, "Metal tile"), Ok(()));
-        let refused = within([16, 16, 1], 4, "Metal tile").expect_err("256 threads exceed 4");
-        assert!(refused.contains("256 threads"), "{refused}");
-        assert!(refused.contains("permits 4"), "{refused}");
-        assert!(refused.starts_with("Metal tile "), "{refused}");
-        assert_eq!(within([1, 1, 1], 1, "Metal compute"), Ok(()));
-        let overflow = within([u32::MAX, u32::MAX, u32::MAX], usize::MAX, "Metal compute")
-            .expect_err("the product overflows a thread count");
-        assert!(overflow.contains("overflows a thread count"), "{overflow}");
-    }
-
-    /// Metal names an imageblock member by its `[[user(...)]]` attribute when it has one and by
-    /// its declared name otherwise, and AIR reports both through the same reflected `semantic`.
-    /// Every custom fragment imageblock in the corpus is the second form.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_imageblock_semantic_is_a_user_attribute_or_a_plain_member_name() {
-        use super::platform::fragment_imageblock_semantic_name as name_of;
-        assert_eq!(name_of("user(depth)"), Ok("depth"));
-        assert_eq!(name_of("color"), Ok("color"));
-        assert_eq!(name_of("gBuffer_2"), Ok("gBuffer_2"));
-        for rejected in ["", "user()", "user(depth", "a.b", "user(a b)"] {
-            assert!(
-                name_of(rejected).is_err(),
-                "{rejected:?} is not an MSL member name"
-            );
-        }
-    }
 
     #[test]
     fn qualification_requires_three_identical_outputs_and_accepts_identity() {

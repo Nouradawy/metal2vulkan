@@ -801,16 +801,6 @@ fn rewrite_cross_binding_pointer_merges_inner(
             }
         })
     }
-    /// The module's existing declaration of `OpTypePointer <storage> <pointee>`, if any.
-    fn find_ptr_ty(module: &Module, storage: StorageClass, pointee: Word) -> Option<Word> {
-        module.types_global_values.iter().find_map(|i| {
-            (i.class.opcode == Op::TypePointer
-                && i.operands.first() == Some(&Operand::StorageClass(storage))
-                && i.operands.get(1) == Some(&Operand::IdRef(pointee)))
-            .then_some(i.result_id)
-            .flatten()
-        })
-    }
     let uint_ty = match find_int_ty(module, 32) {
         Some(id) => id,
         None => {
@@ -1146,26 +1136,16 @@ fn rewrite_cross_binding_pointer_merges_inner(
             Operand::IdRef(addr_struct),
         ],
     ));
-    // SPIR-V 2.8 uniques non-aggregate types by opcode and operands: unlike the aggregates above,
-    // a second `OpTypePointer StorageBuffer %ulong` is invalid even though `spirv-val` accepts it.
-    // The address table's element pointer is exactly the shape a `device ulong*` buffer parameter
-    // already declares, so reuse the module's when it has one.
-    let ptr_sb_u64 = match find_ptr_ty(module, StorageClass::StorageBuffer, ulong_ty) {
-        Some(id) => id,
-        None => {
-            let id = fresh();
-            module.types_global_values.push(Instruction::new(
-                Op::TypePointer,
-                None,
-                Some(id),
-                vec![
-                    Operand::StorageClass(StorageClass::StorageBuffer),
-                    Operand::IdRef(ulong_ty),
-                ],
-            ));
-            id
-        }
-    };
+    let ptr_sb_u64 = fresh();
+    module.types_global_values.push(Instruction::new(
+        Op::TypePointer,
+        None,
+        Some(ptr_sb_u64),
+        vec![
+            Operand::StorageClass(StorageClass::StorageBuffer),
+            Operand::IdRef(ulong_ty),
+        ],
+    ));
     let addr_var = fresh();
     module.types_global_values.push(Instruction::new(
         Op::Variable,
@@ -1386,53 +1366,30 @@ fn rewrite_cross_binding_pointer_merges_inner(
                     }
                 }
                 // Flat-element post-merge chain: an OpAccessChain/OpInBoundsAccessChain that applies a
-                // SINGLE index straight to a merged whole-buffer pointer (`%merged %idx`) — the shape
-                // a scalar element walk over a cross-binding select cascade produces (e.g. b00a8a8d's
-                // 28-way output-buffer scatter). The simple retype below cannot fix it in two cases,
-                // and both are here: indexing a struct member DYNAMICALLY is illegal, and indexing a
-                // merged pointer whose pointee is a SCALAR is illegal whatever the index is, because
-                // there is nothing to descend into. Lower it like the array-element leaf: take the
-                // merged pointer's device address (ConvertPtrToU), reinterpret as the element pointer
-                // (ConvertUToPtr to the ArrayStride-decorated physical element type), and
-                // OpPtrAccessChain by the same index (`base + idx*stride`, byte-identical).
-                //
-                // A `%merged %uint_0` whose merged pointee IS a composite stays with the plain retype:
-                // there the constant is a member selector and descending is what it means. The
-                // `%merged %uint_0 %i` post-merge chains the cleared whole-buffer cases carry have two
-                // indices and never reach here at all.
+                // SINGLE DYNAMIC index straight to a merged whole-buffer pointer (`%merged %idx`, no
+                // constant member-0 selector) — the shape a scalar element walk over a cross-binding
+                // select cascade produces (e.g. b00a8a8d's 28-way output-buffer scatter). Indexing a
+                // struct member dynamically is illegal, so the simple retype below cannot fix it.
+                // Lower it like the array-element leaf: take the merged pointer's device address
+                // (ConvertPtrToU), reinterpret as the element pointer (ConvertUToPtr to the
+                // ArrayStride-decorated physical element type), and OpPtrAccessChain by the same index
+                // (`base + idx*stride`, byte-identical). The valid `%merged %uint_0 %i` post-merge chains
+                // the cleared whole-buffer cases carry have a CONSTANT first index, so they never match
+                // and fall through to the plain retype.
                 if let Some(r) = rid {
                     if matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain) {
                         let base = match inst.operands.first() {
                             Some(Operand::IdRef(b)) => Some(*b),
                             _ => None,
                         };
-                        let merged_pointee_is_composite = base
-                            .and_then(|base| retype.get(&base).or_else(|| value_type.get(&base)))
-                            .and_then(|ty| ptr_info(*ty))
-                            .and_then(|(_, pointee)| type_defs.get(&pointee))
-                            .is_some_and(|pointee| {
-                                matches!(
-                                    pointee.class.opcode,
-                                    Op::TypeStruct
-                                        | Op::TypeArray
-                                        | Op::TypeRuntimeArray
-                                        | Op::TypeVector
-                                        | Op::TypeMatrix
-                                )
-                            });
-                        let single_index = (inst.operands.len() == 2)
+                        let single_dyn_index = (inst.operands.len() == 2)
                             .then(|| match inst.operands[1] {
-                                Operand::IdRef(idx)
-                                    if !const_ids.contains(&idx)
-                                        || !merged_pointee_is_composite =>
-                                {
-                                    Some(idx)
-                                }
+                                Operand::IdRef(idx) if !const_ids.contains(&idx) => Some(idx),
                                 _ => None,
                             })
                             .flatten();
                         if let (Some(base), Some(idx), Some(&elem_ptr)) =
-                            (base, single_index, retype.get(&r))
+                            (base, single_dyn_index, retype.get(&r))
                         {
                             if closure.contains(&base) {
                                 let addr = fresh();
@@ -1524,46 +1481,13 @@ fn rewrite_cross_binding_pointer_merges_inner(
                         .and_then(|ty| ptr_info(*ty))
                         .map(|(_, pointee)| pointee);
                     if closure.contains(&pointer) && pointer_pointee != Some(accessed_type) {
-                        // Take the address of the BASE and add the byte offset, rather than the
-                        // address of the byte access chain, whenever the pointer is one.
-                        //
-                        // `OpConvertPtrToU` of an `OpPtrAccessChain` is valid SPIR-V and
-                        // `spirv-val` accepts it, but SPIRV-Cross's MSL backend renders the access
-                        // chain as an LVALUE there -- `reinterpret_cast<ulong>(_p[i])`, which is a
-                        // cast from `uchar`, and does not compile. It renders the base pointer
-                        // itself correctly. A `uchar` element is one byte, so adding the index to
-                        // the base address names the same byte the chain did.
-                        let byte_step = byte_element_step(
-                            pointer,
-                            &all_value_defs,
-                            &value_type,
-                            &all_value_types,
-                            &type_defs,
-                            ulong_ty,
-                        );
                         let address = fresh();
-                        if let Some((base, index)) = byte_step {
-                            let base_address = fresh();
-                            new_insts.push(Instruction::new(
-                                Op::ConvertPtrToU,
-                                Some(ulong_ty),
-                                Some(base_address),
-                                vec![Operand::IdRef(base)],
-                            ));
-                            new_insts.push(Instruction::new(
-                                Op::IAdd,
-                                Some(ulong_ty),
-                                Some(address),
-                                vec![Operand::IdRef(base_address), Operand::IdRef(index)],
-                            ));
-                        } else {
-                            new_insts.push(Instruction::new(
-                                Op::ConvertPtrToU,
-                                Some(ulong_ty),
-                                Some(address),
-                                vec![Operand::IdRef(pointer)],
-                            ));
-                        }
+                        new_insts.push(Instruction::new(
+                            Op::ConvertPtrToU,
+                            Some(ulong_ty),
+                            Some(address),
+                            vec![Operand::IdRef(pointer)],
+                        ));
                         let typed_pointer = fresh();
                         new_insts.push(Instruction::new(
                             Op::ConvertUToPtr,
@@ -1649,51 +1573,6 @@ fn rewrite_cross_binding_pointer_merges_inner(
     Some(addr_var)
 }
 
-/// The `(base, byte index)` of a byte-element `OpPtrAccessChain`, when taking the base's address
-/// and adding the index names the same byte the chain does.
-///
-/// `OpConvertPtrToU` of an access chain is valid SPIR-V and `spirv-val` accepts it, but SPIRV-Cross
-/// renders the chain as an LVALUE there -- `reinterpret_cast<ulong>(_p[i])`, a cast from `uchar` --
-/// and the MSL does not compile, so MoltenVK refuses the pipeline. It renders the base pointer
-/// itself correctly. A `uchar` element is one byte, so `base + index` is the same address.
-///
-/// Restricted to a byte element and a 64-bit index: any other stride would need a multiply, and any
-/// other index width a conversion, and neither is justified by anything measured here.
-fn byte_element_step(
-    pointer: Word,
-    value_defs: &HashMap<Word, Instruction>,
-    value_type: &HashMap<Word, Word>,
-    all_value_types: &HashMap<Word, Word>,
-    type_defs: &HashMap<Word, Instruction>,
-    ulong_ty: Word,
-) -> Option<(Word, Word)> {
-    let def = value_defs.get(&pointer)?;
-    if !matches!(
-        def.class.opcode,
-        Op::PtrAccessChain | Op::InBoundsPtrAccessChain
-    ) {
-        return None;
-    }
-    let [Operand::IdRef(base), Operand::IdRef(index)] = def.operands.as_slice() else {
-        return None;
-    };
-    if all_value_types.get(index).copied() != Some(ulong_ty) {
-        return None;
-    }
-    let base_pointee = match type_defs.get(value_type.get(base)?)?.operands.as_slice() {
-        [Operand::StorageClass(_), Operand::IdRef(pointee)] => *pointee,
-        _ => return None,
-    };
-    let pointee = type_defs.get(&base_pointee)?;
-    if pointee.class.opcode != Op::TypeInt {
-        return None;
-    }
-    match pointee.operands.first()? {
-        Operand::LiteralBit32(8) => Some((*base, *index)),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1701,504 +1580,6 @@ mod tests {
 
     fn inst(op: Op, ty: Option<Word>, res: Option<Word>, ops: Vec<Operand>) -> Instruction {
         Instruction::new(op, ty, res, ops)
-    }
-
-    #[test]
-    fn a_byte_element_step_is_recognized_and_a_wider_one_is_not() {
-        // `%chain = OpPtrAccessChain %ptr_uchar %base %index` with a 64-bit index: taking the
-        // BASE's address and adding the index names the same byte, and unlike the address of the
-        // chain it is something SPIRV-Cross can spell in MSL.
-        let uchar = 1;
-        let ulong = 2;
-        let uint = 3;
-        let ptr_uchar = 4;
-        let ptr_ushort = 5;
-        let ushort = 6;
-        let type_defs = HashMap::from([
-            (
-                uchar,
-                inst(
-                    Op::TypeInt,
-                    None,
-                    Some(uchar),
-                    vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
-                ),
-            ),
-            (
-                ushort,
-                inst(
-                    Op::TypeInt,
-                    None,
-                    Some(ushort),
-                    vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
-                ),
-            ),
-            (
-                ptr_uchar,
-                inst(
-                    Op::TypePointer,
-                    None,
-                    Some(ptr_uchar),
-                    vec![
-                        Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
-                        Operand::IdRef(uchar),
-                    ],
-                ),
-            ),
-            (
-                ptr_ushort,
-                inst(
-                    Op::TypePointer,
-                    None,
-                    Some(ptr_ushort),
-                    vec![
-                        Operand::StorageClass(StorageClass::PhysicalStorageBuffer),
-                        Operand::IdRef(ushort),
-                    ],
-                ),
-            ),
-        ]);
-        let (base, index, chain) = (10, 11, 12);
-        let chain_inst = inst(
-            Op::PtrAccessChain,
-            Some(ptr_uchar),
-            Some(chain),
-            vec![Operand::IdRef(base), Operand::IdRef(index)],
-        );
-        let value_defs = HashMap::from([(chain, chain_inst.clone())]);
-        let value_type = HashMap::from([(base, ptr_uchar), (chain, ptr_uchar)]);
-        let all_value_types = HashMap::from([(index, ulong)]);
-        assert_eq!(
-            byte_element_step(
-                chain,
-                &value_defs,
-                &value_type,
-                &all_value_types,
-                &type_defs,
-                ulong,
-            ),
-            Some((base, index))
-        );
-
-        // A 16-bit element is a stride this rewrite would have to multiply by, and a 32-bit index
-        // is a width it would have to convert. Neither is recognized.
-        let wide_type = HashMap::from([(base, ptr_ushort), (chain, ptr_uchar)]);
-        assert_eq!(
-            byte_element_step(
-                chain,
-                &value_defs,
-                &wide_type,
-                &all_value_types,
-                &type_defs,
-                ulong,
-            ),
-            None
-        );
-        let narrow_index = HashMap::from([(index, uint)]);
-        assert_eq!(
-            byte_element_step(
-                chain,
-                &value_defs,
-                &value_type,
-                &narrow_index,
-                &type_defs,
-                ulong,
-            ),
-            None
-        );
-
-        // Anything that is not a pointer access chain keeps the plain conversion.
-        let load = HashMap::from([(
-            chain,
-            inst(
-                Op::Load,
-                Some(ptr_uchar),
-                Some(chain),
-                vec![Operand::IdRef(base)],
-            ),
-        )]);
-        assert_eq!(
-            byte_element_step(
-                chain,
-                &load,
-                &value_type,
-                &all_value_types,
-                &type_defs,
-                ulong,
-            ),
-            None
-        );
-    }
-
-    // A byte-element `OpPtrAccessChain` reached by a load of a WIDER type is the shape that made
-    // SPIRV-Cross emit `reinterpret_cast<ulong>(_p[i])` -- a cast from `uchar`, which `xcrun metal`
-    // rejects. The address the rewrite converts must be the BASE's, with the byte index added.
-    #[test]
-    fn a_byte_chain_address_is_taken_from_the_base_and_offset() {
-        // ids: uchar=1 rtarr=2 struct=3 ptrSbStruct=4 ptrSbUchar=5 bool=6 uint=7 ulong=8 |
-        //      uint_0=10 true=12 ulong_4=13 | bufA=20 bufB=21 | block=30 chainA=31 chainB=32
-        //      select=33 byteChain=34 load=35
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(40));
-        module.memory_model = Some(inst(
-            Op::MemoryModel,
-            None,
-            None,
-            vec![
-                Operand::AddressingModel(spirv::AddressingModel::Logical),
-                Operand::MemoryModel(MemoryModel::GLSL450),
-            ],
-        ));
-        module.types_global_values = vec![
-            inst(
-                Op::TypeInt,
-                None,
-                Some(1),
-                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
-            ),
-            inst(Op::TypeRuntimeArray, None, Some(2), vec![Operand::IdRef(1)]),
-            inst(Op::TypeStruct, None, Some(3), vec![Operand::IdRef(2)]),
-            inst(
-                Op::TypePointer,
-                None,
-                Some(4),
-                vec![
-                    Operand::StorageClass(StorageClass::StorageBuffer),
-                    Operand::IdRef(3),
-                ],
-            ),
-            inst(
-                Op::TypePointer,
-                None,
-                Some(5),
-                vec![
-                    Operand::StorageClass(StorageClass::StorageBuffer),
-                    Operand::IdRef(1),
-                ],
-            ),
-            inst(Op::TypeBool, None, Some(6), vec![]),
-            inst(
-                Op::TypeInt,
-                None,
-                Some(7),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::TypeInt,
-                None,
-                Some(8),
-                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::Constant,
-                Some(7),
-                Some(10),
-                vec![Operand::LiteralBit32(0)],
-            ),
-            inst(Op::ConstantTrue, Some(6), Some(12), vec![]),
-            inst(
-                Op::Constant,
-                Some(8),
-                Some(13),
-                vec![Operand::LiteralBit32(4), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::Variable,
-                Some(4),
-                Some(20),
-                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
-            ),
-            inst(
-                Op::Variable,
-                Some(4),
-                Some(21),
-                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
-            ),
-        ];
-        module.annotations = vec![
-            inst(
-                Op::Decorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(2),
-                    Operand::Decoration(Decoration::ArrayStride),
-                    Operand::LiteralBit32(1),
-                ],
-            ),
-            inst(
-                Op::Decorate,
-                None,
-                None,
-                vec![Operand::IdRef(3), Operand::Decoration(Decoration::Block)],
-            ),
-            inst(
-                Op::MemberDecorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(3),
-                    Operand::LiteralBit32(0),
-                    Operand::Decoration(Decoration::Offset),
-                    Operand::LiteralBit32(0),
-                ],
-            ),
-            inst(
-                Op::Decorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(20),
-                    Operand::Decoration(Decoration::Binding),
-                    Operand::LiteralBit32(0),
-                ],
-            ),
-            inst(
-                Op::Decorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(21),
-                    Operand::Decoration(Decoration::Binding),
-                    Operand::LiteralBit32(1),
-                ],
-            ),
-        ];
-        let mut block = Block::new();
-        block.label = Some(inst(Op::Label, None, Some(30), vec![]));
-        block.instructions = vec![
-            inst(
-                Op::AccessChain,
-                Some(5),
-                Some(31),
-                vec![Operand::IdRef(20), Operand::IdRef(10), Operand::IdRef(10)],
-            ),
-            inst(
-                Op::AccessChain,
-                Some(5),
-                Some(32),
-                vec![Operand::IdRef(21), Operand::IdRef(10), Operand::IdRef(10)],
-            ),
-            inst(
-                Op::Select,
-                Some(5),
-                Some(33),
-                vec![Operand::IdRef(12), Operand::IdRef(31), Operand::IdRef(32)],
-            ),
-            inst(
-                Op::PtrAccessChain,
-                Some(5),
-                Some(34),
-                vec![Operand::IdRef(33), Operand::IdRef(13)],
-            ),
-            // A 32-bit load through the byte pointer: the pointee and the accessed type differ, so
-            // the rewrite must materialize the address itself.
-            inst(Op::Load, Some(7), Some(35), vec![Operand::IdRef(34)]),
-            inst(Op::Return, None, None, vec![]),
-        ];
-        let mut function = Function::new();
-        function.blocks = vec![block];
-        module.functions = vec![function];
-
-        assert!(rewrite_cross_binding_pointer_merges(&mut module));
-        let instructions = &module.functions[0].blocks[0].instructions;
-        // The chain itself is never the operand of a `OpConvertPtrToU`; the base is, and the byte
-        // index is added to it.
-        let converted = instructions
-            .iter()
-            .filter(|instruction| instruction.class.opcode == Op::ConvertPtrToU)
-            .map(|instruction| instruction.operands.clone())
-            .collect::<Vec<_>>();
-        assert!(!converted.is_empty(), "no address was materialized");
-        assert!(
-            !converted.contains(&vec![Operand::IdRef(34)]),
-            "the byte access chain is still converted directly: {converted:?}"
-        );
-        let base_address = instructions
-            .iter()
-            .find(|instruction| {
-                instruction.class.opcode == Op::ConvertPtrToU
-                    && instruction.operands == [Operand::IdRef(33)]
-            })
-            .and_then(|instruction| instruction.result_id)
-            .expect("the select's address");
-        assert!(
-            instructions.iter().any(|instruction| {
-                instruction.class.opcode == Op::IAdd
-                    && instruction.operands == [Operand::IdRef(base_address), Operand::IdRef(13)]
-            }),
-            "the byte index is not added to the base address"
-        );
-    }
-
-    // SPIR-V 2.8 uniques non-aggregate types, so the address table's `OpTypePointer StorageBuffer
-    // %ulong` may not be a second declaration of one the module already has. `spirv-val` accepts the
-    // duplicate, so only this assertion catches it.
-    #[test]
-    fn the_address_table_reuses_the_modules_storage_buffer_ulong_pointer() {
-        // ids: ulong=1 rtarr=2 struct=3 ptrSbStruct=4 ptrSbUlong=5 bool=6 uint=7 |
-        //      uint_0=10 true=12 | bufA=20 bufB=21 | block=30 chainA=31 chainB=32 select=33 load=35
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(40));
-        module.memory_model = Some(inst(
-            Op::MemoryModel,
-            None,
-            None,
-            vec![
-                Operand::AddressingModel(spirv::AddressingModel::Logical),
-                Operand::MemoryModel(MemoryModel::GLSL450),
-            ],
-        ));
-        module.types_global_values = vec![
-            inst(
-                Op::TypeInt,
-                None,
-                Some(1),
-                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
-            ),
-            inst(Op::TypeRuntimeArray, None, Some(2), vec![Operand::IdRef(1)]),
-            inst(Op::TypeStruct, None, Some(3), vec![Operand::IdRef(2)]),
-            inst(
-                Op::TypePointer,
-                None,
-                Some(4),
-                vec![
-                    Operand::StorageClass(StorageClass::StorageBuffer),
-                    Operand::IdRef(3),
-                ],
-            ),
-            inst(
-                Op::TypePointer,
-                None,
-                Some(5),
-                vec![
-                    Operand::StorageClass(StorageClass::StorageBuffer),
-                    Operand::IdRef(1),
-                ],
-            ),
-            inst(Op::TypeBool, None, Some(6), vec![]),
-            inst(
-                Op::TypeInt,
-                None,
-                Some(7),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::Constant,
-                Some(7),
-                Some(10),
-                vec![Operand::LiteralBit32(0)],
-            ),
-            inst(Op::ConstantTrue, Some(6), Some(12), vec![]),
-            inst(
-                Op::Variable,
-                Some(4),
-                Some(20),
-                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
-            ),
-            inst(
-                Op::Variable,
-                Some(4),
-                Some(21),
-                vec![Operand::StorageClass(StorageClass::StorageBuffer)],
-            ),
-        ];
-        module.annotations = vec![
-            inst(
-                Op::Decorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(2),
-                    Operand::Decoration(Decoration::ArrayStride),
-                    Operand::LiteralBit32(8),
-                ],
-            ),
-            inst(
-                Op::Decorate,
-                None,
-                None,
-                vec![Operand::IdRef(3), Operand::Decoration(Decoration::Block)],
-            ),
-            inst(
-                Op::MemberDecorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(3),
-                    Operand::LiteralBit32(0),
-                    Operand::Decoration(Decoration::Offset),
-                    Operand::LiteralBit32(0),
-                ],
-            ),
-            inst(
-                Op::Decorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(20),
-                    Operand::Decoration(Decoration::Binding),
-                    Operand::LiteralBit32(0),
-                ],
-            ),
-            inst(
-                Op::Decorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(21),
-                    Operand::Decoration(Decoration::Binding),
-                    Operand::LiteralBit32(1),
-                ],
-            ),
-        ];
-        let mut block = Block::new();
-        block.label = Some(inst(Op::Label, None, Some(30), vec![]));
-        block.instructions = vec![
-            inst(
-                Op::AccessChain,
-                Some(5),
-                Some(31),
-                vec![Operand::IdRef(20), Operand::IdRef(10), Operand::IdRef(10)],
-            ),
-            inst(
-                Op::AccessChain,
-                Some(5),
-                Some(32),
-                vec![Operand::IdRef(21), Operand::IdRef(10), Operand::IdRef(10)],
-            ),
-            inst(
-                Op::Select,
-                Some(5),
-                Some(33),
-                vec![Operand::IdRef(12), Operand::IdRef(31), Operand::IdRef(32)],
-            ),
-            inst(Op::Load, Some(1), Some(35), vec![Operand::IdRef(33)]),
-            inst(Op::Return, None, None, vec![]),
-        ];
-        let mut function = Function::new();
-        function.blocks = vec![block];
-        module.functions = vec![function];
-
-        assert!(rewrite_cross_binding_pointer_merges(&mut module));
-        let declarations = module
-            .types_global_values
-            .iter()
-            .filter(|instruction| {
-                instruction.class.opcode == Op::TypePointer
-                    && instruction.operands
-                        == [
-                            Operand::StorageClass(StorageClass::StorageBuffer),
-                            Operand::IdRef(1),
-                        ]
-            })
-            .filter_map(|instruction| instruction.result_id)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            declarations,
-            vec![5],
-            "the address table declared its own StorageBuffer ulong pointer"
-        );
     }
 
     #[test]

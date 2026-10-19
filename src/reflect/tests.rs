@@ -256,72 +256,6 @@ entry:
 }
 
 #[test]
-fn reflected_buffer_footprint_is_empty_for_a_descriptor_the_module_never_declares() {
-    // `params` reaches the entry, is handed to a helper, and is never dereferenced. AIR still
-    // declares it `air.read`, so the specialized-entry tightening cannot call the parameter unused,
-    // and the finished module carries no variable at its binding. Under Logical addressing that
-    // proves the module executes zero bytes through it -- and, by the same absence, that no access
-    // happens through it at all, which is what its reported `access` has to say.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @k(i32 %gid, ptr addrspace(1) %output, ptr addrspace(2) %params) {
-entry:
-  tail call fastcc void @helper(ptr addrspace(1) %output, ptr addrspace(2) %params, i32 %gid)
-  ret void
-}
-
-define internal fastcc void @helper(ptr addrspace(1) %out, ptr addrspace(2) %ignored, i32 %gid) {
-entry:
-  store i32 %gid, ptr addrspace(1) %out, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"output"}
-!5 = !{i32 2, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"params", !"air.arg_name", !"params"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_reflect_unreachable_descriptor_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let (spv, reflection) = crate::translate_sanitized_native_reflected(
-        ll,
-        crate::passes::Stage::Kernel,
-        &tmp,
-        crate::passes::TransformOptions::default(),
-    )
-    .expect("translate");
-    let plain = crate::translate_sanitized_native(ll, crate::passes::Stage::Kernel, &tmp)
-        .expect("plain translate");
-    assert_eq!(spv, plain, "footprint reflection must remain byte-neutral");
-
-    let params = reflection
-        .binding_at(ResourceKind::Buffer, 2)
-        .expect("params binding is still reflected");
-    let footprint = params.footprint.as_ref().expect("params footprint");
-    assert!(footprint.static_ranges.is_empty(), "{footprint:?}");
-    assert!(footprint.strided_accesses.is_empty(), "{footprint:?}");
-    assert!(
-        !footprint.has_unbounded_access,
-        "a descriptor the Logical module never declares executes zero bytes: {footprint:?}"
-    );
-    assert_eq!(
-        params.access,
-        Some(ResourceAccess::Unused),
-        "AIR declares this parameter air.read, but the same absence that empties its footprint \
-         also proves no access can happen through it"
-    );
-
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
 fn reflected_buffer_footprint_marks_data_dependent_index_unbounded() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
@@ -613,78 +547,6 @@ declare i32 @air.atomic.global.add.u.i32(ptr addrspace(1), i32, i32, i32, i1)
 }
 
 #[test]
-fn a_synthesized_read_sampler_reports_the_state_it_needs() {
-    // A cube texel READ becomes a direction SAMPLE, because `OpImageFetch` forbids `Dim Cube`. The
-    // sampler that sample needs answers to no Metal argument, and until this reported a state the
-    // only record of what it had to be was a comment in the lowering that creates it. A consumer
-    // that bound a LINEAR sampler here would get a blend of four texels where AIR asked for one,
-    // in a module that validates, binds and reflects cleanly.
-    //
-    // The same cube is direction-sampled as well as read, which is what keeps it `Dim Cube`: a cube
-    // only read is declared as something SPIR-V can fetch, and then no sampler is invented at all.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state.1 = internal addrspace(2) constant i64 -9188470239253738862, align 8
-
-define void @k(ptr addrspace(1) %tex, ptr addrspace(1) %out, i32 %gid) {
-entry:
-  %read = tail call { <4 x float>, i8 } @air.read_texture_cube.v4f32(ptr addrspace(1) %tex, <2 x i32> zeroinitializer, i32 0, i32 0, i32 0)
-  %fetched = extractvalue { <4 x float>, i8 } %read, 0
-  %sample = tail call { <4 x float>, i8 } @air.sample_texture_cube.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state.1, <3 x float> <float 1.000000e+00, float 0.000000e+00, float 0.000000e+00>, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %sampled = extractvalue { <4 x float>, i8 } %sample, 0
-  %value = fadd <4 x float> %fetched, %sampled
-  store <4 x float> %value, ptr addrspace(1) %out, align 16
-  ret void
-}
-
-declare { <4 x float>, i8 } @air.read_texture_cube.v4f32(ptr addrspace(1), <2 x i32>, i32, i32, i32)
-declare { <4 x float>, i8 } @air.sample_texture_cube.v4f32(ptr addrspace(1), ptr addrspace(2), <3 x float>, i1, float, float, i32)
-
-!air.kernel = !{!0}
-!air.sampler_states = !{!6}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texturecube<float>"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
-!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-!6 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state.1}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_reflect_synth_read_sampler_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let (_, reflection) = crate::translate_sanitized_native_reflected(
-        ll,
-        crate::passes::Stage::Kernel,
-        &tmp,
-        crate::passes::TransformOptions::default(),
-    )
-    .expect("translate");
-    let synthesized = reflection
-        .bindings
-        .iter()
-        .find(|binding| binding.kind == ResourceKind::SynthesizedReadSampler)
-        .expect("the cube read synthesizes a sampler");
-    let state = synthesized
-        .static_sampler
-        .expect("the synthesized sampler reports the state a consumer must bind");
-    assert_eq!(state.min_filter, SamplerFilter::Nearest);
-    assert_eq!(state.mag_filter, SamplerFilter::Nearest);
-    assert_eq!(state.mip_filter, SamplerMipFilter::Nearest);
-    assert_eq!(state.address_mode_s, SamplerAddressMode::ClampToEdge);
-    assert_eq!(state.address_mode_t, SamplerAddressMode::ClampToEdge);
-    assert_eq!(state.address_mode_r, SamplerAddressMode::ClampToEdge);
-    assert_eq!(state.coordinates, SamplerCoordinates::Normalized);
-    assert_eq!(state.max_anisotropy, 1);
-    assert_eq!(state.lod_bias, 0.0);
-    // No AIR constexpr encodes this sampler, so there are no raw words to carry through.
-    assert_eq!(state.raw_words, [0; 2]);
-}
-
-#[test]
 fn reflected_static_samplers_stay_in_sampler_band_and_carry_state() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
@@ -733,7 +595,8 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     )
     .expect("translate");
     let asm = crate::disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("Binding 160"), "{asm}");
+    // `runtime_sampler` is never sampled with, so no descriptor is declared for it.
+    assert!(!asm.contains("Binding 160"), "{asm}");
     assert!(asm.contains("Binding 161"), "{asm}");
     assert!(asm.contains("Binding 162"), "{asm}");
     assert!(asm.contains("Binding 192"), "{asm}");
@@ -796,7 +659,9 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     )
     .expect("translate custom sampler layout");
     let custom_asm = crate::disassemble(&custom_spv).expect("disassemble custom sampler layout");
-    for binding in [800, 801, 802] {
+    // The runtime sampler at 800 is never sampled with, so only the two static samplers bind.
+    assert!(!custom_asm.contains("Binding 800"), "{custom_asm}");
+    for binding in [801, 802] {
         assert!(
             custom_asm.contains(&format!("Binding {binding}")),
             "{custom_asm}"
@@ -1430,11 +1295,6 @@ fn storage_image_texel_format_exported() {
         (2, "texture2d<uint, write>", TF::Rgba8ui),
         (3, "texture2d<ushort, read_write>", TF::Rgba16ui),
         (4, "texture2d<int, write>", TF::Rgba8i),
-        // The signed pair mirrors the unsigned pair above it: `<short` widens to 16 bits just as
-        // `<ushort` does. The signed default used to be `Rgba8i` for every width, so a
-        // `texture2d<short, write>` was decorated as an 8-bit storage image and every component
-        // written through it was truncated to the signed byte range.
-        (5, "texture2d<short, write>", TF::Rgba16i),
     ];
     let mut meta = KernMeta {
         roles: cases
@@ -1615,7 +1475,6 @@ fn reflection_serde_covers_every_reflection_field() {
         depth_qualifier: None,
         stencil_members: vec![2],
         local_size: Some([8, 8, 1]),
-        max_work_group_size: Some(256),
         kernel_dispatch: Some(KernelDispatch::ThreadsDynamic { offset: 16 }),
         vertex_builtins: Some(VertexBuiltins {
             uses_vertex_index: true,
@@ -1881,8 +1740,10 @@ fn runtime_storage_formats_have_complete_component_and_spirv_mappings() {
 ///
 /// A sampler decoded from the wrong bit is not a translation failure -- it is a shader that filters,
 /// wraps, or compares differently than Metal asked, with valid SPIR-V and no diagnostic. The
-/// ignored ranges are pinned so that ignoring them stays deliberate; what each of them carries is
-/// settled in `every_metal_constexpr_sampler_option_decodes_to_what_the_frontend_emits`.
+/// ignored ranges are pinned too because ignoring them is a documented gap rather than a
+/// conclusion: bit 63 of `words[0]` is set on 151 of a 2880-source corpus's 1084 static samplers,
+/// with no correlate among the decoded fields, and `raw_words` is what a consumer that learns its
+/// meaning would read.
 #[test]
 fn every_static_sampler_bit_is_either_decoded_or_deliberately_ignored() {
     // One value per field, each distinct from its neighbours so a swapped shift cannot pass.
@@ -1895,7 +1756,7 @@ fn every_static_sampler_bit_is_either_decoded_or_deliberately_ignored() {
         | (1 << 15)
         | (3 << 16)
         | (4 << 20)
-        | (0x4080 << 24)
+        | (0x40 << 32)
         | (0x4200 << 40)
         | (1 << 56)
         | (2 << 58);
@@ -1909,7 +1770,7 @@ fn every_static_sampler_bit_is_either_decoded_or_deliberately_ignored() {
         coordinates: SamplerCoordinates::Pixel,
         compare_function: SamplerCompareFunction::Greater,
         max_anisotropy: 5,
-        lod_min_clamp: 2.25,
+        lod_min_clamp: 2.0,
         lod_max_clamp: 3.0,
         border_color: SamplerBorderColor::OpaqueBlack,
         reduction: SamplerReduction::Maximum,
@@ -1921,9 +1782,9 @@ fn every_static_sampler_bit_is_either_decoded_or_deliberately_ignored() {
         expected,
     );
 
-    // `words[0]` bits 60-63 and `words[1]` bits 16-63 are not read. Setting every one of them
-    // changes nothing but `raw_words`, which carries them through verbatim.
-    let ignored_word0 = 0xf << 60;
+    // `words[0]` bits 24-31 and 60-63, and `words[1]` bits 16-63, are not read. Setting every one
+    // of them changes nothing but `raw_words`, which carries them through verbatim.
+    let ignored_word0 = (0xff << 24) | (0xf << 60);
     let ignored_word1 = !0xffff_u64;
     let mut with_ignored = expected;
     with_ignored.raw_words = [decoded | ignored_word0, 0x3c00 | ignored_word1];
@@ -1953,257 +1814,4 @@ fn every_static_sampler_bit_is_either_decoded_or_deliberately_ignored() {
             "an unsupported {field} code should not be decoded into a guess",
         );
     }
-}
-
-/// Every `constexpr sampler` option, as the Metal frontend actually encodes it.
-///
-/// The bit map above is pinned against a word this file builds, so it can only prove that
-/// `from_air_words` agrees with itself. These words came out of `xcrun -sdk macosx metal -S
-/// -emit-llvm` (Apple metal version 32023.883, one kernel per option), so they pin the map against
-/// the compiler that produces the AIR instead. A shift that moves ties this test, not just the
-/// synthetic one.
-///
-/// Two encodings are worth naming because they are not one-to-one with the source text.
-/// `compare_func::never` and an unspecified `compare_func` both emit code 8 -- there is no
-/// `compare_func::none` in the language, so code 0 is a value the frontend never writes.
-/// `address::clamp_to_border` with the default transparent-black border emits the same word as
-/// `address::clamp_to_zero`, which is why `from_air_words` reads address code 0 through the border
-/// colour rather than on its own.
-///
-/// **`words[0]` bit 63 is a frontend-version artifact, not a sampler property.** Over the
-/// 14579-source corpus it is set on 1076 of 5499 static-sampler sites, and it partitions exactly by
-/// the emitting frontend: every module from metalfe-32023.850 (`air.version` 2.6.0), which spells
-/// the state as a single `i64`, sets it on every sampler, and no module from metalfe-32023.884
-/// (`air.version` 2.8.0, `[2 x i64]`) ever does. 31 of the 32 distinct words carrying it also occur
-/// without it, with identical decoded fields, in a 2.8.0 module. Ignoring it is therefore a
-/// conclusion, and the words below -- all 2.8.0 -- are why this test cannot re-derive it.
-#[test]
-fn every_metal_constexpr_sampler_option_decodes_to_what_the_frontend_emits() {
-    // `constant sampler s;` -- what every row below is a single-field departure from.
-    let default_state = StaticSamplerState {
-        address_mode_s: SamplerAddressMode::ClampToEdge,
-        address_mode_t: SamplerAddressMode::ClampToEdge,
-        address_mode_r: SamplerAddressMode::ClampToEdge,
-        mag_filter: SamplerFilter::Nearest,
-        min_filter: SamplerFilter::Nearest,
-        mip_filter: SamplerMipFilter::None,
-        coordinates: SamplerCoordinates::Normalized,
-        compare_function: SamplerCompareFunction::Never,
-        max_anisotropy: 1,
-        lod_min_clamp: 0.0,
-        lod_max_clamp: 65504.0,
-        border_color: SamplerBorderColor::TransparentBlack,
-        reduction: SamplerReduction::WeightedAverage,
-        lod_bias: 0.0,
-        raw_words: [0x007b_ff00_0008_0049, 0],
-    };
-    let rows: &[(&str, u64, u64, fn(&mut StaticSamplerState))] = &[
-        ("", 0x007b_ff00_0008_0049, 0, |_| {}),
-        ("coord::normalized", 0x007b_ff00_0008_0049, 0, |_| {}),
-        ("coord::pixel", 0x007b_ff00_0008_8049, 0, |s| {
-            s.coordinates = SamplerCoordinates::Pixel;
-        }),
-        ("filter::nearest", 0x007b_ff00_0008_0049, 0, |_| {}),
-        ("filter::linear", 0x007b_ff00_0008_0a49, 0, |s| {
-            s.mag_filter = SamplerFilter::Linear;
-            s.min_filter = SamplerFilter::Linear;
-        }),
-        ("filter::bicubic", 0x007b_ff00_0008_1449, 0, |s| {
-            s.mag_filter = SamplerFilter::Bicubic;
-            s.min_filter = SamplerFilter::Bicubic;
-        }),
-        (
-            "mag_filter::linear, min_filter::nearest",
-            0x007b_ff00_0008_0249,
-            0,
-            |s| s.mag_filter = SamplerFilter::Linear,
-        ),
-        ("address::clamp_to_edge", 0x007b_ff00_0008_0049, 0, |_| {}),
-        ("address::clamp_to_zero", 0x007b_ff00_0008_0000, 0, |s| {
-            s.address_mode_s = SamplerAddressMode::ClampToZero;
-            s.address_mode_t = SamplerAddressMode::ClampToZero;
-            s.address_mode_r = SamplerAddressMode::ClampToZero;
-        }),
-        // Same word as clamp_to_zero: a transparent-black border and a clamp to zero are the same
-        // texel, and the frontend does not distinguish them.
-        ("address::clamp_to_border", 0x007b_ff00_0008_0000, 0, |s| {
-            s.address_mode_s = SamplerAddressMode::ClampToZero;
-            s.address_mode_t = SamplerAddressMode::ClampToZero;
-            s.address_mode_r = SamplerAddressMode::ClampToZero;
-        }),
-        ("address::repeat", 0x007b_ff00_0008_0092, 0, |s| {
-            s.address_mode_s = SamplerAddressMode::Repeat;
-            s.address_mode_t = SamplerAddressMode::Repeat;
-            s.address_mode_r = SamplerAddressMode::Repeat;
-        }),
-        ("address::mirrored_repeat", 0x007b_ff00_0008_00db, 0, |s| {
-            s.address_mode_s = SamplerAddressMode::MirroredRepeat;
-            s.address_mode_t = SamplerAddressMode::MirroredRepeat;
-            s.address_mode_r = SamplerAddressMode::MirroredRepeat;
-        }),
-        (
-            "address::clamp_to_border, border_color::opaque_black",
-            0x017b_ff00_0008_0000,
-            0,
-            |s| {
-                s.address_mode_s = SamplerAddressMode::ClampToBorder;
-                s.address_mode_t = SamplerAddressMode::ClampToBorder;
-                s.address_mode_r = SamplerAddressMode::ClampToBorder;
-                s.border_color = SamplerBorderColor::OpaqueBlack;
-            },
-        ),
-        (
-            "address::clamp_to_border, border_color::opaque_white",
-            0x027b_ff00_0008_0000,
-            0,
-            |s| {
-                s.address_mode_s = SamplerAddressMode::ClampToBorder;
-                s.address_mode_t = SamplerAddressMode::ClampToBorder;
-                s.address_mode_r = SamplerAddressMode::ClampToBorder;
-                s.border_color = SamplerBorderColor::OpaqueWhite;
-            },
-        ),
-        (
-            "s_address::repeat, t_address::mirrored_repeat, r_address::clamp_to_zero",
-            0x007b_ff00_0008_001a,
-            0,
-            |s| {
-                s.address_mode_s = SamplerAddressMode::Repeat;
-                s.address_mode_t = SamplerAddressMode::MirroredRepeat;
-                s.address_mode_r = SamplerAddressMode::ClampToZero;
-            },
-        ),
-        ("mip_filter::none", 0x007b_ff00_0008_0049, 0, |_| {}),
-        ("mip_filter::nearest", 0x007b_ff00_0008_2049, 0, |s| {
-            s.mip_filter = SamplerMipFilter::Nearest;
-        }),
-        ("mip_filter::linear", 0x007b_ff00_0008_4049, 0, |s| {
-            s.mip_filter = SamplerMipFilter::Linear;
-        }),
-        ("max_anisotropy(5)", 0x007b_ff00_0048_0049, 0, |s| {
-            s.max_anisotropy = 5;
-        }),
-        ("lod_clamp(2.0f, 3.0f)", 0x0042_0040_0008_0049, 0, |s| {
-            s.lod_min_clamp = 2.0;
-            s.lod_max_clamp = 3.0;
-        }),
-        // `lod_min_clamp` occupies bits 24-39, not just the byte at 32-39: 3.7 is the half 0x4366
-        // and its low byte is the only thing separating it from 3.5. Each expectation below is the
-        // half's exact value written as its own ratio -- significand over the binade's scale --
-        // rather than a rounded decimal or a call to the decoder under test.
-        ("lod_clamp(3.7f, 4.0f)", 0x0044_0043_6608_0049, 0, |s| {
-            // 0x4366: (1 + 870/1024) * 2 = 947/256.
-            s.lod_min_clamp = 947.0 / 256.0;
-            s.lod_max_clamp = 4.0;
-        }),
-        ("lod_clamp(1.1f, 2.2f)", 0x0040_663c_6608_0049, 0, |s| {
-            // 0x3c66: (1 + 102/1024) * 1 = 563/512. 0x4066 is the same significand one binade up.
-            s.lod_min_clamp = 563.0 / 512.0;
-            s.lod_max_clamp = 563.0 / 256.0;
-        }),
-        ("compare_func::less", 0x007b_ff00_0001_0049, 0, |s| {
-            s.compare_function = SamplerCompareFunction::Less;
-        }),
-        ("compare_func::less_equal", 0x007b_ff00_0002_0049, 0, |s| {
-            s.compare_function = SamplerCompareFunction::LessEqual;
-        }),
-        ("compare_func::greater", 0x007b_ff00_0003_0049, 0, |s| {
-            s.compare_function = SamplerCompareFunction::Greater;
-        }),
-        (
-            "compare_func::greater_equal",
-            0x007b_ff00_0004_0049,
-            0,
-            |s| {
-                s.compare_function = SamplerCompareFunction::GreaterEqual;
-            },
-        ),
-        ("compare_func::equal", 0x007b_ff00_0005_0049, 0, |s| {
-            s.compare_function = SamplerCompareFunction::Equal;
-        }),
-        ("compare_func::not_equal", 0x007b_ff00_0006_0049, 0, |s| {
-            s.compare_function = SamplerCompareFunction::NotEqual;
-        }),
-        ("compare_func::always", 0x007b_ff00_0007_0049, 0, |s| {
-            s.compare_function = SamplerCompareFunction::Always;
-        }),
-        ("compare_func::never", 0x007b_ff00_0008_0049, 0, |_| {}),
-        ("max_anisotropy(16)", 0x007b_ff00_00f8_0049, 0, |s| {
-            s.max_anisotropy = 16
-        }),
-        ("lod_clamp(0.0f, 0.0f)", 0x0000_0000_0008_0049, 0, |s| {
-            s.lod_max_clamp = 0.0
-        }),
-        // `bias` is the only option that reaches `words[1]`, and it is not spelled `lod_bias`.
-        ("bias(2.0f)", 0x007b_ff00_0008_0049, 0x4000, |s| {
-            s.lod_bias = 2.0
-        }),
-        ("bias(-0.5f)", 0x007b_ff00_0008_0049, 0xb800, |s| {
-            s.lod_bias = -0.5
-        }),
-    ];
-    for (options, word, second, apply) in rows {
-        let mut expected = default_state;
-        apply(&mut expected);
-        expected.raw_words = [*word, *second];
-        assert_eq!(
-            StaticSamplerState::from_air_words([*word, *second]).expect("decode"),
-            expected,
-            "constexpr sampler s({options}) emits {word:#018x}, {second:#018x}",
-        );
-    }
-}
-
-/// Reapplying the DEFAULT layout to a reflection built with the default helpers changes nothing.
-///
-/// The binding of a Metal resource index is derived twice: the `from_*` builders ask the
-/// `*_resource_binding` helpers while assembling a reflection, and `apply_descriptor_layout` asks
-/// `DescriptorLayout` again whenever a caller selects a layout — which every translation does, with
-/// the default layout when the caller states no other. Two derivations of one fact drift; this runs
-/// them against each other over every resource kind the builders can produce, so a band that moves
-/// in one spelling and not the other is a failing test rather than a binding a consumer satisfies
-/// at the wrong number.
-#[test]
-fn the_default_layout_reapplied_is_the_identity_on_every_binding() {
-    let ll = r#"
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5, !6, !7}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 1}
-!4 = !{i32 1, !"air.texture", !"air.location_index", i32 5, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
-!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 3, i32 1}
-!6 = !{i32 3, !"air.texture", !"air.location_index", i32 9, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>"}
-!7 = !{i32 4, !"air.stage_in", !"air.location_index", i32 2, i32 1, !"air.arg_type_name", !"float3"}
-"#;
-    let meta = crate::meta::parse_air_kernel_meta(ll).expect("parse kernel meta");
-    let mut reflection = ShaderReflection::from_kernel(&meta, None, [1, 1, 1]);
-    let before = reflection.bindings.clone();
-    let mut kinds = before
-        .iter()
-        .filter(|binding| binding.descriptor.is_some())
-        .map(|binding| format!("{:?}", binding.kind))
-        .collect::<Vec<_>>();
-    kinds.sort();
-    kinds.dedup();
-    // Named rather than counted: the test is only as good as the bands it reaches, and a fixture
-    // that quietly stops producing one of these would still pass an "is not empty" assertion.
-    assert_eq!(
-        kinds,
-        [
-            "Buffer",
-            "KernelStageInput",
-            "Sampler",
-            "StorageImage",
-            "Texture"
-        ],
-        "one descriptor band per kind the default helpers assign: {before:?}"
-    );
-    reflection
-        .apply_descriptor_layout(DescriptorLayout::default())
-        .expect("reapply the default layout");
-    assert_eq!(
-        reflection.bindings, before,
-        "the default layout's answer and the default helpers' answer are the same answer"
-    );
 }

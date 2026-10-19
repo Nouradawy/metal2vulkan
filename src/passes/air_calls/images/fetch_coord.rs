@@ -234,7 +234,6 @@ pub(in crate::passes) fn build_pixel_fetch_coord_from_parts(
         };
         let comp = clamp_pixel_coord_component_finite(
             ctx,
-            sampler_state,
             comp,
             size,
             spatial > 1 || arrayed,
@@ -864,7 +863,7 @@ pub(in crate::passes) fn cube_fetch_as_center_sample(
     // Nearest sampler: the shader's own read sampler when AIR threads one, else the default read
     // sampler resource (the harness binds nearest/clamp for both).
     let sampler = match sampler_arg {
-        Some(samp) => valid_sampler_value(ctx, samp, out)?,
+        Some(samp) => valid_sampler_value(ctx, samp, out, SamplerUse::CubeRead)?,
         None => {
             let sty = ctx.ty_sampler();
             let var = ctx.default_read_sampler()?;

@@ -24,47 +24,6 @@ pub struct CheckedCaseContract {
     pub input_sha256: String,
 }
 
-/// An installed case whose manifest no longer checks against current product reflection.
-pub struct StaleCase {
-    pub case_id: String,
-    pub name: String,
-    pub errors: Vec<String>,
-}
-
-/// Re-check every installed case against the CURRENT product reflection, newest semantics.
-///
-/// An authored case is evidence about the bytes this translator emits today. A product change that
-/// moves a descriptor slot, or that starts requiring a resource, turns that evidence into a manifest
-/// the shared checker no longer accepts -- with its Metal and candidate observations still committed
-/// beside it, describing a run nobody can reproduce. Nothing on the ordinary path re-reads the store
-/// for that: `corpus-index --check` verifies the index against the shards, not the shards against
-/// the product.
-///
-/// `e84ea3fa` is the case in point. Reading `air.location_index` positionally moved 41 authored
-/// texture arrays off the Metal slot their manifests declare; its full-corpus A/B measured 0
-/// translation status changes, which is the wrong instrument for this, and the store went 133
-/// commits with 60 stale cases in it.
-pub fn recheck_installed_cases(
-    root: &Path,
-    store: &crate::store::CorpusStore,
-) -> Result<(usize, Vec<StaleCase>), String> {
-    let cases = store.read_all_cases()?;
-    let total = cases.len();
-    let stale = cases
-        .into_iter()
-        .filter_map(|case| {
-            let case_id = case.case_id.clone();
-            let name = case.name.clone();
-            check_case(root, case).err().map(|errors| StaleCase {
-                case_id,
-                name,
-                errors,
-            })
-        })
-        .collect();
-    Ok((total, stale))
-}
-
 pub fn check_case(root: &Path, case: AuthoredCase) -> Result<CheckedCase, Vec<String>> {
     let (mut errors, input_sha256) = check_case_identity(&case);
     let source = match find_source(root, &case.air_sha256) {
@@ -188,15 +147,6 @@ fn check_case_against_source_with_identity(
         errors.push(error);
     }
     validate_reflection(&case, &reflection, &mut errors);
-    // The declared classification is narrower than what the module does, by design. Only a case
-    // the declared view rejects pays for building the module, and the second opinion can only
-    // accept -- it never adds an error of its own.
-    if errors.iter().any(|error| error == OUTPUT_NOT_WRITABLE)
-        && reflect_translated(&source.air_ll, &case, &linked_functions)
-            .is_ok_and(|widened| selected_output_is_reflected_writable(&case, &widened))
-    {
-        errors.retain(|error| error != OUTPUT_NOT_WRITABLE);
-    }
     if errors.is_empty() {
         Ok(CheckedCaseContract {
             case,
@@ -428,20 +378,11 @@ fn validate_execution_safety(safety: ExecutionSafety, ll: &str, errors: &mut Vec
     }
 }
 
-/// The linked AIR, transform options and function-constant values every reflection of this case
-/// shares. Kept as one derivation so the declared and the translated reflection below cannot
-/// answer their common inputs differently.
-struct ReflectionInputs<'a> {
-    linked_air: std::borrow::Cow<'a, str>,
-    options: metal2vulkan::passes::TransformOptions,
-    function_constants: Vec<(u32, Vec<u8>)>,
-}
-
-fn reflection_inputs<'a>(
-    air_ll: &'a str,
+fn reflect(
+    air_ll: &str,
     case: &AuthoredCase,
     linked: &ResolvedLinkedFunctions,
-) -> Result<ReflectionInputs<'a>, String> {
+) -> Result<ShaderReflection, String> {
     let function_constants = crate::literal::function_constants(case)?
         .into_iter()
         .map(|constant| (constant.index, constant.bytes))
@@ -462,60 +403,13 @@ fn reflection_inputs<'a>(
             &linkage,
         )?)
     };
-    let options = crate::case::product_transform_options_with_reflection(case, &initial)?;
-    Ok(ReflectionInputs {
-        linked_air,
-        options,
-        function_constants,
-    })
-}
-
-fn reflect(
-    air_ll: &str,
-    case: &AuthoredCase,
-    linked: &ResolvedLinkedFunctions,
-) -> Result<ShaderReflection, String> {
-    let inputs = reflection_inputs(air_ll, case, linked)?;
     metal2vulkan::reflect_sanitized_specialized(
-        inputs.linked_air.as_ref(),
+        linked_air.as_ref(),
         case.stage.product(),
-        inputs.options,
-        &inputs.function_constants,
+        crate::case::product_transform_options_with_reflection(case, &initial)?,
+        &function_constants,
     )
 }
-
-/// The same reflection taken off the finished module rather than off AIR's declared qualifiers.
-///
-/// `docs/REFLECTION.md` states the difference exactly: reflected translation widens a buffer's
-/// declared classification "to cover the loads and stores the finished module performs through it",
-/// while `reflect_sanitized` "builds no module and reports the declared classification alone". A
-/// kernel that writes a buffer AIR annotated `air.read` is therefore not a contradiction, and an
-/// authored case that stages that buffer as its output is asking the widened question.
-fn reflect_translated(
-    air_ll: &str,
-    case: &AuthoredCase,
-    linked: &ResolvedLinkedFunctions,
-) -> Result<ShaderReflection, String> {
-    let inputs = reflection_inputs(air_ll, case, linked)?;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_case_writability_{}_{}",
-        std::process::id(),
-        &case.air_sha256[..16]
-    ));
-    std::fs::create_dir_all(&tmp).map_err(|error| error.to_string())?;
-    let reflection = metal2vulkan::translate_sanitized_native_specialized_reflected_with_options(
-        inputs.linked_air.as_ref(),
-        case.stage.product(),
-        &tmp,
-        inputs.options,
-        &inputs.function_constants,
-    )
-    .map(|(_, reflection)| reflection);
-    let _ = std::fs::remove_dir_all(&tmp);
-    reflection
-}
-
-const OUTPUT_NOT_WRITABLE: &str = "selected output is not reflected as shader-writable";
 
 fn validate_reflection(
     case: &AuthoredCase,
@@ -667,19 +561,7 @@ fn validate_reflection(
             ));
         }
     }
-    for resource in &case.device_buffer_arrays {
-        if let Some(error) =
-            crate::executor_contract::device_buffer_array_completeness_error(resource, "manifest")
-        {
-            errors.push(error);
-        }
-    }
     for resource in &case.threadgroup_memory {
-        if let Some(error) =
-            crate::executor_contract::threadgroup_memory_length_error(resource, "manifest")
-        {
-            errors.push(error);
-        }
         let Some(binding) = reflection.bindings.iter().find(|binding| {
             binding.kind == ResourceKind::ThreadgroupBuffer
                 && binding.metal_index == resource.binding
@@ -716,7 +598,7 @@ fn validate_reflection(
     validate_implicit_imageblock_attachments(case, reflection, errors);
     validate_fragment_imageblock(case, reflection, errors);
     if !selected_output_is_reflected_writable(case, reflection) {
-        errors.push(OUTPUT_NOT_WRITABLE.into());
+        errors.push("selected output is not reflected as shader-writable".into());
     }
 
     let reflected_acceleration_structures = reflection
@@ -908,16 +790,15 @@ fn validate_reflection(
                 resource.binding, resource.elements.len(), fixed_lengths
             ));
         }
-        if let Some(binding) = alternatives.iter().find(|binding| {
-            binding
-                .descriptor
-                .is_none_or(|descriptor| (resource.elements.len() as u32) > descriptor.count)
+        if alternatives.iter().any(|binding| {
+            binding.descriptor.is_none_or(|descriptor| {
+                descriptor.count != metal2vulkan::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT
+            })
         }) {
             errors.push(format!(
-                "texture-array binding {} authors {} elements, but an alternative exposes {:?} descriptors",
+                "texture-array binding {} does not expose the {}-descriptor product contract for every alternative",
                 resource.binding,
-                resource.elements.len(),
-                binding.descriptor.map(|descriptor| descriptor.count)
+                metal2vulkan::meta::TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT
             ));
         }
         if resource.role != crate::case::ResourceRole::Input
@@ -1400,7 +1281,9 @@ fn validate_texture_shape(
     reflected: Option<metal2vulkan::meta::TextureShape>,
     errors: &mut Vec<String>,
 ) {
-    use metal2vulkan::meta::{TextureDimension, TextureFormat as ReflectedFormat};
+    use metal2vulkan::meta::{
+        TextureComponent, TextureDimension, TextureFormat as ReflectedFormat,
+    };
 
     let Some(shape) = reflected else {
         errors.push(format!("{label} has no reflected texture shape"));
@@ -1446,10 +1329,32 @@ fn validate_texture_shape(
         ReflectedFormat::Rgba8ui => TextureFormat::Rgba8Uint,
         ReflectedFormat::Rgba16ui => TextureFormat::Rgba16Uint,
         ReflectedFormat::Rgba8i => TextureFormat::Rgba8Sint,
-        ReflectedFormat::Rgba16i => TextureFormat::Rgba16Sint,
     });
     let format_matches = exact_storage_format.map_or_else(
-        || authored_format.component_class() == shape.component,
+        || match shape.component {
+            TextureComponent::Float => matches!(
+                authored_format,
+                TextureFormat::R8Unorm
+                    | TextureFormat::Rgba8Unorm
+                    | TextureFormat::Rg32Float
+                    | TextureFormat::Rgba16Float
+                    | TextureFormat::R32Float
+                    | TextureFormat::Rgba32Float
+                    | TextureFormat::Depth32Float
+            ),
+            TextureComponent::Uint => matches!(
+                authored_format,
+                TextureFormat::Rgba8Uint
+                    | TextureFormat::R16Uint
+                    | TextureFormat::Rgba16Uint
+                    | TextureFormat::R32Uint
+                    | TextureFormat::Rgba32Uint
+            ),
+            TextureComponent::Sint => matches!(
+                authored_format,
+                TextureFormat::Rgba8Sint | TextureFormat::R32Sint | TextureFormat::Rgba32Sint
+            ),
+        },
         |expected| expected == authored_format,
     );
     if !format_matches {
@@ -1490,19 +1395,39 @@ fn validate_texture_alternatives(
 }
 
 fn render_target_format_matches_type(format: TextureFormat, type_name: &str) -> bool {
-    use metal2vulkan::meta::TextureComponent;
-
     let scalar = type_name
         .trim()
         .trim_end_matches(|ch: char| ch.is_ascii_digit());
-    let component = match scalar {
-        "float" | "half" => TextureComponent::Float,
-        "uint" | "ushort" | "uchar" | "bool" => TextureComponent::Uint,
-        "int" | "short" | "char" => TextureComponent::Sint,
-        _ => return false,
-    };
-    // Depth carries a float component class but is not a colour attachment.
-    !format.is_depth() && format.component_class() == component
+    match scalar {
+        "float" | "half" => matches!(
+            format,
+            TextureFormat::R8Unorm
+                | TextureFormat::Rgba8Unorm
+                | TextureFormat::R16Float
+                | TextureFormat::Rg16Float
+                | TextureFormat::Rg32Float
+                | TextureFormat::Rgba16Float
+                | TextureFormat::R32Float
+                | TextureFormat::Rgba32Float
+        ),
+        "uint" | "ushort" | "uchar" | "bool" => {
+            matches!(
+                format,
+                TextureFormat::Rgba8Uint
+                    | TextureFormat::R16Uint
+                    | TextureFormat::Rgba16Uint
+                    | TextureFormat::R32Uint
+                    | TextureFormat::Rgba32Uint
+            )
+        }
+        "int" | "short" | "char" => {
+            matches!(
+                format,
+                TextureFormat::Rgba8Sint | TextureFormat::R32Sint | TextureFormat::Rgba32Sint
+            )
+        }
+        _ => false,
+    }
 }
 
 fn validate_implicit_imageblock_attachments(
@@ -1775,59 +1700,6 @@ mod resource_contract_tests {
         FunctionTableResource, OutputSelection, ResourceRole, ThreadgroupMemoryResource,
     };
 
-    /// A kernel case over `source` with a single 4-byte output buffer at `binding` and no
-    /// other resources, so a test only spells the resource it is about.
-    fn bare_kernel_case(source: &crate::source::SourceRow, binding: u32) -> AuthoredCase {
-        AuthoredCase {
-            air_sha256: source.air_sha256.clone(),
-            case_id: String::new(),
-            name: String::new(),
-            entry: source.entry.clone(),
-            stage: Stage::Kernel,
-            buffers: vec![BufferResource {
-                binding,
-                role: ResourceRole::Output,
-                bytes_b64: None,
-                initial_bytes_b64: Some("q6urqw==".into()),
-            }],
-            argument_buffer_buffers: vec![],
-            device_buffer_arrays: vec![],
-            threadgroup_memory: vec![],
-            imageblock: None,
-            fragment_imageblock: None,
-            acceleration_structures: vec![],
-            visible_function_references: vec![],
-            visible_function_tables: vec![],
-            intersection_function_tables: vec![],
-            argument_buffer_intersection_function_tables: vec![],
-            textures: vec![],
-            texture_arrays: vec![],
-            argument_buffer_textures: vec![],
-            samplers: vec![],
-            render_targets: vec![],
-            depth_stencil: None,
-            vertex_inputs: vec![],
-            vertex_observation: None,
-            kernel_stage_inputs: vec![],
-            function_constants: vec![],
-            dispatch: Some(Dispatch {
-                grid: [1, 1, 1],
-                threads_per_threadgroup: [1, 1, 1],
-            }),
-            draw: None,
-            tessellation: None,
-            output: OutputSelection::Buffer {
-                binding,
-                offset: 0,
-                length: 4,
-            },
-            compare: Comparison::Exact,
-            execution_safety: ExecutionSafety::LoopFree,
-            rationale: None,
-            authored_by: Some("test".into()),
-        }
-    }
-
     #[test]
     fn selected_identity_output_requires_a_reflected_write() {
         let ll = include_str!("../fixtures/public/kernel_implicit_imageblock_half2.ll");
@@ -1922,14 +1794,59 @@ entry:
             .into_iter()
             .find(|source| source.entry == "threadgroup_word")
             .unwrap();
-        let build = |length: u32| {
-            let mut case = bare_kernel_case(&source, 1);
-            case.name = "threadgroup-word".into();
-            case.threadgroup_memory = vec![ThreadgroupMemoryResource { binding: 0, length }];
-            case.case_id = case.computed_case_id().unwrap();
-            case
+        let mut case = AuthoredCase {
+            air_sha256: source.air_sha256,
+            case_id: String::new(),
+            name: "threadgroup-word".into(),
+            entry: source.entry,
+            stage: Stage::Kernel,
+            buffers: vec![BufferResource {
+                binding: 1,
+                role: ResourceRole::Output,
+                bytes_b64: None,
+                initial_bytes_b64: Some("q6urqw==".into()),
+            }],
+            argument_buffer_buffers: vec![],
+            device_buffer_arrays: vec![],
+            threadgroup_memory: vec![ThreadgroupMemoryResource {
+                binding: 0,
+                length: 4,
+            }],
+            imageblock: None,
+            fragment_imageblock: None,
+            acceleration_structures: vec![],
+            visible_function_references: vec![],
+            visible_function_tables: vec![],
+            intersection_function_tables: vec![],
+            argument_buffer_intersection_function_tables: vec![],
+            textures: vec![],
+            texture_arrays: vec![],
+            argument_buffer_textures: vec![],
+            samplers: vec![],
+            render_targets: vec![],
+            depth_stencil: None,
+            vertex_inputs: vec![],
+            vertex_observation: None,
+            kernel_stage_inputs: vec![],
+            function_constants: vec![],
+            dispatch: Some(Dispatch {
+                grid: [1, 1, 1],
+                threads_per_threadgroup: [1, 1, 1],
+            }),
+            draw: None,
+            tessellation: None,
+            output: OutputSelection::Buffer {
+                binding: 1,
+                offset: 0,
+                length: 4,
+            },
+            compare: Comparison::Exact,
+            execution_safety: ExecutionSafety::LoopFree,
+            rationale: None,
+            authored_by: Some("test".into()),
         };
-        let checked = check_case(&crate::source::corpus_root(), build(16)).unwrap();
+        case.case_id = case.computed_case_id().unwrap();
+        let checked = check_case(&crate::source::corpus_root(), case).unwrap();
         let reflected = checked
             .reflection
             .bindings
@@ -1939,79 +1856,6 @@ entry:
         assert_eq!(reflected.metal_index, 0);
         assert_eq!(reflected.declared_size, Some(4));
         assert_eq!(reflected.descriptor, None);
-
-        // The reflected element size is four bytes, but Metal allocates threadgroup memory in
-        // sixteen-byte units and asserts on anything else, so four is not a length this case can
-        // ask for -- see `METAL_THREADGROUP_MEMORY_GRANULARITY`.
-        let Err(errors) = check_case(&crate::source::corpus_root(), build(4)) else {
-            panic!("Metal cannot allocate four bytes of threadgroup memory");
-        };
-        assert!(
-            errors
-                .iter()
-                .any(|error| error.contains("must be a multiple of 16 bytes")),
-            "{errors:?}"
-        );
-
-        // Declaring nothing at all would satisfy the reflected requirement without allocating.
-        let Err(errors) = check_case(&crate::source::corpus_root(), build(0)) else {
-            panic!("a zero-byte declaration allocates nothing");
-        };
-        assert!(
-            errors.iter().any(|error| error.contains("zero bytes")),
-            "{errors:?}"
-        );
-    }
-
-    #[test]
-    fn a_fixed_texture_array_is_checked_at_the_length_it_declares() {
-        let source = crate::source::public_sources()
-            .unwrap()
-            .into_iter()
-            .find(|source| source.entry == "texture_array_width")
-            .unwrap();
-        let build = |elements: usize| {
-            let mut case = bare_kernel_case(&source, 0);
-            case.name = "fixed-texture-array-width".into();
-            case.texture_arrays = vec![crate::case::TextureArrayResource {
-                binding: 0,
-                role: ResourceRole::Input,
-                texture_type: crate::case::TextureType::D2,
-                format: crate::case::TextureFormat::R32Float,
-                sample_count: 1,
-                overrides_texture_at_base: false,
-                elements: (0..elements)
-                    .map(|_| crate::case::TextureArrayElement {
-                        dimensions: [1, 1, 1],
-                        bytes_b64: Some("AAAAAA==".into()),
-                        initial_bytes_b64: None,
-                    })
-                    .collect(),
-            }];
-            case.case_id = case.computed_case_id().unwrap();
-            case
-        };
-
-        // `array<texture2d<float, sample>, 2>` occupies exactly the two descriptors it
-        // declares, so a case authoring both elements is complete.
-        let checked = check_case(&crate::source::corpus_root(), build(2)).unwrap();
-        let reflected = checked
-            .reflection
-            .bindings
-            .iter()
-            .find(|binding| binding.kind == ResourceKind::TextureArray)
-            .unwrap();
-        assert_eq!(reflected.descriptor.unwrap().count, 2);
-
-        // Authoring past the declared length has nowhere to bind the third element.
-        let Err(errors) = check_case(&crate::source::corpus_root(), build(3)) else {
-            panic!("a third element has nowhere to bind");
-        };
-        assert!(
-            errors.iter().any(|error| error
-                == "texture-array binding 0 authors 3 elements, but an alternative exposes Some(2) descriptors"),
-            "{errors:?}"
-        );
     }
 
     #[test]
@@ -2262,234 +2106,6 @@ fn graph_has_cycle(graph: &HashMap<String, Vec<String>>) -> bool {
 mod tests {
     use super::*;
 
-    /// The store-wide sweep names exactly the installed cases the current checker rejects.
-    ///
-    /// A case is installed under the semantics of its day and then left alone. `e84ea3fa` moved 41
-    /// authored texture arrays to a different Metal slot without anyone re-reading the store, so the
-    /// property under test is not "a bad manifest is rejected" -- `check_case` already did that --
-    /// but that a manifest ALREADY in the store is re-read at all.
-    #[test]
-    fn the_store_sweep_names_the_installed_cases_the_checker_now_rejects() {
-        use crate::case::{
-            BufferResource, Comparison, Dispatch, ExecutionSafety, OutputSelection, ResourceRole,
-            Stage,
-        };
-        use crate::store::CorpusStore;
-        use crate::ScratchDir;
-
-        let air_ll = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/fixtures/public/kernel_copy_word.ll"
-        ))
-        .expect("public fixture");
-        let air_sha256 = crate::hash::sha256_bytes(air_ll.as_bytes());
-        let buffer = |binding, role| BufferResource {
-            binding,
-            role,
-            bytes_b64: (role == ResourceRole::Input).then(|| "AAAAAA==".to_string()),
-            initial_bytes_b64: (role != ResourceRole::Input).then(|| "q6urqw==".to_string()),
-        };
-        let case = |name: &str, buffers: Vec<BufferResource>| {
-            let mut case = AuthoredCase {
-                air_sha256: air_sha256.clone(),
-                case_id: String::new(),
-                name: name.into(),
-                entry: "copy_word".into(),
-                stage: Stage::Kernel,
-                buffers,
-                argument_buffer_buffers: vec![],
-                device_buffer_arrays: vec![],
-                threadgroup_memory: vec![],
-                imageblock: None,
-                fragment_imageblock: None,
-                acceleration_structures: vec![],
-                visible_function_references: vec![],
-                visible_function_tables: vec![],
-                intersection_function_tables: vec![],
-                argument_buffer_intersection_function_tables: vec![],
-                textures: vec![],
-                texture_arrays: vec![],
-                argument_buffer_textures: vec![],
-                samplers: vec![],
-                render_targets: vec![],
-                depth_stencil: None,
-                vertex_inputs: vec![],
-                vertex_observation: None,
-                kernel_stage_inputs: vec![],
-                function_constants: vec![],
-                dispatch: Some(Dispatch {
-                    grid: [1, 1, 1],
-                    threads_per_threadgroup: [1, 1, 1],
-                }),
-                draw: None,
-                tessellation: None,
-                output: OutputSelection::Buffer {
-                    binding: 1,
-                    offset: 0,
-                    length: 4,
-                },
-                compare: Comparison::Exact,
-                execution_safety: ExecutionSafety::LoopFree,
-                rationale: None,
-                authored_by: None,
-            };
-            case.case_id = case.computed_case_id().expect("case id");
-            case
-        };
-
-        let scratch = ScratchDir::new("recheck-installed-cases").expect("scratch");
-        let store = CorpusStore::new(scratch.path());
-        let sound = case(
-            "copies-the-word",
-            vec![
-                buffer(0, ResourceRole::Input),
-                buffer(1, ResourceRole::Output),
-            ],
-        );
-        // Installed straight into the store, exactly as a case authored under older semantics sits
-        // there today: `put_case` does not check, only `corpus-case-check --install` does.
-        let stale = case(
-            "copies-the-word-from-nowhere",
-            vec![buffer(1, ResourceRole::Output)],
-        );
-        store.put_case(sound.clone()).expect("install sound case");
-        store.put_case(stale.clone()).expect("install stale case");
-
-        let (total, reported) =
-            recheck_installed_cases(scratch.path(), &store).expect("sweep the store");
-        assert_eq!(total, 2);
-        assert_eq!(
-            reported
-                .iter()
-                .map(|case| case.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["copies-the-word-from-nowhere"],
-            "the sound case must not be reported and the stale one must be"
-        );
-        assert!(
-            reported[0]
-                .errors
-                .iter()
-                .any(|error| error.contains("buffer 0")),
-            "the report carries the checker's own reason: {:?}",
-            reported[0].errors
-        );
-    }
-
-    /// A buffer AIR annotates `air.read` but the kernel stores through is a legal case output.
-    ///
-    /// `docs/REFLECTION.md`: reflected translation widens a buffer's declared classification "to
-    /// cover the loads and stores the finished module performs through it", while
-    /// `reflect_sanitized` "builds no module and reports the declared classification alone". The
-    /// writability gate is asking the widened question, so answering it from the declared view
-    /// alone rejected 17 corpus modules whose only written buffer is annotated `air.read` --
-    /// `particle_fill_grid` among them.
-    #[test]
-    fn an_output_declared_read_but_written_by_the_kernel_is_accepted() {
-        use crate::case::{
-            BufferResource, Comparison, Dispatch, ExecutionSafety, OutputSelection, ResourceRole,
-            Stage,
-        };
-
-        let air_ll = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/fixtures/public/kernel_copy_word_declared_read.ll"
-        ))
-        .expect("public fixture");
-
-        // The declared view sees no writable resource at all; the translated view sees the store.
-        let declared = metal2vulkan::reflect_sanitized(
-            &air_ll,
-            metal2vulkan::passes::Stage::Kernel,
-            metal2vulkan::passes::TransformOptions::default(),
-        )
-        .expect("declared reflection");
-        assert!(
-            declared.bindings.iter().all(|binding| matches!(
-                binding.access,
-                Some(metal2vulkan::reflect::ResourceAccess::ReadOnly)
-                    | Some(metal2vulkan::reflect::ResourceAccess::Unused)
-            )),
-            "the fixture must declare both buffers non-writable: {:?}",
-            declared
-                .bindings
-                .iter()
-                .map(|binding| binding.access)
-                .collect::<Vec<_>>()
-        );
-
-        let mut case = AuthoredCase {
-            air_sha256: crate::hash::sha256_bytes(air_ll.as_bytes()),
-            case_id: String::new(),
-            name: "copies-the-word-through-a-buffer-declared-read".into(),
-            entry: "copy_word_declared_read".into(),
-            stage: Stage::Kernel,
-            buffers: vec![
-                BufferResource {
-                    binding: 0,
-                    role: ResourceRole::Input,
-                    bytes_b64: Some("KgAAAA==".to_string()),
-                    initial_bytes_b64: None,
-                },
-                BufferResource {
-                    binding: 1,
-                    role: ResourceRole::Output,
-                    bytes_b64: None,
-                    initial_bytes_b64: Some("q6urqw==".to_string()),
-                },
-            ],
-            argument_buffer_buffers: vec![],
-            device_buffer_arrays: vec![],
-            threadgroup_memory: vec![],
-            imageblock: None,
-            fragment_imageblock: None,
-            acceleration_structures: vec![],
-            visible_function_references: vec![],
-            visible_function_tables: vec![],
-            intersection_function_tables: vec![],
-            argument_buffer_intersection_function_tables: vec![],
-            textures: vec![],
-            texture_arrays: vec![],
-            argument_buffer_textures: vec![],
-            samplers: vec![],
-            render_targets: vec![],
-            depth_stencil: None,
-            vertex_inputs: vec![],
-            vertex_observation: None,
-            kernel_stage_inputs: vec![],
-            function_constants: vec![],
-            dispatch: Some(Dispatch {
-                grid: [1, 1, 1],
-                threads_per_threadgroup: [1, 1, 1],
-            }),
-            draw: None,
-            tessellation: None,
-            output: OutputSelection::Buffer {
-                binding: 1,
-                offset: 0,
-                length: 4,
-            },
-            compare: Comparison::Exact,
-            execution_safety: ExecutionSafety::LoopFree,
-            rationale: None,
-            authored_by: None,
-        };
-        case.case_id = case.computed_case_id().expect("case id");
-
-        // The gate itself, against each derivation in turn.
-        let linked = ResolvedLinkedFunctions::default();
-        let reflection = reflect(&air_ll, &case, &linked).expect("declared reflection");
-        assert!(
-            !selected_output_is_reflected_writable(&case, &reflection),
-            "the declared view must reject, or this test proves nothing"
-        );
-        let widened = reflect_translated(&air_ll, &case, &linked).expect("translated reflection");
-        assert!(
-            selected_output_is_reflected_writable(&case, &widened),
-            "the translated view must see the store the kernel performs"
-        );
-    }
-
     #[test]
     fn safety_check_distinguishes_cycle_from_acyclic_cfg() {
         let acyclic = "define void @k() {\nentry:\n br label %done\ndone:\n ret void\n}";
@@ -2528,64 +2144,6 @@ mod tests {
             TextureFormat::Rgba32Sint,
             "mystery4"
         ));
-    }
-
-    #[test]
-    fn one_component_class_answers_both_texture_and_render_target_checks() {
-        use metal2vulkan::meta::texture_shape_from_name;
-
-        // A single-channel half texture is a float-component texture. Both executors bind
-        // `r16_float`, and the render-target check has always accepted it for a `half` target;
-        // the sampled-texture check used to reject it, which blocked authoring any case over a
-        // `texture2d<half, sample>` fed by a one-channel half image.
-        let mut errors = Vec::new();
-        validate_texture_shape(
-            "half sampled texture",
-            TextureType::D2,
-            TextureFormat::R16Float,
-            Some(texture_shape_from_name("texture2d<half, sample>")),
-            &mut errors,
-        );
-        assert!(errors.is_empty(), "{errors:?}");
-
-        validate_texture_shape(
-            "half sampled texture",
-            TextureType::D2,
-            TextureFormat::Rg16Float,
-            Some(texture_shape_from_name("texture2d<half, sample>")),
-            &mut errors,
-        );
-        assert!(errors.is_empty(), "{errors:?}");
-
-        // The classes still separate: an integer texture rejects every float format.
-        validate_texture_shape(
-            "uint sampled texture",
-            TextureType::D2,
-            TextureFormat::R16Float,
-            Some(texture_shape_from_name("texture2d<uint, sample>")),
-            &mut errors,
-        );
-        assert_eq!(errors.len(), 1);
-        assert!(errors[0].contains("component class"), "{errors:?}");
-
-        // Depth is float-classed for a texture and still not a colour attachment.
-        assert!(render_target_format_matches_type(
-            TextureFormat::R16Float,
-            "half"
-        ));
-        assert!(!render_target_format_matches_type(
-            TextureFormat::Depth32Float,
-            "float4"
-        ));
-        let mut depth_errors = Vec::new();
-        validate_texture_shape(
-            "depth texture",
-            TextureType::D2,
-            TextureFormat::Depth32Float,
-            Some(texture_shape_from_name("depth2d<float>")),
-            &mut depth_errors,
-        );
-        assert!(depth_errors.is_empty(), "{depth_errors:?}");
     }
 
     #[test]

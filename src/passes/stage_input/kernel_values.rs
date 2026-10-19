@@ -93,12 +93,19 @@ pub(in crate::passes) fn const_kernel_local_size(
                 Operand::LiteralBit32(lanes @ 2..=3) => *lanes,
                 _ => return None,
             };
-            let constituents = values[..lanes as usize]
+            let ops = values[..lanes as usize]
                 .iter()
                 .copied()
-                .map(|value| ctx.const_int_of(component, value as i64))
+                .map(|value| Operand::IdRef(ctx.const_int_of(component, value as i64)))
                 .collect();
-            Some(ctx.const_composite(ty, constituents))
+            let id = ctx.module.fresh_id();
+            ctx.new_globals.push(Instruction::new(
+                Op::ConstantComposite,
+                Some(ty),
+                Some(id),
+                ops,
+            ));
+            Some(id)
         }
         _ => None,
     }
@@ -106,12 +113,19 @@ pub(in crate::passes) fn const_kernel_local_size(
 
 pub(in crate::passes) fn const_ivec(ctx: &mut Ctx, ty: Word, values: &[i32]) -> Word {
     let int_ty = ctx.ty_sint();
-    let constituents = values
+    let ops = values
         .iter()
         .copied()
-        .map(|value| ctx.const_int_of(int_ty, value as i64))
+        .map(|value| Operand::IdRef(ctx.const_int_of(int_ty, value as i64)))
         .collect();
-    ctx.const_composite(ty, constituents)
+    let id = ctx.module.fresh_id();
+    ctx.new_globals.push(Instruction::new(
+        Op::ConstantComposite,
+        Some(ty),
+        Some(id),
+        ops,
+    ));
+    id
 }
 
 pub(in crate::passes) fn is_raw_uint_buffer_block(

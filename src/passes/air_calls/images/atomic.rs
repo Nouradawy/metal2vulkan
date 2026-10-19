@@ -23,9 +23,7 @@ pub(in crate::passes) fn lower_atomic_texture_fetch_max(
     let rty = rty.ok_or_else(|| format!("{name} has no result type"))?;
     let mut image = resolve_image_value(ctx, args[0]);
     if !image_is_storage(ctx, image) {
-        // The one intrinsic this arm accepts is `..._texture_2d`, so the recovered image has to be
-        // a non-arrayed 2D storage image.
-        image = recovered_image_for_private_operand(ctx, image, name, ImageOperandUse::Storage)
+        image = single_storage_image_for_private_write(ctx, image)
             .ok_or_else(|| format!("{name} on non-storage image id {image}"))?;
     }
     let (_, _, comp) = image_shape_or_recorded(ctx, image);

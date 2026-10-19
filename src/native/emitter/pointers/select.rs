@@ -134,7 +134,6 @@ impl Emitter {
                     StorageClass::StorageBuffer
                         | StorageClass::UniformConstant
                         | StorageClass::Workgroup
-                        | StorageClass::PhysicalStorageBuffer
                 )
             });
             if !can_select_pointer {
@@ -235,24 +234,6 @@ impl Emitter {
             ],
         ));
         if let Some(meta) = pointer_meta {
-            // A pointer select with one null arm is null exactly when that arm is taken, and a
-            // later `icmp eq ptr, null` reads the answer out of `pointer_nullness`. Every OTHER
-            // route out of this function records it; this tail did not, because before physical
-            // pointers became selectable nothing with a null arm reached it -- the arms landed in
-            // an unmodelled placeholder, which records nullness on the way past. Two arms that are
-            // both null or both concrete carry no answer, and `selected_pointer_nullness_id`
-            // returns None for them, so nothing is recorded and nothing changes.
-            let selected = SelectedPointer {
-                ty: result_ty.clone(),
-                cond: cond_id,
-                true_value: true_value.value.clone(),
-                false_value: false_value.value.clone(),
-            };
-            if !self.pointer_nullness.contains_key(&name) {
-                if let Some(is_null) = self.selected_pointer_nullness_id(&selected, instructions)? {
-                    self.record_pointer_nullness(name.clone(), is_null);
-                }
-            }
             self.record_pointer_meta(name.clone(), meta);
         }
         if let Some(provenance) = pointer_provenance {
@@ -418,7 +399,7 @@ impl Emitter {
         let Some(pointee) = meta.pointee.as_ref() else {
             return self.value_id_in(value, ty, instructions);
         };
-        match self.typed_null_or_undef_pointer_id(value, meta.storage, pointee, instructions)? {
+        match self.typed_null_or_undef_pointer_id(value, meta.storage, pointee)? {
             Some(id) => Ok(id),
             None => self.value_id_in(value, ty, instructions),
         }
@@ -572,33 +553,16 @@ impl Emitter {
         value: &LlValue,
         storage: StorageClass,
         pointee: &LlType,
-        instructions: &mut Vec<Instruction>,
     ) -> Result<Option<Word>, String> {
-        if !matches!(value, LlValue::Zero | LlValue::Undef) {
-            return Ok(None);
-        }
+        let op = match value {
+            LlValue::Zero | LlValue::Undef => Op::ConstantNull,
+            _ => return Ok(None),
+        };
         let ptr_type = self.ptr_type_id(storage, pointee)?;
         let id = self.fresh();
-        if storage == StorageClass::PhysicalStorageBuffer {
-            // A physical pointer has no null CONSTANT -- spirv-val: "OpConstantNull Result Type
-            // cannot have a null value" for a PhysicalStorageBuffer pointer. Its null is the
-            // address zero, which is an instruction, so it belongs in the body rather than the
-            // module's constant section.
-            let zero = self.const_signed_int(64, 0)?;
-            instructions.push(Self::inst(
-                Op::ConvertUToPtr,
-                Some(ptr_type),
-                Some(id),
-                vec![Operand::IdRef(zero)],
-            ));
-            return Ok(Some(id));
-        }
-        self.module.types_global_values.push(Self::inst(
-            Op::ConstantNull,
-            Some(ptr_type),
-            Some(id),
-            vec![],
-        ));
+        self.module
+            .types_global_values
+            .push(Self::inst(op, Some(ptr_type), Some(id), vec![]));
         Ok(Some(id))
     }
 

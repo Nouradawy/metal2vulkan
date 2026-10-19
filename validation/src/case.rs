@@ -794,7 +794,6 @@ pub enum TextureFormat {
     Rg32Float,
     Rgba16Float,
     Rgba16Uint,
-    Rgba16Sint,
     R32Uint,
     R32Sint,
     R32Float,
@@ -817,47 +816,10 @@ impl TextureFormat {
             | Self::R32Float => 4,
             Self::Rg16Float => 4,
             Self::Rg32Float => 8,
-            Self::Rgba16Float | Self::Rgba16Uint | Self::Rgba16Sint => 8,
+            Self::Rgba16Float | Self::Rgba16Uint => 8,
             Self::Rgba32Uint | Self::Rgba32Sint | Self::Rgba32Float => 16,
             Self::Depth32Float => 4,
         }
-    }
-
-    /// The AIR component class a texture declaration must carry to read or write this format.
-    ///
-    /// Every format has exactly one class, so this is the whole answer to the question the
-    /// sampled/storage texture check and the colour render-target check both ask. Spelling it
-    /// instead as one membership list per class in each of them let the two copies drift: the
-    /// render-target list accepted `r16_float` and `rg16_float` for a `half` target while the
-    /// texture list did not, so no case could bind a `texture2d<half, sample>` to a
-    /// single-channel half texture even though both executors bind that format.
-    pub fn component_class(self) -> metal2vulkan::meta::TextureComponent {
-        use metal2vulkan::meta::TextureComponent;
-        match self {
-            Self::R8Unorm
-            | Self::Rgba8Unorm
-            | Self::R16Float
-            | Self::Rg16Float
-            | Self::Rg32Float
-            | Self::Rgba16Float
-            | Self::R32Float
-            | Self::Rgba32Float
-            | Self::Depth32Float => TextureComponent::Float,
-            Self::Rgba8Uint
-            | Self::R16Uint
-            | Self::Rgba16Uint
-            | Self::R32Uint
-            | Self::Rgba32Uint => TextureComponent::Uint,
-            Self::Rgba8Sint | Self::R32Sint | Self::Rgba16Sint | Self::Rgba32Sint => {
-                TextureComponent::Sint
-            }
-        }
-    }
-
-    /// Whether this format is a depth format. Depth carries a float component class but is not a
-    /// colour attachment, so the render-target check excludes it on top of the component class.
-    pub fn is_depth(self) -> bool {
-        matches!(self, Self::Depth32Float)
     }
 
     fn runtime_storage_specialization(
@@ -877,7 +839,6 @@ impl TextureFormat {
             Self::Rg32Float => RuntimeStorageImageFormat::Rg32Float,
             Self::Rgba16Float => RuntimeStorageImageFormat::Rgba16Float,
             Self::Rgba16Uint => RuntimeStorageImageFormat::Rgba16Uint,
-            Self::Rgba16Sint => RuntimeStorageImageFormat::Rgba16Sint,
             Self::R32Uint => RuntimeStorageImageFormat::R32Uint,
             Self::R32Sint => RuntimeStorageImageFormat::R32Sint,
             Self::R32Float => RuntimeStorageImageFormat::R32Float,
@@ -992,20 +953,6 @@ pub(crate) fn product_transform_options(
                 texture.format.runtime_storage_specialization()?,
             )?;
         }
-    }
-    // Vulkan fixes a Workgroup array's length in the module while Metal binds it at encode time,
-    // so the translator has to be told what the case allocates. Without this the array keeps the
-    // translator's default element count and a longer binding is silently truncated -- the case
-    // dispatches, and every access past the default reads zero.
-    for resource in &case.threadgroup_memory {
-        // An unallocatable length has one rule (`threadgroup_memory_length_error`), consulted by
-        // both executors and by the case checker. Forward only lengths that rule accepts, so its
-        // diagnosis is the one the caller sees rather than this builder's.
-        if crate::executor_contract::threadgroup_memory_length_error(resource, "manifest").is_some()
-        {
-            continue;
-        }
-        options = options.with_threadgroup_memory_length(resource.binding, resource.length)?;
     }
     Ok(options)
 }
@@ -1752,25 +1699,14 @@ impl AuthoredCase {
             );
             if let Some(imageblock) = &self.imageblock {
                 validate_dimensions("imageblock.dimensions", &imageblock.dimensions, &mut errors);
-                // The tile is the threadgroup's, but a thread may own more than one cell of it: an
-                // entry that stages a `k`x`k` output block per thread has a tile `k` times the
-                // threadgroup in each axis, and the AIR says so (`imageblock_cell_scale`). The
-                // factor has to be the same in both axes and a whole number, because a cell is
-                // owned by exactly one thread either way.
-                let threads = [
-                    dispatch.threads_per_threadgroup[0],
-                    dispatch.threads_per_threadgroup[1],
-                ];
-                let scales = [
-                    imageblock.dimensions[0].checked_div(threads[0]),
-                    imageblock.dimensions[1].checked_div(threads[1]),
-                ];
-                let exact = imageblock.dimensions[0] % threads[0].max(1) == 0
-                    && imageblock.dimensions[1] % threads[1].max(1) == 0;
-                if !exact || scales[0] != scales[1] || scales[0] == Some(0) {
+                if imageblock.dimensions
+                    != [
+                        dispatch.threads_per_threadgroup[0],
+                        dispatch.threads_per_threadgroup[1],
+                    ]
+                {
                     errors.push(format!(
-                        "imageblock dimensions {:?} must be the same whole multiple of the \
-                         threadgroup x/y dimensions {:?} in both axes",
+                        "imageblock dimensions {:?} must equal threadgroup x/y dimensions {:?}",
                         imageblock.dimensions,
                         &dispatch.threads_per_threadgroup[..2]
                     ));
@@ -4032,30 +3968,20 @@ declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float
     }
 
     #[test]
-    fn imageblock_dimensions_are_a_uniform_multiple_of_the_local_size() {
+    fn imageblock_dimensions_are_explicit_and_match_product_local_size() {
         let mut case = example();
-        case.dispatch.as_mut().unwrap().threads_per_threadgroup = [2, 2, 1];
         case.imageblock = Some(ImageblockResource {
-            dimensions: [2, 2],
+            dimensions: [1, 1],
             implicit_coverage: None,
         });
         case.case_id = case.computed_case_id().unwrap();
         case.validate_literal_resources().unwrap();
 
-        // A thread may own a whole kxk block of the tile rather than one cell of it.
-        case.imageblock.as_mut().unwrap().dimensions = [4, 4];
-        case.case_id = case.computed_case_id().unwrap();
-        case.validate_literal_resources().unwrap();
-
-        // Not the same factor in both axes: no k names this tile.
-        for dimensions in [[4, 2], [3, 3], [2, 0]] {
-            case.imageblock.as_mut().unwrap().dimensions = dimensions;
-            case.case_id = case.computed_case_id().unwrap();
-            let errors = case.validate_literal_resources().unwrap_err().join("\n");
-            assert!(
-                errors.contains("must be the same whole multiple of the threadgroup"),
-                "{dimensions:?}: {errors}"
-            );
-        }
+        case.imageblock.as_mut().unwrap().dimensions = [2, 1];
+        let errors = case.validate_literal_resources().unwrap_err().join("\n");
+        assert!(
+            errors.contains("must equal threadgroup x/y dimensions"),
+            "{errors}"
+        );
     }
 }

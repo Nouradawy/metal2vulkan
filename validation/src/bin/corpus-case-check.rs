@@ -1,9 +1,9 @@
 use metal2vulkan_validation::case::AuthoredCase;
-use metal2vulkan_validation::check::{check_case, recheck_installed_cases};
+use metal2vulkan_validation::check::check_case;
 use metal2vulkan_validation::source::corpus_root;
 use metal2vulkan_validation::store::CorpusStore;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn main() {
     if let Err(error) = run() {
@@ -19,7 +19,6 @@ fn run() -> Result<(), String> {
     let mut install = false;
     let mut delete_air = None;
     let mut delete_name = None;
-    let mut recheck_all = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -29,10 +28,9 @@ fn run() -> Result<(), String> {
             "--install" => install = true,
             "--delete-air" => delete_air = Some(required(&mut args, "--delete-air")?),
             "--delete-name" => delete_name = Some(required(&mut args, "--delete-name")?),
-            "--recheck-all" => recheck_all = true,
             "-h" | "--help" => {
                 println!(
-                    "usage: corpus-case-check [--corpus DIR] (--manifest PATH [--install] | --case-id HASH | --delete-air HASH --delete-name NAME | --recheck-all)"
+                    "usage: corpus-case-check [--corpus DIR] (--manifest PATH [--install] | --case-id HASH | --delete-air HASH --delete-name NAME)"
                 );
                 return Ok(());
             }
@@ -40,12 +38,6 @@ fn run() -> Result<(), String> {
         }
     }
     let store = CorpusStore::new(&root);
-    if recheck_all {
-        if manifest.is_some() || case_id.is_some() || install || delete_air.is_some() {
-            return Err("--recheck-all takes no other selection".into());
-        }
-        return recheck_all_cases(&root, &store);
-    }
     match (delete_air, delete_name) {
         (Some(air), Some(name)) if manifest.is_none() && case_id.is_none() && !install => {
             let removed = store.delete_named_case(&air, &name)?;
@@ -84,31 +76,6 @@ fn run() -> Result<(), String> {
         println!("installed {:?}", store.put_case(checked.case)?);
     }
     Ok(())
-}
-
-/// Report every installed case the shared checker no longer accepts.
-///
-/// Needs the private AIR sources, so it is a developer command rather than a CI gate. It fails when
-/// any case is stale, so the answer cannot be skimmed past. See
-/// [`recheck_installed_cases`] for why the store needs re-reading at all.
-fn recheck_all_cases(root: &Path, store: &CorpusStore) -> Result<(), String> {
-    let (total, stale) = recheck_installed_cases(root, store)?;
-    for case in &stale {
-        println!(
-            "stale {} {}: {}",
-            case.case_id,
-            case.name,
-            case.errors.join("; ")
-        );
-    }
-    println!("rechecked {total} installed cases, {} stale", stale.len());
-    if stale.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "{} of {total} installed cases no longer check against product reflection",
-        stale.len()
-    ))
 }
 
 fn required(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<String, String> {

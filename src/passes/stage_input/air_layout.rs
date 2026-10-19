@@ -25,7 +25,30 @@ pub(in crate::passes) fn texture_type_hints(
         .collect()
 }
 
-pub(in crate::passes) use crate::spirv_module::array_type;
+pub(in crate::passes) fn array_type(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+) -> Option<(Word, u32)> {
+    let def = defs.get(&ty)?;
+    if def.class.opcode != Op::TypeArray {
+        return None;
+    }
+    let elem = match def.operands.first()? {
+        Operand::IdRef(elem) => *elem,
+        _ => return None,
+    };
+    let len_const = match def.operands.get(1)? {
+        Operand::IdRef(len_const) => *len_const,
+        _ => return None,
+    };
+    let len = defs
+        .get(&len_const)
+        .and_then(|constant| match constant.operands.first() {
+            Some(Operand::LiteralBit32(len)) => Some(*len),
+            _ => None,
+        })?;
+    Some((elem, len))
+}
 
 /// A fragment shader Input interface variable of integer (or 64-bit float) component type cannot be
 /// interpolated and MUST carry a `Flat` decoration (VUID-StandaloneSpirv-Flat-04744). Returns true
@@ -236,9 +259,27 @@ pub(in crate::passes) fn is_scalar_bool(defs: &HashMap<Word, Instruction>, ty: W
         .is_some_and(|def| def.class.opcode == Op::TypeBool)
 }
 
-pub(in crate::passes) use crate::spirv_module::type_float_width;
+pub(in crate::passes) fn type_float_width(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+) -> Option<u32> {
+    let def = defs.get(&ty)?;
+    (def.class.opcode == Op::TypeFloat).then(|| match def.operands.first() {
+        Some(Operand::LiteralBit32(width)) => *width,
+        _ => 32,
+    })
+}
 
-pub(in crate::passes) use crate::spirv_module::type_int_width;
+pub(in crate::passes) fn type_int_width(
+    defs: &HashMap<Word, Instruction>,
+    ty: Word,
+) -> Option<u32> {
+    let def = defs.get(&ty)?;
+    (def.class.opcode == Op::TypeInt).then(|| match def.operands.first() {
+        Some(Operand::LiteralBit32(width)) => *width,
+        _ => 32,
+    })
+}
 
 pub(in crate::passes) fn is_backend_padding_array(
     defs: &HashMap<Word, Instruction>,
@@ -375,11 +416,7 @@ pub(in crate::passes) fn input_attachment_read_types(
     }
 }
 
-pub(in crate::passes) fn input_attachment_vector_type(
-    ctx: &mut Ctx,
-    component_ty: Word,
-    lanes: u32,
-) -> Word {
+fn input_attachment_vector_type(ctx: &mut Ctx, component_ty: Word, lanes: u32) -> Word {
     ctx.get_or_create(
         Op::TypeVector,
         None,

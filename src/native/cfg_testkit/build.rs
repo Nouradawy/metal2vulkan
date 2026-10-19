@@ -359,25 +359,6 @@ impl CfgBuilder {
         ));
     }
 
-    /// Declare the current block the header of a selection construct merging at `merge`.
-    ///
-    /// Call it immediately before the divergent terminator, which is where SPIR-V requires the
-    /// `OpSelectionMerge` to sit. Authoring an explicit merge is what lets a shape be *owned* and
-    /// still badly nested — an arm leaving the construct through a block that is not the merge —
-    /// which is a distinct failure from having no owner at all.
-    pub(in crate::native) fn selection_merge(&mut self, merge: &str) {
-        let merge = self.label(merge);
-        self.push(Instruction::new(
-            Op::SelectionMerge,
-            None,
-            None,
-            vec![
-                Operand::IdRef(merge),
-                Operand::SelectionControl(spirv::SelectionControl::NONE),
-            ],
-        ));
-    }
-
     pub(in crate::native) fn branch_conditional(
         &mut self,
         condition: Word,

@@ -230,42 +230,46 @@ impl Emitter {
         Ok(true)
     }
 
-    /// `air.{add,sub}_sat.{s,u}.<ty>(a, b)`: the sum or difference clamped to the operand type's
-    /// own range rather than wrapped.
-    ///
-    /// Unsigned carries are self-announcing — the wrapped sum compares below an operand exactly
-    /// when it carried, and the wrapped difference borrowed exactly when `a < b` — so one
-    /// `ULessThan` picks between the wrapped value and the single range end.
-    ///
-    /// Signed has two ends, and which one it saturates to is the sign of `a`: `a >> (W-1)` is
-    /// all-zeros or all-ones, and XOR with `INT_MAX` turns those into `INT_MAX` and `INT_MIN`.
-    /// Overflow is a sign disagreement the wrapped result cannot hide: for `a + b` both operands
-    /// disagree with it, for `a - b` the operands disagree with each other and `a` disagrees with
-    /// the result. Device-measured against Metal's `addsat`/`subsat` over a 256-row `i32` edge
-    /// grid, and both forms are width- and lane-generic, so `<3 x i8>` and `i16` take the same
-    /// path as `i32`.
-    pub(in crate::native::emitter) fn emit_air_saturating_add_sub_call(
+    pub(in crate::native::emitter) fn emit_air_unsigned_sat_call(
         &mut self,
         call: &LlCall,
         name: &str,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        const MEMBERS: [(&str, bool, bool); 4] = [
-            ("air.add_sat.u.", true, false),
-            ("air.add_sat.s.", true, true),
-            ("air.sub_sat.u.", false, false),
-            ("air.sub_sat.s.", false, true),
-        ];
-        let Some(&(_, is_add, signed)) = MEMBERS
-            .iter()
-            .find(|(prefix, _, _)| call.callee.starts_with(prefix))
-        else {
+        let is_add = call.callee.starts_with("air.add_sat.u.");
+        let is_sub = call.callee.starts_with("air.sub_sat.u.");
+        if !is_add && !is_sub {
             return Ok(false);
-        };
-        let (result_ty, width, lhs_id, rhs_id) = self.int_binary_operands(call, instructions, 2)?;
-        let cmp_ty_id = self.type_id(&int_compare_result_type(&result_ty)?)?;
-        let result_ty_id = self.type_id(&result_ty)?;
+        }
+        if call.args.len() != 2 {
+            return Err(format!(
+                "native emitter: {} expects two operands",
+                call.callee
+            ));
+        }
+        let result_ty = self.resolve_type(&call.ret)?;
+        if !is_integer_type(&result_ty) {
+            return Err(format!(
+                "native emitter: {} expects integer result, got {result_ty:?}",
+                call.callee
+            ));
+        }
+        let lhs = &call.args[0];
+        let rhs = &call.args[1];
+        let lhs_ty = self.resolve_type(&lhs.ty)?;
+        let rhs_ty = self.resolve_type(&rhs.ty)?;
+        if lhs_ty != result_ty || rhs_ty != result_ty {
+            return Err(format!(
+                "native emitter: {} operand/result type mismatch {lhs_ty:?}, {rhs_ty:?}, {result_ty:?}",
+                call.callee
+            ));
+        }
 
+        let cmp_ty = int_compare_result_type(&result_ty)?;
+        let cmp_ty_id = self.type_id(&cmp_ty)?;
+        let result_ty_id = self.type_id(&result_ty)?;
+        let lhs_id = self.value_id_in(&lhs.value, &lhs.ty, instructions)?;
+        let rhs_id = self.value_id_in(&rhs.value, &rhs.ty, instructions)?;
         let raw = self.fresh();
         instructions.push(Self::inst(
             if is_add { Op::IAdd } else { Op::ISub },
@@ -273,92 +277,29 @@ impl Emitter {
             Some(raw),
             vec![Operand::IdRef(lhs_id), Operand::IdRef(rhs_id)],
         ));
-
-        let (overflowed, limit) = if signed {
-            // `(a ^ raw) & (b ^ raw)` for add, `(a ^ b) & (a ^ raw)` for sub; negative iff the
-            // true result left the range.
-            let (left, right) = if is_add {
-                ((lhs_id, raw), (rhs_id, raw))
+        let saturated = self.fresh();
+        instructions.push(Self::inst(
+            Op::ULessThan,
+            Some(cmp_ty_id),
+            Some(saturated),
+            if is_add {
+                vec![Operand::IdRef(raw), Operand::IdRef(lhs_id)]
             } else {
-                ((lhs_id, rhs_id), (lhs_id, raw))
-            };
-            let disagree_left = self.fresh();
-            instructions.push(Self::inst(
-                Op::BitwiseXor,
-                Some(result_ty_id),
-                Some(disagree_left),
-                vec![Operand::IdRef(left.0), Operand::IdRef(left.1)],
-            ));
-            let disagree_right = self.fresh();
-            instructions.push(Self::inst(
-                Op::BitwiseXor,
-                Some(result_ty_id),
-                Some(disagree_right),
-                vec![Operand::IdRef(right.0), Operand::IdRef(right.1)],
-            ));
-            let both = self.fresh();
-            instructions.push(Self::inst(
-                Op::BitwiseAnd,
-                Some(result_ty_id),
-                Some(both),
-                vec![
-                    Operand::IdRef(disagree_left),
-                    Operand::IdRef(disagree_right),
-                ],
-            ));
-            let zero = self.const_null(&result_ty)?;
-            let overflowed = self.fresh();
-            instructions.push(Self::inst(
-                Op::SLessThan,
-                Some(cmp_ty_id),
-                Some(overflowed),
-                vec![Operand::IdRef(both), Operand::IdRef(zero)],
-            ));
-            // `(a >> (W-1)) ^ INT_MAX` is `INT_MIN` when `a` is negative and `INT_MAX` otherwise.
-            let sign_bits = self.fresh();
-            let shift = self.int_constant_like(&result_ty, i64::from(width - 1))?;
-            instructions.push(Self::inst(
-                Op::ShiftRightArithmetic,
-                Some(result_ty_id),
-                Some(sign_bits),
-                vec![Operand::IdRef(lhs_id), Operand::IdRef(shift)],
-            ));
-            let int_max = self.int_constant_like(&result_ty, i64::MAX >> (64 - width))?;
-            let limit = self.fresh();
-            instructions.push(Self::inst(
-                Op::BitwiseXor,
-                Some(result_ty_id),
-                Some(limit),
-                vec![Operand::IdRef(sign_bits), Operand::IdRef(int_max)],
-            ));
-            (overflowed, limit)
+                vec![Operand::IdRef(lhs_id), Operand::IdRef(rhs_id)]
+            },
+        ));
+        let limit = if is_add {
+            self.int_constant_like(&result_ty, -1)?
         } else {
-            let overflowed = self.fresh();
-            instructions.push(Self::inst(
-                Op::ULessThan,
-                Some(cmp_ty_id),
-                Some(overflowed),
-                if is_add {
-                    vec![Operand::IdRef(raw), Operand::IdRef(lhs_id)]
-                } else {
-                    vec![Operand::IdRef(lhs_id), Operand::IdRef(rhs_id)]
-                },
-            ));
-            let limit = if is_add {
-                self.int_constant_like(&result_ty, -1)?
-            } else {
-                self.const_null(&result_ty)?
-            };
-            (overflowed, limit)
+            self.const_null(&result_ty)?
         };
-
         let result = self.result_id(name, &result_ty)?;
         instructions.push(Self::inst(
             Op::Select,
             Some(result_ty_id),
             Some(result),
             vec![
-                Operand::IdRef(overflowed),
+                Operand::IdRef(saturated),
                 Operand::IdRef(limit),
                 Operand::IdRef(raw),
             ],
@@ -367,103 +308,25 @@ impl Emitter {
         Ok(true)
     }
 
-    /// `air.{h,rhadd}.{s,u}.<ty>(a, b)`: the average of two integers, computed so the intermediate
-    /// sum cannot overflow the operand width.
-    ///
-    /// `hadd(a, b) = (a & b) + ((a ^ b) >> 1)` and `rhadd(a, b) = (a | b) - ((a ^ b) >> 1)`: the
-    /// common bits carry their full weight and the differing bits carry half, so nothing ever
-    /// leaves the operand type and no widening is needed at any width. The shift is arithmetic for
-    /// the signed families, which is exactly Metal's rounding: `hadd` truncates toward -inf and
-    /// `rhadd` rounds the half up, both device-measured over a 256-row `i32` edge grid.
-    pub(in crate::native::emitter) fn emit_air_halving_add_call(
+    pub(in crate::native::emitter) fn emit_air_unsigned_rhadd_call(
         &mut self,
         call: &LlCall,
         name: &str,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
-        const MEMBERS: [(&str, bool, bool); 4] = [
-            ("air.hadd.u.", false, false),
-            ("air.hadd.s.", false, true),
-            ("air.rhadd.u.", true, false),
-            ("air.rhadd.s.", true, true),
-        ];
-        let Some(&(_, rounded, signed)) = MEMBERS
-            .iter()
-            .find(|(prefix, _, _)| call.callee.starts_with(prefix))
-        else {
+        if call.callee != "air.rhadd.u.i16" {
             return Ok(false);
-        };
-        let (result_ty, _, lhs_id, rhs_id) = self.int_binary_operands(call, instructions, 2)?;
-        let result_ty_id = self.type_id(&result_ty)?;
-
-        let common = self.fresh();
-        instructions.push(Self::inst(
-            if rounded {
-                Op::BitwiseOr
-            } else {
-                Op::BitwiseAnd
-            },
-            Some(result_ty_id),
-            Some(common),
-            vec![Operand::IdRef(lhs_id), Operand::IdRef(rhs_id)],
-        ));
-        let differing = self.fresh();
-        instructions.push(Self::inst(
-            Op::BitwiseXor,
-            Some(result_ty_id),
-            Some(differing),
-            vec![Operand::IdRef(lhs_id), Operand::IdRef(rhs_id)],
-        ));
-        let half = self.fresh();
-        let one = self.int_constant_like(&result_ty, 1)?;
-        instructions.push(Self::inst(
-            if signed {
-                Op::ShiftRightArithmetic
-            } else {
-                Op::ShiftRightLogical
-            },
-            Some(result_ty_id),
-            Some(half),
-            vec![Operand::IdRef(differing), Operand::IdRef(one)],
-        ));
-        let result = self.result_id(name, &result_ty)?;
-        instructions.push(Self::inst(
-            if rounded { Op::ISub } else { Op::IAdd },
-            Some(result_ty_id),
-            Some(result),
-            vec![Operand::IdRef(common), Operand::IdRef(half)],
-        ));
-        self.record_int_alignment(name, &result_ty, 1);
-        Ok(true)
-    }
-
-    /// Resolves the operands of an integer AIR intrinsic that requires every operand and the
-    /// result to share one integer scalar/vector type, returning that type, its component width
-    /// and the operand ids.
-    fn int_binary_operands(
-        &mut self,
-        call: &LlCall,
-        instructions: &mut Vec<Instruction>,
-        arity: usize,
-    ) -> Result<(LlType, u32, Word, Word), String> {
-        if call.args.len() != arity {
+        }
+        if call.args.len() != 2 {
             return Err(format!(
-                "native emitter: {} expects {arity} operands",
+                "native emitter: {} expects two operands",
                 call.callee
             ));
         }
         let result_ty = self.resolve_type(&call.ret)?;
-        let width = match &result_ty {
-            LlType::Int(bits) => *bits,
-            LlType::Vector(elem, _) => match elem.as_ref() {
-                LlType::Int(bits) => *bits,
-                _ => 0,
-            },
-            _ => 0,
-        };
-        if width == 0 {
+        if result_ty != LlType::Int(16) {
             return Err(format!(
-                "native emitter: {} expects integer result, got {result_ty:?}",
+                "native emitter: {} returned {result_ty:?}",
                 call.callee
             ));
         }
@@ -476,9 +339,58 @@ impl Emitter {
                 ));
             }
         }
+
+        let ushort = self.type_id(&result_ty)?;
+        let uint = self.type_id(&LlType::Int(32))?;
         let lhs = self.value_id_in(&call.args[0].value, &call.args[0].ty, instructions)?;
         let rhs = self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
-        Ok((result_ty, width, lhs, rhs))
+
+        let lhs32 = self.fresh();
+        instructions.push(Self::inst(
+            Op::UConvert,
+            Some(uint),
+            Some(lhs32),
+            vec![Operand::IdRef(lhs)],
+        ));
+        let rhs32 = self.fresh();
+        instructions.push(Self::inst(
+            Op::UConvert,
+            Some(uint),
+            Some(rhs32),
+            vec![Operand::IdRef(rhs)],
+        ));
+        let one = self.const_uint(1)?;
+        let sum = self.fresh();
+        instructions.push(Self::inst(
+            Op::IAdd,
+            Some(uint),
+            Some(sum),
+            vec![Operand::IdRef(lhs32), Operand::IdRef(rhs32)],
+        ));
+        let rounded = self.fresh();
+        instructions.push(Self::inst(
+            Op::IAdd,
+            Some(uint),
+            Some(rounded),
+            vec![Operand::IdRef(sum), Operand::IdRef(one)],
+        ));
+        let shift = self.const_uint(1)?;
+        let half = self.fresh();
+        instructions.push(Self::inst(
+            Op::ShiftRightLogical,
+            Some(uint),
+            Some(half),
+            vec![Operand::IdRef(rounded), Operand::IdRef(shift)],
+        ));
+        let result = self.result_id(name, &result_ty)?;
+        instructions.push(Self::inst(
+            Op::UConvert,
+            Some(ushort),
+            Some(result),
+            vec![Operand::IdRef(half)],
+        ));
+        self.record_int_alignment(name, &result_ty, 1);
+        Ok(true)
     }
 
     pub(in crate::native::emitter) fn emit_llvm_fshl_call(

@@ -70,19 +70,15 @@ pub(in crate::native) fn value_int_widths(module: &Module) -> HashMap<Word, u32>
             }
         }
     }
-    // Module-scope constants are values with an integer type as much as instruction results are,
-    // and a fold over a comparison of two of them needs their width to know where the sign bit is.
     let mut out: HashMap<Word, u32> = HashMap::new();
-    for inst in module.types_global_values.iter().chain(
-        module
-            .functions
-            .iter()
-            .flat_map(|f| f.blocks.iter())
-            .flat_map(|b| b.instructions.iter()),
-    ) {
-        if let (Some(rid), Some(t)) = (inst.result_id, inst.result_type) {
-            if let Some(w) = type_width.get(&t) {
-                out.insert(rid, *w);
+    for f in &module.functions {
+        for b in &f.blocks {
+            for inst in &b.instructions {
+                if let (Some(rid), Some(t)) = (inst.result_id, inst.result_type) {
+                    if let Some(w) = type_width.get(&t) {
+                        out.insert(rid, *w);
+                    }
+                }
             }
         }
     }
@@ -428,43 +424,5 @@ pub(in crate::native) fn numworkgroups_vars(module: &Module) -> HashSet<Word> {
                 _ => None,
             }
         })
-        .collect()
-}
-
-/// Every value id whose type is a vector of booleans -- the ids that may appear as an `OpSelect`
-/// condition selecting PER LANE. The scalar constant lattice cannot describe one, so a caller that
-/// reads a condition out of it must exclude these.
-pub(in crate::native) fn bool_vector_valued_ids(module: &Module) -> HashSet<Word> {
-    let bool_types: HashSet<Word> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypeBool)
-        .filter_map(|inst| inst.result_id)
-        .collect();
-    let bool_vectors: HashSet<Word> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypeVector)
-        .filter(|inst| match inst.operands.first() {
-            Some(Operand::IdRef(element)) => bool_types.contains(element),
-            _ => false,
-        })
-        .filter_map(|inst| inst.result_id)
-        .collect();
-    module
-        .types_global_values
-        .iter()
-        .chain(
-            module
-                .functions
-                .iter()
-                .flat_map(|function| function.blocks.iter())
-                .flat_map(|block| block.instructions.iter()),
-        )
-        .filter(|inst| {
-            inst.result_type
-                .is_some_and(|ty| bool_vectors.contains(&ty))
-        })
-        .filter_map(|inst| inst.result_id)
         .collect()
 }

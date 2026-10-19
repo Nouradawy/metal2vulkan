@@ -683,18 +683,6 @@ pub(in crate::native) fn first_type_after_op(rhs: &str) -> Option<LlType> {
 /// token (a type may be multi-token like `<4 x float>`). Scanning — rather than requiring the type at
 /// a fixed offset — tolerates the variable run of leading non-type tokens: fast-math flags, and the
 /// `fcmp`/`icmp` predicate (`olt`/`eq`/...) that sits between the opcode and the operand type.
-///
-/// The inner scan is SHORTEST window first, and that is not neutral: every LLVM type has a
-/// parseable proper prefix, so `phi ptr addrspace(2) [ .. ]` resolves to `Ptr(0)`, not `Ptr(2)`.
-/// `parse_type_prefix` (used for parameters) scans longest-first and does not have this shape.
-/// Correcting the order here was MEASURED over all 14,579 corpus sources and is not an improvement:
-/// four modules gain an unbounded `reserve_pointer_phi_provenance` recursion (a stack-overflow
-/// abort, not a refusal), and once that is broken the one module whose bytes change loses its typed
-/// `runtimearray<float>` buffer views for raw `runtimearray<uint>` ones. Every other source is
-/// byte-identical, because `types_compatible(Ptr(0), Ptr(2))` is false and every `value_id` caller
-/// for a pointer phi is spelled `if let Ok(id)` and takes its fallback — the fallback is what
-/// lowers pointer phis, and it is the better lowering. Do not "fix" the order on its own; the work
-/// it would unblock is a pointer-phi provenance route that measures worse than what runs today.
 pub(in crate::native) fn first_type_after(rhs: &str, start: usize) -> Option<LlType> {
     let toks: Vec<&str> = rhs.split_whitespace().collect();
     for begin in start..toks.len() {
@@ -709,9 +697,7 @@ pub(in crate::native) fn first_type_after(rhs: &str, start: usize) -> Option<LlT
     None
 }
 
-/// The first parseable type token at the start of `s` (for a select arm `<ty> <v>`). Shortest window
-/// first, with the same `Ptr(0)`-for-`ptr addrspace(N)` consequence and the same measurement behind
-/// it as [`first_type_after`].
+/// The first parseable type token at the start of `s` (for a select arm `<ty> <v>`).
 pub(in crate::native) fn first_type_token(s: &str) -> Option<LlType> {
     let toks: Vec<&str> = s.split_whitespace().collect();
     for end in 1..=toks.len() {

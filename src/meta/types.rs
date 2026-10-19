@@ -145,46 +145,25 @@ pub(super) fn tokenize(body: &str) -> Vec<Tok> {
     out
 }
 
-/// One member of an `air.struct_type_info` node, exactly as AIR spells it.
-///
-/// AIR writes a member as a 5-tuple `i32 offset, i32 size, i32 array_len, !"type", !"name"`,
-/// optionally PREFIXED by `!"air.struct_type_info", !N` naming the member's OWN member list, and
-/// optionally SUFFIXED by `!"air.indirect_argument"` plus one operand: a node ref `!N` for a
-/// resource handle, or a bare `i32` for an argument-buffer wrapper carrying its own argument id.
-pub(super) struct MemberTuple {
-    pub(super) offset: u32,
-    /// Per-element declared size. For an array member this is the ELEMENT size, not the total.
-    pub(super) size: u32,
-    /// Zero for a scalar member; otherwise the number of elements.
-    pub(super) array_len: u32,
-    pub(super) tyname: String,
-    /// The `!"air.struct_type_info", !N` prefix: this member's own member list.
-    pub(super) nested: Option<u32>,
-    /// The `!"air.indirect_argument", !N` suffix: the argument-buffer entry this member holds.
-    pub(super) argument_node: Option<u32>,
-    /// The `!"air.indirect_argument", i32 N` suffix: this wrapper's own argument-id base.
-    pub(super) argument_wrapper_id: Option<u32>,
-}
-
-impl MemberTuple {
-    /// How many bytes the member occupies by AIR's own account, from its declared per-element size
-    /// and array length. This is what AIR states, not a recomputation from the type name, so it is
-    /// the quantity two members are compared on to decide whether they overlap.
-    pub(super) fn declared_extent(&self) -> u64 {
-        u64::from(self.size) * u64::from(self.array_len.max(1))
+/// Parse an `air.struct_type_info` node into an `AirType::Struct`. Each member is a 5-tuple
+/// `i32 offset, i32 size, i32 array_len, !"type", !"name"`, optionally PREFIXED by
+/// `!"air.struct_type_info", !N` when the member is itself a nested struct (then recurse into `!N`)
+/// and optionally SUFFIXED by `!"air.indirect_argument", !N` naming the argument-buffer entry the
+/// member holds (see [`member_holds_resource_handle`]).
+pub(super) fn parse_struct_info(
+    nodes: &HashMap<u32, String>,
+    id: u32,
+    depth: u32,
+) -> Option<AirType> {
+    if depth > 16 {
+        return None;
     }
-}
-
-/// Walk one `air.struct_type_info` node body into its member tuples.
-///
-/// The single decoder for AIR's member-tuple grammar: [`parse_struct_info`] reads it as a layout
-/// and `embedded::collect_argument_members` reads it as a resource list, and they used to walk it
-/// separately. `struct_member_starts_at` does NOT treat a suffix as a member start, so scanning to
-/// the next member start reads the suffix that belongs to THIS member.
-pub(super) fn member_tuples(toks: &[Tok]) -> Vec<MemberTuple> {
-    let mut out = vec![];
+    let body = nodes.get(&id)?;
+    let toks = tokenize(body);
+    let mut members = vec![];
     let mut i = 0;
     while i < toks.len() {
+        // Optional nested-struct prefix.
         let mut nested = None;
         if let (Some(Tok::Str(s)), Some(Tok::Ref(x))) = (toks.get(i), toks.get(i + 1)) {
             if s == "air.struct_type_info" {
@@ -192,6 +171,7 @@ pub(super) fn member_tuples(toks: &[Tok]) -> Vec<MemberTuple> {
                 i += 2;
             }
         }
+        // Member tuple: offset, size, array_len, type-name (name string follows, ignored).
         let (offset, size, array_len, tyname) = match (
             toks.get(i),
             toks.get(i + 1),
@@ -207,79 +187,46 @@ pub(super) fn member_tuples(toks: &[Tok]) -> Vec<MemberTuple> {
             _ => break,
         };
         i += 5; // 3 ints + type + name
+
+        // Trailing tokens up to the next member tuple. `!"air.indirect_argument", !N` here binds
+        // node `!N` to THIS member; `embedded::embedded_argument_members` walks the same suffix to
+        // surface the resources an argument buffer carries.
         let mut argument_node = None;
-        let mut argument_wrapper_id = None;
-        while i < toks.len() && !struct_member_starts_at(toks, i) {
-            match (toks.get(i), toks.get(i + 1)) {
-                (Some(Tok::Str(s)), Some(Tok::Ref(x))) if s == "air.indirect_argument" => {
+        while i < toks.len() && !struct_member_starts_at(&toks, i) {
+            if let (Some(Tok::Str(s)), Some(Tok::Ref(x))) = (toks.get(i), toks.get(i + 1)) {
+                if s == "air.indirect_argument" {
                     argument_node = Some(*x);
                 }
-                (Some(Tok::Str(s)), Some(Tok::Int(id))) if s == "air.indirect_argument" => {
-                    argument_wrapper_id = Some(*id);
-                }
-                _ => {}
             }
             i += 1;
         }
-        out.push(MemberTuple {
-            offset,
-            size,
-            array_len,
-            tyname,
-            nested,
-            argument_node,
-            argument_wrapper_id,
-        });
-    }
-    out
-}
-
-/// Parse an `air.struct_type_info` node into an `AirType::Struct`, one member per
-/// [`MemberTuple`], or `None` when the node does not describe storage member-by-member.
-///
-/// `None` is not a parse failure; it is the answer that AIR's member list cannot be read as a
-/// layout, and every caller already has the fact that outranks it -- the enclosing member's
-/// declared size, or `air.arg_type_size` for a whole argument. See
-/// [`members_are_disjoint`] for the shapes that produce it.
-pub(super) fn parse_struct_info(
-    nodes: &HashMap<u32, String>,
-    id: u32,
-    depth: u32,
-) -> Option<AirType> {
-    if depth > 16 {
-        return None;
-    }
-    let body = nodes.get(&id)?;
-    let tuples = member_tuples(&tokenize(body));
-    if tuples.is_empty() || !members_are_disjoint(&tuples) {
-        return None;
-    }
-    let members = tuples
-        .into_iter()
-        .map(|tuple| {
-            let mut ty = match tuple.nested {
-                // A nested node that does not describe storage leaves the member exactly as well
-                // described as before: AIR stated its size right here in the tuple.
-                Some(x) => parse_struct_info(nodes, x, depth + 1)
-                    .unwrap_or_else(|| storage_air_type_for_size(tuple.size)),
-                None if member_holds_resource_handle(nodes, tuple.argument_node) => {
-                    storage_air_type_for_size(tuple.size)
+        let mut mt = match nested {
+            Some(x) => {
+                let nested_ty = parse_struct_info(nodes, x, depth + 1)?;
+                if nested_offsets_are_strict(&nested_ty) {
+                    nested_ty
+                } else {
+                    storage_air_type_for_size(size)
                 }
-                None => member_air_type(&tuple.tyname, tuple.size),
+            }
+            None if member_holds_resource_handle(nodes, argument_node) => {
+                storage_air_type_for_size(size)
+            }
+            None => member_air_type(&tyname, size),
+        };
+        if array_len > 0 {
+            mt = AirType::Array {
+                elem: Box::new(mt),
+                len: array_len,
             };
-            if tuple.array_len > 0 {
-                ty = AirType::Array {
-                    elem: Box::new(ty),
-                    len: tuple.array_len,
-                };
-            }
-            AirMember {
-                offset: tuple.offset,
-                ty,
-            }
-        })
-        .collect();
-    Some(AirType::Struct(members))
+        }
+        members.push(AirMember { offset, ty: mt });
+    }
+    if members.is_empty() {
+        None
+    } else {
+        Some(AirType::Struct(members))
+    }
 }
 
 /// True when a member's `air.indirect_argument` node describes a resource the argument buffer
@@ -325,33 +272,13 @@ pub(super) fn struct_member_starts_at(toks: &[Tok], mut i: usize) -> bool {
     )
 }
 
-/// Whether a node's members each own their bytes outright.
-///
-/// AIR states two shapes with overlapping members, and neither is usable as a layout:
-///
-/// - A **union** gives every member the SAME offset -- `half2 maskCoord` and `half vectorOpacity`
-///   both at 0 are two readings of one four-byte run.
-/// - A **bitfield** gives each field the offset of the byte its run starts in beside the size of
-///   the whole underlying storage unit -- `uint pixel_x` at 0, `uint pixel_y` at 1, `uint matid`
-///   at 3, each four bytes wide, is three views of one four-byte word, not a struct reaching to
-///   byte seven.
-///
-/// What settles both is who consumes this layout: [`crate::passes`] builds a SPIR-V struct type
-/// from it, and a `Block` cannot decorate two members onto the same bytes. An overlapping member
-/// list therefore does not become an overlapping struct -- it makes the emitter give up on the
-/// WHOLE buffer and address it as raw words, losing every typed access chain in it, not just the
-/// overlapping member. Refusing the node here costs far less: the caller always has the size AIR
-/// declared for this member, or `air.arg_type_size` for a whole argument.
-///
-/// So overlap is the test, at any offset and by any amount. Accepting unions was measured: it
-/// re-typed 379 corpus sources and cost `87c1f8ca` its `PKMetalStrokeVertex` access chains,
-/// widening a `writeonly` buffer to `ReadWrite`. Requiring a strictly increasing offset instead --
-/// which is what this used to do, for nested nodes only -- misses the bitfield, whose offsets do
-/// increase strictly while its members still overlap, on 4 corpus sources.
-fn members_are_disjoint(tuples: &[MemberTuple]) -> bool {
-    tuples.windows(2).all(|pair| {
-        u64::from(pair[0].offset) + pair[0].declared_extent() <= u64::from(pair[1].offset)
-    })
+fn nested_offsets_are_strict(ty: &AirType) -> bool {
+    match ty {
+        AirType::Struct(members) => members
+            .windows(2)
+            .all(|pair| pair[1].offset > pair[0].offset),
+        _ => true,
+    }
 }
 
 /// Render `size` opaque bytes as a concrete AIR leaf, for the places that must hand a real

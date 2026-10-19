@@ -53,13 +53,13 @@ These options affect pipeline- or dispatch-dependent lowering:
 | Option | Supply it when |
 |---|---|
 | `--raster-samples 1|2|4|8|16|32|64` | Fragment AIR calls `air.get_num_samples.i32`; use the exact graphics-pipeline sample count |
+| `--simd-cluster32` | A caller explicitly needs Metal's 32-lane simdgroup reduction partition on a wider Vulkan subgroup |
 | `--local X,Y,Z` | Kernel dispatches use a threadgroup size other than the default `64,1,1` |
 | `--threads-per-grid X,Y,Z` | Reflect one fixed Metal `dispatchThreads` grid for region planning |
 | `--threads-per-grid-push-constant OFFSET` | Move the default 48-byte dispatch-region payload from offset 0 to `OFFSET` |
 | `--whole-workgroups` | Assert every kernel launch covers complete workgroups and use one fixed-local-size pipeline |
 
-Every `air.simd_*` lowering keeps Metal's 32-lane simdgroup contract unconditionally; there is no
-option for it, because there is no correct module that wants the driver's subgroup width instead.
+The translator automatically preserves the 32-lane contract for recognized `air.simd_*` modules.
 Do not use either option as a workaround for an unrelated translation failure.
 
 ## 3. Translate from Rust
@@ -236,10 +236,7 @@ footprint soundness gate. Treat `access: null` conservatively as read-write.
   `translate_sanitized_native_specialized_with_options`; specialization must precede metadata,
   resource-interface, and CFG construction. Metadata-only tooling must pass those same payloads to
   `reflect_sanitized_specialized`; reflecting the default AIR can omit a resource selected by a
-  non-default value. A consumer that BINDS the specialized module should take its reflection from
-  `translate_sanitized_native_specialized_reflected_with_options` instead: `reflect_sanitized*`
-  constructs no module, so the image type behind a texture binding stays at the AIR type name, and a
-  `texturecube` that is only ever texel-read is bound as a 2D array image. Exact predicates also remove false-gated resources from the specialized
+  non-default value. Exact predicates also remove false-gated resources from the specialized
   interface, so consumers bind the selected contract rather than the unspecialized union. A
   generated fullscreen companion must use `translate_passthrough_specialized` with the same
   payloads so its vertex outputs match the selected fragment inputs.
@@ -282,7 +279,7 @@ At minimum:
 
 ```sh
 spirv-val --target-env vulkan1.2 output.spv
-cargo test -p metal2vulkan --all-features
+cargo test -p metal2vulkan
 ```
 
 `spirv-val` checks structural validity, not Metal equivalence. For a semantic claim, follow the

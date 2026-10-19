@@ -334,167 +334,113 @@ pub(in crate::passes) fn lower_integer_op(
         }
         return Ok(Some(clz_scalar(ctx, res, rty, args[0], width)));
     }
-    // The `air.{mul,mad}_hi.{s,u}` / `air.mad_sat.{s,u}` family. Every member's answer is a
-    // property of the *true* 64-bit product of two 32-bit integers, which a 32-bit multiply has
-    // already thrown away, so all six widen first — a 32x32 product plus a 32-bit addend still
-    // cannot overflow 64 bits — and then differ only in what they take back.
-    if let Some(op) = wide_multiply_op(name, args.len()) {
+    // `mul_hi.u.i32(a,b)` = high 32 bits of the 64-bit unsigned product: widen to u64, multiply,
+    // shift right 32, narrow back.
+    if name.starts_with("air.mul_hi.u.") && args.len() == 2 {
         if int_scalar_width(ctx, rty) != Some(32) {
             return Err(format!("{name} currently supports i32 results"));
         }
-        return Ok(Some(lower_wide_multiply(ctx, res, rty, op, args)));
-    }
-    Ok(None)
-}
-
-/// One member of the widen-multiply family, named by what it takes back from the 64-bit product.
-#[derive(Clone, Copy)]
-struct WideMultiplyOp {
-    signed: bool,
-    /// `mul_hi`/`mad_hi` take the product's high 32 bits; `mad_sat` clamps the 64-bit sum into
-    /// the 32-bit range.
-    high_half: bool,
-    /// `mad_*` add a third operand. For `mad_hi` it joins the high half in 32-bit arithmetic and
-    /// is allowed to wrap; for `mad_sat` it joins the 64-bit product before the clamp.
-    fused: bool,
-}
-
-fn wide_multiply_op(name: &str, argc: usize) -> Option<WideMultiplyOp> {
-    const MEMBERS: [(&str, bool, bool, usize); 3] = [
-        ("air.mul_hi.", true, false, 2),
-        ("air.mad_hi.", true, true, 3),
-        ("air.mad_sat.", false, true, 3),
-    ];
-    let (_, high_half, fused, _) = MEMBERS
-        .into_iter()
-        .find(|&(stem, _, _, wanted)| argc == wanted && name.starts_with(stem))?;
-    // `air.<stem>.<s|u>.<type>`: the third dotted field is the whole sign distinction.
-    let signed = match name.split('.').nth(2)? {
-        "s" => true,
-        "u" => false,
-        _ => return None,
-    };
-    Some(WideMultiplyOp {
-        signed,
-        high_half,
-        fused,
-    })
-}
-
-/// Emits `op` over 32-bit `args`, all six members device-measured against Metal's `mulhi`,
-/// `madhi`, `madsat` over a 256-row edge grid.
-fn lower_wide_multiply(
-    ctx: &mut Ctx,
-    res: Word,
-    rty: Word,
-    op: WideMultiplyOp,
-    args: &[Word],
-) -> Vec<Instruction> {
-    let wide = ctx.ty_ulong();
-    // The widening and the narrowing carry the whole sign distinction: `SConvert` replicates the
-    // sign bit into the high half so the 64-bit product is the signed one.
-    let (widen, narrow) = if op.signed {
-        (Op::SConvert, Op::SConvert)
-    } else {
-        (Op::UConvert, Op::UConvert)
-    };
-    let mut insts = Vec::new();
-    let widened = |ctx: &mut Ctx, insts: &mut Vec<Instruction>, arg: Word| {
-        let id = ctx.module.fresh_id();
-        insts.push(Instruction::new(
-            widen,
-            Some(wide),
-            Some(id),
-            vec![Operand::IdRef(arg)],
-        ));
-        id
-    };
-    let a = widened(ctx, &mut insts, args[0]);
-    let b = widened(ctx, &mut insts, args[1]);
-    let product = ctx.module.fresh_id();
-    insts.push(Instruction::new(
-        Op::IMul,
-        Some(wide),
-        Some(product),
-        vec![Operand::IdRef(a), Operand::IdRef(b)],
-    ));
-
-    if op.high_half {
+        let ulong = ctx.ty_ulong();
+        let a64 = ctx.module.fresh_id();
+        let b64 = ctx.module.fresh_id();
+        let prod = ctx.module.fresh_id();
         let hi = ctx.module.fresh_id();
-        let thirty_two = ctx.const_uint(32);
-        insts.push(Instruction::new(
-            if op.signed {
-                Op::ShiftRightArithmetic
-            } else {
-                Op::ShiftRightLogical
-            },
-            Some(wide),
-            Some(hi),
-            vec![Operand::IdRef(product), Operand::IdRef(thirty_two)],
-        ));
-        // `mul_hi` narrows straight into `res`; `mad_hi` narrows into a temporary that the addend
-        // then joins in 32-bit arithmetic, where it is allowed to wrap.
-        let narrowed = if op.fused { ctx.module.fresh_id() } else { res };
-        insts.push(Instruction::new(
-            narrow,
-            Some(rty),
-            Some(narrowed),
-            vec![Operand::IdRef(hi)],
-        ));
-        if op.fused {
-            insts.push(Instruction::new(
+        return Ok(Some(vec![
+            Instruction::new(
+                Op::UConvert,
+                Some(ulong),
+                Some(a64),
+                vec![Operand::IdRef(args[0])],
+            ),
+            Instruction::new(
+                Op::UConvert,
+                Some(ulong),
+                Some(b64),
+                vec![Operand::IdRef(args[1])],
+            ),
+            Instruction::new(
+                Op::IMul,
+                Some(ulong),
+                Some(prod),
+                vec![Operand::IdRef(a64), Operand::IdRef(b64)],
+            ),
+            Instruction::new(
+                Op::ShiftRightLogical,
+                Some(ulong),
+                Some(hi),
+                vec![Operand::IdRef(prod), Operand::IdRef(ctx.const_uint(32))],
+            ),
+            Instruction::new(Op::UConvert, Some(rty), Some(res), vec![Operand::IdRef(hi)]),
+        ]));
+    }
+    // `mad_sat.s.i32(a,b,c)` = saturate(a*b+c) to the i32 range. Compute in 64-bit (no overflow for
+    // 32-bit inputs), SClamp to [i32::MIN, i32::MAX], narrow back.
+    if name.starts_with("air.mad_sat.s.") && args.len() == 3 {
+        if int_scalar_width(ctx, rty) != Some(32) {
+            return Err(format!("{name} currently supports i32 results"));
+        }
+        let long = ctx.ty_ulong();
+        let ext = ctx.glsl();
+        let a64 = ctx.module.fresh_id();
+        let b64 = ctx.module.fresh_id();
+        let c64 = ctx.module.fresh_id();
+        let prod = ctx.module.fresh_id();
+        let sum = ctx.module.fresh_id();
+        let clamped = ctx.module.fresh_id();
+        let lo = ctx.const_int_of(long, i64::from(i32::MIN));
+        let hi = ctx.const_int_of(long, i64::from(i32::MAX));
+        return Ok(Some(vec![
+            Instruction::new(
+                Op::SConvert,
+                Some(long),
+                Some(a64),
+                vec![Operand::IdRef(args[0])],
+            ),
+            Instruction::new(
+                Op::SConvert,
+                Some(long),
+                Some(b64),
+                vec![Operand::IdRef(args[1])],
+            ),
+            Instruction::new(
+                Op::SConvert,
+                Some(long),
+                Some(c64),
+                vec![Operand::IdRef(args[2])],
+            ),
+            Instruction::new(
+                Op::IMul,
+                Some(long),
+                Some(prod),
+                vec![Operand::IdRef(a64), Operand::IdRef(b64)],
+            ),
+            Instruction::new(
                 Op::IAdd,
+                Some(long),
+                Some(sum),
+                vec![Operand::IdRef(prod), Operand::IdRef(c64)],
+            ),
+            Instruction::new(
+                Op::ExtInst,
+                Some(long),
+                Some(clamped),
+                vec![
+                    Operand::IdRef(ext),
+                    Operand::LiteralExtInstInteger(GLSLstd450::SClamp as u32),
+                    Operand::IdRef(sum),
+                    Operand::IdRef(lo),
+                    Operand::IdRef(hi),
+                ],
+            ),
+            Instruction::new(
+                Op::SConvert,
                 Some(rty),
                 Some(res),
-                vec![Operand::IdRef(narrowed), Operand::IdRef(args[2])],
-            ));
-        }
-        return insts;
+                vec![Operand::IdRef(clamped)],
+            ),
+        ]));
     }
-
-    let c = widened(ctx, &mut insts, args[2]);
-    let sum = ctx.module.fresh_id();
-    insts.push(Instruction::new(
-        Op::IAdd,
-        Some(wide),
-        Some(sum),
-        vec![Operand::IdRef(product), Operand::IdRef(c)],
-    ));
-
-    let ext = ctx.glsl();
-    let (clamp, lo, hi) = if op.signed {
-        (
-            GLSLstd450::SClamp,
-            ctx.const_int_of(wide, i64::from(i32::MIN)),
-            ctx.const_int_of(wide, i64::from(i32::MAX)),
-        )
-    } else {
-        (
-            GLSLstd450::UClamp,
-            ctx.const_int_of(wide, 0),
-            ctx.const_int_of(wide, i64::from(u32::MAX)),
-        )
-    };
-    let clamped = ctx.module.fresh_id();
-    insts.push(Instruction::new(
-        Op::ExtInst,
-        Some(wide),
-        Some(clamped),
-        vec![
-            Operand::IdRef(ext),
-            Operand::LiteralExtInstInteger(clamp as u32),
-            Operand::IdRef(sum),
-            Operand::IdRef(lo),
-            Operand::IdRef(hi),
-        ],
-    ));
-    insts.push(Instruction::new(
-        narrow,
-        Some(rty),
-        Some(res),
-        vec![Operand::IdRef(clamped)],
-    ));
-    insts
+    Ok(None)
 }
 
 fn integer_shape(ctx: &Ctx, ty: Word) -> Option<(u32, u32)> {
@@ -942,31 +888,36 @@ fn lower_quad_vote(
     ])
 }
 
-/// The 32-bit ballot word that covers `lane`'s own aligned 32-lane partition.
-///
-/// `OpGroupNonUniformBallot` answers for the whole physical subgroup, as four 32-bit words in a
-/// `uvec4`. Every mask AIR states is group-RELATIVE -- a quad's four bits, a simdgroup's
-/// thirty-two -- lies entirely inside the word at `SubgroupLocalInvocationId >> 5`, because both
-/// partitions are aligned and neither is wider than a word. Selecting that word is therefore the
-/// one step every Metal-relative ballot shares, whatever it does with the bits afterwards.
-fn subgroup_partition_ballot_word(
+fn lower_quad_active_threads_mask(
     ctx: &mut Ctx,
-    insts: &mut Vec<Instruction>,
-    lane: Word,
-    predicate: Word,
-) -> Word {
+    res: Word,
+    rty: Word,
+) -> Result<Vec<Instruction>, String> {
+    if int_scalar_width(ctx, rty) != Some(16) {
+        return Err("air.quad_active_threads_mask result is not i16".to_string());
+    }
+    // AIR reports a quad-relative four-bit mask. A subgroup ballot is absolute, so select the
+    // current 32-lane word and shift its aligned four-lane partition down to bits 0..3. Quad bases
+    // are multiples of four and therefore never straddle the ballot's 32-bit words.
     let uint = ctx.ty_uint();
+    let bool_ty = ctx.ty_bool();
     let ballot_ty = ctx.ty_vec_uint(4);
     let scope = ctx.const_uint(Scope::Subgroup as u32);
+    let active = ctx.const_bool_of(bool_ty, true);
+    let mut insts = Vec::new();
+    let lane = subgroup_lane_index_u32(ctx, &mut insts);
     let ballot = ctx.module.fresh_id();
     let word_index = ctx.module.fresh_id();
     let word = ctx.module.fresh_id();
+    let quad_shift = ctx.module.fresh_id();
+    let shifted = ctx.module.fresh_id();
+    let masked = ctx.module.fresh_id();
     insts.extend([
         Instruction::new(
             Op::GroupNonUniformBallot,
             Some(ballot_ty),
             Some(ballot),
-            vec![Operand::IdScope(scope), Operand::IdRef(predicate)],
+            vec![Operand::IdScope(scope), Operand::IdRef(active)],
         ),
         Instruction::new(
             Op::ShiftRightLogical,
@@ -980,30 +931,6 @@ fn subgroup_partition_ballot_word(
             Some(word),
             vec![Operand::IdRef(ballot), Operand::IdRef(word_index)],
         ),
-    ]);
-    word
-}
-
-fn lower_quad_active_threads_mask(
-    ctx: &mut Ctx,
-    res: Word,
-    rty: Word,
-) -> Result<Vec<Instruction>, String> {
-    if int_scalar_width(ctx, rty) != Some(16) {
-        return Err("air.quad_active_threads_mask result is not i16".to_string());
-    }
-    // AIR reports a quad-relative four-bit mask, so shift this lane's partition word down by the
-    // quad's base within it. Quad bases are multiples of four and never straddle a ballot word.
-    let uint = ctx.ty_uint();
-    let bool_ty = ctx.ty_bool();
-    let active = ctx.const_bool_of(bool_ty, true);
-    let mut insts = Vec::new();
-    let lane = subgroup_lane_index_u32(ctx, &mut insts);
-    let word = subgroup_partition_ballot_word(ctx, &mut insts, lane, active);
-    let quad_shift = ctx.module.fresh_id();
-    let shifted = ctx.module.fresh_id();
-    let masked = ctx.module.fresh_id();
-    insts.extend([
         Instruction::new(
             Op::BitwiseAnd,
             Some(uint),
@@ -1032,77 +959,6 @@ fn lower_quad_active_threads_mask(
     Ok(insts)
 }
 
-/// `air.simd_all` / `air.simd_any`: a vote over Metal's 32-lane simdgroup.
-///
-/// `OpGroupNonUniformAll`/`Any` vote over the whole physical subgroup, which is the right answer
-/// only where that subgroup IS one simdgroup. Under the 32-lane opt-in the vote is taken from this
-/// lane's own partition word instead: `OpGroupNonUniformBallot` sets a bit for each ACTIVE
-/// invocation whose predicate holds, so "any" is that word being non-zero and "all" is its
-/// equality with the same partition's ballot of `true`, which is the active mask. This is the lane
-/// model `air.simd_is_first`, `air.simd_broadcast_first` and the clustered `air.simd_{sum,min,max}`
-/// reductions already use; leaving the votes on the physical subgroup made one module state two.
-fn lower_simd_vote(
-    ctx: &mut Ctx,
-    res: Word,
-    rty: Word,
-    predicate: Word,
-    all: bool,
-) -> Result<Vec<Instruction>, String> {
-    if !is_bool_type(ctx, rty) {
-        return Err("simd vote result type is not bool".to_string());
-    }
-    let mut insts = Vec::new();
-    let lane = subgroup_lane_index_u32(ctx, &mut insts);
-    let voted = subgroup_partition_ballot_word(ctx, &mut insts, lane, predicate);
-    if all {
-        let bool_ty = ctx.ty_bool();
-        let active = ctx.const_bool_of(bool_ty, true);
-        let active_word = subgroup_partition_ballot_word(ctx, &mut insts, lane, active);
-        insts.push(Instruction::new(
-            Op::IEqual,
-            Some(rty),
-            Some(res),
-            vec![Operand::IdRef(voted), Operand::IdRef(active_word)],
-        ));
-    } else {
-        let zero = ctx.const_uint(0);
-        insts.push(Instruction::new(
-            Op::INotEqual,
-            Some(rty),
-            Some(res),
-            vec![Operand::IdRef(voted), Operand::IdRef(zero)],
-        ));
-    }
-    Ok(insts)
-}
-
-/// `air.simd_ballot.i64`: Metal's `simd_vote`, whose bits are indexed by `simd_lane_id`.
-///
-/// The AIR result is 64 bits wide because the ABI predates any narrowing, but only the simdgroup's
-/// own lanes may set a bit, and lane `n` of the simdgroup owns bit `n`. Under the 32-lane opt-in
-/// that is exactly this lane's partition word, zero-extended. Without the opt-in the subgroup is
-/// the simdgroup, and the mask is the ballot's low two words joined.
-fn lower_simd_ballot(
-    ctx: &mut Ctx,
-    res: Word,
-    rty: Word,
-    predicate: Word,
-) -> Result<Vec<Instruction>, String> {
-    if int_scalar_width(ctx, rty) != Some(64) {
-        return Err("air.simd_ballot.i64 result is not i64".to_string());
-    }
-    let mut insts = Vec::new();
-    let lane = subgroup_lane_index_u32(ctx, &mut insts);
-    let word = subgroup_partition_ballot_word(ctx, &mut insts, lane, predicate);
-    insts.push(Instruction::new(
-        Op::UConvert,
-        Some(rty),
-        Some(res),
-        vec![Operand::IdRef(word)],
-    ));
-    Ok(insts)
-}
-
 /// Lower the SIMD/subgroup lane-op family (`air.is_uniform`, `air.quad_{all,any}`, `air.get_simdgroup_size`,
 /// `air.simd_is_first`, `air.quad_is_first`, the simd/quad shuffle/broadcast/fill variants,
 /// `air.simd_{prefix_*,sum,or,xor,and,min,max}`) plus the vector-reduction / function-constant predicates (`air.all`/`air.any`,
@@ -1116,39 +972,17 @@ pub(in crate::passes) fn lower_simd_op(
     rty: Word,
     args: &[Word],
 ) -> Result<Option<Vec<Instruction>>, String> {
-    // `air.is_uniform` is Metal's `uniform<T>` ASSERTION, not a subgroup query. AIR states the
-    // value is uniform and feeds the predicate straight to `llvm.assume`; across the 14579 local
-    // corpus sources all 35143 occurrences are consumed by an `llvm.assume` or by a `phi i1` that
-    // is, so the program never observes the answer -- it supplies it.
-    //
-    // The structural tell is the name: EVERY Metal intrinsic scoped to an execution group is
-    // spelled `air.simd_*` or `air.quad_*`. This one names no group, and lowering it to a subgroup
-    // vote answered a question at a scope AIR did not mention -- while putting a CONVERGENT
-    // instruction wherever the frontend happened to place a free assumption, and demanding
-    // `GroupNonUniformVote` of every device that runs the module.
-    //
-    // `llvm.assume` has no SPIR-V form, so the assumption itself is dropped; the predicate it
-    // asserts is the constant it asserts.
     if name.starts_with("air.is_uniform.") && args.len() == 1 {
-        if !is_bool_type(ctx, rty) {
-            return Err(format!("{name} result type is not bool"));
-        }
-        let asserted = ctx.const_bool_of(rty, true);
+        let scope = ctx.const_uint(Scope::Subgroup as u32);
         return Ok(Some(vec![Instruction::new(
-            Op::CopyObject,
+            Op::GroupNonUniformAllEqual,
             Some(rty),
             Some(res),
-            vec![Operand::IdRef(asserted)],
+            vec![Operand::IdScope(scope), Operand::IdRef(args[0])],
         )]));
     }
     if matches!(name, "air.quad_all" | "air.quad_any") && args.len() == 1 {
         return lower_quad_vote(ctx, res, rty, args[0], name == "air.quad_all").map(Some);
-    }
-    if matches!(name, "air.simd_all" | "air.simd_any") && args.len() == 1 {
-        return lower_simd_vote(ctx, res, rty, args[0], name == "air.simd_all").map(Some);
-    }
-    if name == "air.simd_ballot.i64" && args.len() == 1 {
-        return lower_simd_ballot(ctx, res, rty, args[0]).map(Some);
     }
     if name == "air.quad_active_threads_mask" && args.is_empty() {
         return lower_quad_active_threads_mask(ctx, res, rty).map(Some);
@@ -1194,28 +1028,79 @@ pub(in crate::passes) fn lower_simd_op(
         if !is_bool_type(ctx, rty) {
             return Err(format!("{name} result type is not bool"));
         }
-        // `OpGroupNonUniformElect` names the first lane of the PHYSICAL subgroup, so on a wider
-        // driver only one of its Metal simdgroups would have a first lane at all.
-        let mut insts = Vec::new();
-        let lane = subgroup_lane_index_u32(ctx, &mut insts);
-        let simd_lane = metal_simd_lane_local_u32(ctx, lane, &mut insts);
-        insts.push(Instruction::new(
-            Op::IEqual,
+        if ctx.simd_cluster32 {
+            let mut insts = Vec::new();
+            let lane = subgroup_lane_index_u32(ctx, &mut insts);
+            let uint = ctx.ty_uint();
+            let local_lane = ctx.module.fresh_id();
+            insts.push(Instruction::new(
+                Op::BitwiseAnd,
+                Some(uint),
+                Some(local_lane),
+                vec![Operand::IdRef(lane), Operand::IdRef(ctx.const_uint(31))],
+            ));
+            insts.push(Instruction::new(
+                Op::IEqual,
+                Some(rty),
+                Some(res),
+                vec![
+                    Operand::IdRef(local_lane),
+                    Operand::IdRef(ctx.const_uint(0)),
+                ],
+            ));
+            return Ok(Some(insts));
+        }
+        let scope = ctx.const_uint(Scope::Subgroup as u32);
+        return Ok(Some(vec![Instruction::new(
+            Op::GroupNonUniformElect,
             Some(rty),
             Some(res),
-            vec![Operand::IdRef(simd_lane), Operand::IdRef(ctx.const_uint(0))],
-        ));
-        return Ok(Some(insts));
+            vec![Operand::IdScope(scope)],
+        )]));
     }
     if name.starts_with("air.simd_broadcast_first.") && args.len() == 1 {
-        // `OpGroupNonUniformBroadcastFirst` broadcasts the PHYSICAL subgroup's first lane, which
-        // is not lane 0 of the caller's simdgroup once the subgroup is wider than 32. Shuffle from
-        // the caller's own partition base instead.
+        let scope = ctx.const_uint(Scope::Subgroup as u32);
+        if ctx.simd_cluster32 {
+            let mut insts = Vec::new();
+            let lane = subgroup_lane_index_u32(ctx, &mut insts);
+            let uint = ctx.ty_uint();
+            let local_lane = ctx.module.fresh_id();
+            insts.push(Instruction::new(
+                Op::BitwiseAnd,
+                Some(uint),
+                Some(local_lane),
+                vec![Operand::IdRef(lane), Operand::IdRef(ctx.const_uint(31))],
+            ));
+            let base_lane = ctx.module.fresh_id();
+            insts.push(Instruction::new(
+                Op::ISub,
+                Some(uint),
+                Some(base_lane),
+                vec![Operand::IdRef(lane), Operand::IdRef(local_lane)],
+            ));
+            insts.push(Instruction::new(
+                Op::GroupNonUniformShuffle,
+                Some(rty),
+                Some(res),
+                vec![
+                    Operand::IdScope(scope),
+                    Operand::IdRef(args[0]),
+                    Operand::IdRef(base_lane),
+                ],
+            ));
+            return Ok(Some(insts));
+        }
+        return Ok(Some(vec![Instruction::new(
+            Op::GroupNonUniformBroadcastFirst,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdScope(scope), Operand::IdRef(args[0])],
+        )]));
+    }
+    if name.starts_with("air.simd_broadcast.") && args.len() == 2 {
         let scope = ctx.const_uint(Scope::Subgroup as u32);
         let mut insts = Vec::new();
-        let lane = subgroup_lane_index_u32(ctx, &mut insts);
-        let simd_lane = metal_simd_lane_local_u32(ctx, lane, &mut insts);
-        let base_lane = metal_simd_lane_base_u32(ctx, lane, simd_lane, &mut insts);
+        let lane = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
         insts.push(Instruction::new(
             Op::GroupNonUniformShuffle,
             Some(rty),
@@ -1223,23 +1108,15 @@ pub(in crate::passes) fn lower_simd_op(
             vec![
                 Operand::IdScope(scope),
                 Operand::IdRef(args[0]),
-                Operand::IdRef(base_lane),
+                Operand::IdRef(lane),
             ],
         ));
         return Ok(Some(insts));
     }
-    // `air.simd_broadcast(value, lane)` and `air.simd_shuffle(value, lane)` both name a lane of the
-    // caller's own Metal simdgroup, exactly like `simd_shuffle_up`/`_down`/`_rotate_down` and like
-    // the `simd_broadcast_first` arm directly above -- all of which resolve that to an absolute
-    // subgroup lane through the simdgroup base. These two used the operand as an absolute subgroup
-    // lane instead, which is a different answer on any subgroup wider than 32.
-    if (name.starts_with("air.simd_broadcast.") || name.starts_with("air.simd_shuffle."))
-        && args.len() == 2
-    {
+    if name.starts_with("air.simd_shuffle.") && args.len() == 2 {
         let scope = ctx.const_uint(Scope::Subgroup as u32);
         let mut insts = Vec::new();
-        let index = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
-        let lane = metal_simd_absolute_lane_u32(ctx, index, &mut insts);
+        let lane = subgroup_shuffle_index_u32(ctx, args[1], &mut insts)?;
         insts.push(Instruction::new(
             Op::GroupNonUniformShuffle,
             Some(rty),
@@ -1384,7 +1261,6 @@ pub(in crate::passes) fn lower_simd_op(
     if name.starts_with("air.simd_min.") && args.len() == 1 {
         return lower_simd_extrema(
             ctx,
-            name,
             res,
             rty,
             args[0],
@@ -1396,7 +1272,6 @@ pub(in crate::passes) fn lower_simd_op(
     if name.starts_with("air.simd_max.") && args.len() == 1 {
         return lower_simd_extrema(
             ctx,
-            name,
             res,
             rty,
             args[0],
@@ -1630,12 +1505,11 @@ pub(in crate::passes) fn lower_one(
     if name == "air.get_num_samples.i32" {
         return lower_raster_sample_count(ctx, name, res, rty);
     }
-    // `air.map_screen_to_physical_coordinates.<ret>.<map>.<layer>`: with a uniform rate-1.0 map the
-    // physical grid is the screen grid, so this is the identity — the same mapping, in the same
-    // direction, as its inverse below. Device-verified; see `lower_map_screen_to_physical`. Full
-    // variable-rate map decoding remains a separate resource-model problem shared with the inverse.
+    // The private capture harness synthesizes `metal::rasterization_rate_map_data` as a single physical tile.
+    // The observed Apple helper maps through that 1x1 tile to the first physical texel; full
+    // variable-rate rasterization map decoding remains a separate resource-model problem.
     if name.starts_with("air.map_screen_to_physical_coordinates.") {
-        return lower_map_screen_to_physical(name, res, rty, args);
+        return lower_map_screen_to_physical(ctx, name, res, rty, args);
     }
 
     // `air.map_physical_to_screen_coordinates.<ret>.<map>.<layer>`: the inverse of the map above.

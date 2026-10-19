@@ -71,24 +71,6 @@ impl ObservationType {
     }
 }
 
-/// Namespace the generated Metal interface structs own.
-///
-/// A varying's Metal field name is its AIR argument name, because Metal links an unattributed
-/// stage-in member by that name. The generated structs also carry members the AIR never names --
-/// the attribute-linked builtins below, and the synthetic name a `[[user(...)]]` varying falls back
-/// to -- and those must not be spellable by an AIR argument name, or the two collide in one struct
-/// and the whole observer stops compiling.
-pub const GENERATED_FIELD_PREFIX: &str = "metal2vulkan_";
-
-/// `[[position]]` member of every generated vertex-output / fragment-input struct.
-pub const METAL_POSITION_FIELD: &str = "metal2vulkan_position";
-
-/// `[[viewport_array_index]]` member of the generated fragment-input struct.
-pub const METAL_VIEWPORT_FIELD: &str = "metal2vulkan_viewport";
-
-/// `[[render_target_array_index]]` member of the generated fragment-input struct.
-pub const METAL_LAYER_FIELD: &str = "metal2vulkan_layer";
-
 pub fn metal_user_attribute(semantic: Option<&str>) -> Option<&str> {
     semantic.filter(|semantic| semantic.starts_with("user(") && semantic.ends_with(')'))
 }
@@ -98,18 +80,11 @@ pub fn metal_field_name(
     name: Option<&str>,
     semantic: Option<&str>,
 ) -> Result<String, String> {
-    if let Some(name) = name.filter(|name| name.starts_with(GENERATED_FIELD_PREFIX)) {
-        return Err(format!(
-            "varying {location} is named {name:?}, which is inside the generated-interface \
-             namespace {GENERATED_FIELD_PREFIX:?} and cannot be linked without colliding with a \
-             member the observer generates"
-        ));
-    }
     if let Some(name) = name.filter(|name| is_msl_identifier(name)) {
         return Ok(name.to_string());
     }
     if metal_user_attribute(semantic).is_some() {
-        return Ok(format!("{GENERATED_FIELD_PREFIX}varying_{location}"));
+        return Ok(format!("metal2vulkan_varying_{location}"));
     }
     match name {
         Some(name) => Err(format!(
@@ -154,22 +129,5 @@ mod tests {
             Ok("metal2vulkan_varying_7".into())
         );
         assert!(metal_field_name(7, None, Some("generated(payload)")).is_err());
-    }
-
-    #[test]
-    fn the_generated_namespace_is_not_spellable_by_an_air_name() {
-        assert!(metal_field_name(0, Some("metal2vulkan_position"), Some("user(p)")).is_err());
-        assert!(metal_field_name(3, Some("metal2vulkan_varying_3"), None).is_err());
-        assert_eq!(
-            metal_field_name(0, Some("position"), None),
-            Ok("position".into())
-        );
-        for field in [
-            METAL_POSITION_FIELD,
-            METAL_VIEWPORT_FIELD,
-            METAL_LAYER_FIELD,
-        ] {
-            assert!(field.starts_with(GENERATED_FIELD_PREFIX));
-        }
     }
 }

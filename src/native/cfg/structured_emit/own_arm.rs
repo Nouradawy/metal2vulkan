@@ -38,6 +38,23 @@ struct Witness {
     local_of: HashMap<usize, usize>,
 }
 
+fn typed_state_type(ty: &LlType) -> bool {
+    match ty {
+        LlType::Void | LlType::Ptr(_) | LlType::Named(_) => false,
+        LlType::Vector(element, _) | LlType::Array(element, _) => typed_state_type(element),
+        LlType::Struct(fields) => fields.iter().all(typed_state_type),
+        LlType::Bool | LlType::Float | LlType::Half | LlType::BFloat | LlType::Int(_) => true,
+    }
+}
+
+fn passthrough(name: &str, target: &str) -> BodyBlock {
+    synthetic_block(
+        name.to_string(),
+        vec![format!("br label {target}")],
+        BlockRole::Normal,
+    )
+}
+
 fn carrier_with_phis(
     name: &str,
     target: &str,

@@ -53,36 +53,6 @@ pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     sign | encoded.min(0x7c00) as u16
 }
 
-/// The exact `f32` value of a binary16 bit pattern.
-///
-/// Every finite `half` is exactly representable as an `f32`, so this is a widening with no
-/// rounding of its own; the infinities and NaNs widen to their `f32` counterparts.
-pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
-    let negative = bits & 0x8000 != 0;
-    let exponent = ((bits >> 10) & 0x1f) as u32;
-    let significand = (bits & 0x03ff) as u32;
-    let magnitude = if exponent == 0 {
-        // Subnormal: significand * 2^-24, exact in `f32`.
-        (significand as f32) * (2.0f32).powi(-24)
-    } else if exponent == 0x1f {
-        // The all-ones exponent is not a binade. Widening it arithmetically lands on 65536, which
-        // is a plausible-looking number and the wrong one; and 65536 encodes back to this same
-        // pattern, so a round-trip test cannot tell the difference.
-        if significand == 0 {
-            f32::INFINITY
-        } else {
-            f32::from_bits(0x7f80_0000 | (significand << 13))
-        }
-    } else {
-        f32::from_bits(((exponent + 112) << 23) | (significand << 13))
-    };
-    if negative {
-        -magnitude
-    } else {
-        magnitude
-    }
-}
-
 /// `value >> shift`, rounded to nearest with ties going to the even result.
 fn round_shift_right_ties_even(value: u32, shift: u32) -> u32 {
     let truncated = value >> shift;
@@ -93,7 +63,26 @@ fn round_shift_right_ties_even(value: u32, shift: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{f16_bits_to_f32, f32_to_f16_bits};
+    use super::f32_to_f16_bits;
+
+    /// The exact `f32` value of a binary16 bit pattern. Every finite `half` is exactly
+    /// representable as an `f32`, so this is a widening with no rounding of its own.
+    fn f16_bits_to_f32(bits: u16) -> f32 {
+        let negative = bits & 0x8000 != 0;
+        let exponent = ((bits >> 10) & 0x1f) as u32;
+        let significand = (bits & 0x03ff) as u32;
+        let magnitude = if exponent == 0 {
+            // Subnormal: significand * 2^-24, exact in `f32`.
+            (significand as f32) * (2.0f32).powi(-24)
+        } else {
+            f32::from_bits(((exponent + 112) << 23) | (significand << 13))
+        };
+        if negative {
+            -magnitude
+        } else {
+            magnitude
+        }
+    }
 
     /// Every finite `half`, widened and encoded again, must come back unchanged.
     ///

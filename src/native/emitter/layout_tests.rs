@@ -4,8 +4,8 @@
 //! `Emitter` (module context / `resolve_type`) rather than an `LlModule`:
 //!
 //! - `Emitter::raw_type_size_align` → the "Raw" `LayoutRule` (LLVM vector allocation size and
-//!   source ABI alignment, arrays taking their element's alignment; a `Result` that ERRORS — not
-//!   `None` — on odd-width ints / `Void`).
+//!   source ABI alignment, arrays floor align at 4; a `Result` that ERRORS — not `None` — on
+//!   odd-width ints / `Void`).
 //! - `bitcast_width` / `Emitter::vector_total_bits` → the bit-width helpers used to decide when
 //!   two types are a byte-identical `OpBitcast` reinterpret. These are NOT size/align calculators
 //!   (they return bit counts, not `(size, align)`), so they are pinned here but are not folded
@@ -29,7 +29,7 @@ fn vec(elem: LlType, lanes: u32) -> LlType {
 }
 
 #[test]
-fn raw_rule_pads_vec3_and_keeps_element_array_align() {
+fn raw_rule_pads_vec3_and_floors_array_align() {
     // "Raw" (`raw_type_size_align`): same padded shape as the Memcpy rule (vec3 = 16/16), a
     // `Result` return, and explicit standard-width int buckets.
     let e = emitter();
@@ -48,10 +48,8 @@ fn raw_rule_pads_vec3_and_keeps_element_array_align() {
     assert_eq!(raw(&vec(LlType::Float, 2)), (8, 8));
     assert_eq!(raw(&vec(LlType::Float, 3)), (16, 16));
     assert_eq!(raw(&vec(LlType::Float, 4)), (16, 16));
-    // an array takes its ELEMENT's alignment: a byte array stays byte-aligned, and array of vec3
-    // strides at the padded 16
+    // array of scalars floors align at 4; array of vec3 strides at the padded 16
     assert_eq!(raw(&LlType::Array(Box::new(LlType::Float), 3)), (12, 4));
-    assert_eq!(raw(&LlType::Array(Box::new(LlType::Int(8)), 11)), (11, 1));
     assert_eq!(
         raw(&LlType::Array(Box::new(vec(LlType::Float, 3)), 2)),
         (32, 16)
@@ -59,17 +57,6 @@ fn raw_rule_pads_vec3_and_keeps_element_array_align() {
     // struct { i8, float }: i8@0, float@4 (align 4), total 8
     assert_eq!(
         raw(&LlType::Struct(vec![LlType::Int(8), LlType::Float])),
-        (8, 4)
-    );
-    // Metal's packed spelling: `<{ i8, [3 x i8], i32 }>` writes its padding out as a byte array, so
-    // the i32 behind it lands at 4. A four-byte floor on the pad would push it to 8 and grow the
-    // struct to 12.
-    assert_eq!(
-        raw(&LlType::Struct(vec![
-            LlType::Int(8),
-            LlType::Array(Box::new(LlType::Int(8)), 3),
-            LlType::Int(32),
-        ])),
         (8, 4)
     );
 }

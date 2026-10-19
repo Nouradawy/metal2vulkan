@@ -86,7 +86,15 @@ pub(in crate::passes) fn resolve_composite_insert_path(
     }
 }
 
-pub(in crate::passes) use crate::passes::resources::literal_path;
+pub(in crate::passes) fn literal_path(operands: &[Operand]) -> Vec<u32> {
+    operands
+        .iter()
+        .filter_map(|operand| match operand {
+            Operand::LiteralBit32(value) => Some(*value),
+            _ => None,
+        })
+        .collect()
+}
 
 pub(in crate::passes) fn value_inst(ctx: &Ctx, value: Word) -> Option<&Instruction> {
     ctx.module
@@ -167,140 +175,57 @@ pub(in crate::passes) fn image_is_storage(ctx: &Ctx, img: Word) -> bool {
     matches!(def.operands.get(5), Some(Operand::LiteralBit32(2)))
 }
 
-/// What an image operand is about to be used AS, which decides which bindings could possibly be the
-/// one a lost handle names. See [`recovered_image_for_private_operand`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::passes) enum ImageOperandUse {
-    /// Sampled or read through a sampled binding: a non-storage, non-null image.
-    Sampled,
-    /// Written or atomically updated: a storage image.
-    Storage,
-    /// Queried for size, level or sample count, which either binding can answer.
-    Query,
-}
-
-/// The texture SHAPE an AIR texture intrinsic's symbol states: the dimensionality token that
-/// follows its `_texture_` or `_depth_` marker, and whether that token is arrayed.
-///
-/// The symbol is stable AIR ABI -- `air.write_texture_2d_array.v4f32` says "arrayed 2D" no matter
-/// what the operand's side-table entry survived as -- so this is the shape any image standing in for
-/// a lost operand has to be able to address. `None` for an intrinsic that names no texture shape.
-pub(in crate::passes) fn intrinsic_texture_shape(name: &str) -> Option<(Dim, bool)> {
-    let tail = ["_texture_", "_depth_"]
-        .iter()
-        .find_map(|marker| name.rfind(marker).map(|at| &name[at + marker.len()..]))?;
-    let token = tail.split('.').next()?;
-    // Longest first: `2d_array` must not be read as `2d` with an `_array` modifier after it.
-    for (candidate, dim, arrayed) in [
-        ("cube_array", Dim::DimCube, true),
-        ("buffer_1d", Dim::DimBuffer, false),
-        ("1d_array", Dim::Dim1D, true),
-        ("2d_array", Dim::Dim2D, true),
-        ("buffer", Dim::DimBuffer, false),
-        ("cube", Dim::DimCube, false),
-        ("1d", Dim::Dim1D, false),
-        ("2d", Dim::Dim2D, false),
-        ("3d", Dim::Dim3D, false),
-    ] {
-        let Some(rest) = token.strip_prefix(candidate) else {
-            continue;
-        };
-        // Anything left is a modifier on that shape (`_grad`, `_ms`), not a different shape.
-        if rest.is_empty() || rest.starts_with('_') {
-            return Some((dim, arrayed));
-        }
-    }
-    None
-}
-
-/// True when this operand is the placeholder for a texture argument the variant declares no slot
-/// for.
-///
-/// `Ctx::variant_absent_texture_values` holds the placeholder VARIABLES; an operand reaches a
-/// lowering either as the variable itself or as the value loaded from it.
-pub(in crate::passes) fn operand_is_variant_absent_texture(ctx: &Ctx, img: Word) -> bool {
-    if ctx.variant_absent_texture_values.contains(&img) {
-        return true;
-    }
-    value_inst(ctx, img).is_some_and(|inst| {
-        inst.class.opcode == Op::Load
-            && matches!(inst.operands.first(),
-                Some(Operand::IdRef(pointer)) if ctx.variant_absent_texture_values.contains(pointer))
-    })
-}
-
-/// The image a Private placeholder texture operand stands for, or `None` when nothing may stand in
-/// and the operand has to be treated as the ABSENT resource it looks like.
-///
-/// Helper wrappers can store a texture inside a Function aggregate and load it again from a callee.
-/// The native emitter models Function pointer fields as integer storage, so if field replay misses
-/// the cross-function case, the inlined operation sees a Private zero pointer. When metadata
-/// produced exactly one binding this operation could possibly mean, that binding is the operand.
-///
-/// THREE conditions, not one. "Exactly one candidate" alone is not evidence, because a Private
-/// placeholder is ALSO what a texture this pipeline variant does not declare looks like (see
-/// `meta::variant_texture_slot`).
-///
-/// The first two conditions are about the CANDIDATE, and they only cover the case where the absent
-/// argument is a differently shaped alternative of the live one. Recovering a `texture2d_array`
-/// write onto the module's only `texture2d` binding writes through a coordinate that cannot address
-/// it; recovering a cube sample onto a 2D binding samples the wrong texture through a sampled-image
-/// type that does not match. So the candidate must have the shape the intrinsic's own symbol
-/// states.
-///
-/// The third is about the OPERAND, and it is the one that covers the rest: where the live binding
-/// happens to have exactly the shape the absent argument had, no fact about the candidate can tell
-/// them apart, and standing it in reads and writes a texture the shader never named. Only the
-/// parameter binding knows which placeholder is which, so it records the ones it creates for a
-/// `VariantAbsentTexture` argument and [`operand_is_variant_absent_texture`] asks.
-///
-/// And the candidate has to REACH this call. The one binding is an SSA image value -- the result of
-/// the load that bound it -- and that load sits in whichever block first needed it. Standing it in
-/// for an operand in a block the load does not dominate emits an `OpSampledImage` (or read, or
-/// write) over a definition that does not reach the use, which the owned-construction contract
-/// rejects and which a later pass can turn into a dangling id by deleting the defining block. An
-/// operand whose only candidate is out of reach stays absent, and the absent-resource contract
-/// answers it.
-pub(in crate::passes) fn recovered_image_for_private_operand(
+pub(in crate::passes) fn single_storage_image_for_private_write(
     ctx: &Ctx,
     img: Word,
-    name: &str,
-    use_as: ImageOperandUse,
 ) -> Option<Word> {
-    if !texture_operand_is_absent(ctx, img) {
+    // Helper wrappers can store a write texture inside a Function aggregate and load it again from a
+    // callee. The native emitter models Function pointer fields as integer storage, so if field replay
+    // misses the cross-function case, the inlined write sees a Private zero pointer. When metadata
+    // still produced exactly one storage-image binding, that binding is the only legal write target.
+    if !texture_operand_is_private_pointer(ctx, img) || ctx.image_storage.len() != 1 {
         return None;
     }
-    // A placeholder standing in for a texture the variant does not declare is not a lost handle.
-    // It is the absent resource itself, and the absent-resource contract below answers it.
-    if operand_is_variant_absent_texture(ctx, img) {
+    ctx.image_storage.iter().copied().next()
+}
+
+pub(in crate::passes) fn single_image_for_private_query(ctx: &Ctx, img: Word) -> Option<Word> {
+    // Texture size/level/sample queries carry no access-mode suffix, so a helper-wrapper private
+    // placeholder is recoverable only when the interface has exactly one real image binding total.
+    if !texture_operand_is_private_pointer(ctx, img) {
         return None;
     }
-    let mut candidates: Box<dyn Iterator<Item = Word> + '_> =
-        match use_as {
-            // A storage binding is tracked by `image_storage` itself; the other two are every image
-            // binding the interface produced, minus the translator's own synthesized null images.
-            ImageOperandUse::Storage => Box::new(ctx.image_storage.iter().copied()),
-            ImageOperandUse::Sampled => Box::new(ctx.image_dims.keys().copied().filter(|id| {
-                !ctx.image_storage.contains(id) && !ctx.null_image_values.contains(id)
-            })),
-            ImageOperandUse::Query => Box::new(
-                ctx.image_dims
-                    .keys()
-                    .copied()
-                    .filter(|id| !ctx.null_image_values.contains(id)),
-            ),
-        };
+    let mut candidates = ctx
+        .image_dims
+        .keys()
+        .copied()
+        .filter(|id| !ctx.null_image_values.contains(id));
     let candidate = candidates.next()?;
     if candidates.next().is_some() {
         return None;
     }
-    drop(candidates);
-    if !ctx.dominates_air_call_site(candidate) {
+    Some(candidate)
+}
+
+pub(in crate::passes) fn single_sampled_image_for_private_read(
+    ctx: &Ctx,
+    img: Word,
+) -> Option<Word> {
+    // Same helper-wrapper failure mode as writes, but for a sampled/read texture operand. Keep this
+    // to the unambiguous case: exactly one non-storage, non-null image binding exists.
+    if !texture_operand_is_private_pointer(ctx, img) {
         return None;
     }
-    let (dim, arrayed) = intrinsic_texture_shape(name)?;
-    let (candidate_dim, candidate_arrayed, _) = image_shape_or_recorded(ctx, candidate);
-    (candidate_dim == dim && candidate_arrayed == arrayed).then_some(candidate)
+    let mut candidates = ctx
+        .image_dims
+        .keys()
+        .copied()
+        .filter(|id| !ctx.image_storage.contains(id) && !ctx.null_image_values.contains(id));
+    let candidate = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(candidate)
 }
 
 pub(in crate::passes) fn describe_value(ctx: &Ctx, value: Word) -> String {
@@ -333,22 +258,6 @@ pub(in crate::passes) fn store_count(ctx: &Ctx, pointer: Word) -> usize {
         .count()
 }
 
-/// True when a texture operand names no bound image.
-///
-/// Two shapes reach a texture lowering. The Private placeholder itself -- this translator's
-/// representation of a resource the pipeline does not provide -- and the `OpConstantNull` that
-/// placeholder's VALUE is, once [`resolve_image_value`] has walked the load through to what was
-/// stored. They are the same fact about the same argument, and recognizing only the first left the
-/// second to be lowered as though it were an image: an `air.get_array_size_texture_2d_array` on it
-/// took the default non-arrayed 2D shape and refused, and a sample on it built a sampled-image type
-/// around a null constant.
-pub(in crate::passes) fn texture_operand_is_absent(ctx: &Ctx, img: Word) -> bool {
-    if texture_operand_is_private_pointer(ctx, img) {
-        return true;
-    }
-    value_inst(ctx, img).is_some_and(|inst| inst.class.opcode == Op::ConstantNull)
-}
-
 pub(in crate::passes) fn texture_operand_is_private_pointer(ctx: &Ctx, img: Word) -> bool {
     let Some(ty) = value_result_type(ctx, img) else {
         return false;
@@ -372,55 +281,11 @@ pub(in crate::passes) fn value_is_pointer(ctx: &Ctx, value: Word) -> bool {
         .unwrap_or(false)
 }
 
-/// The result of a texture operation whose image operand is an ABSENT resource: zero, and an
-/// undefined "was it resident" flag for the struct-returning forms.
-///
-/// Metal gives a texture operation on a resource the pipeline does not provide a zero result, and a
-/// `[[function_constant]]`-gated texture whose constant is off is exactly that resource. The
-/// operand reaches here as a Private placeholder because no descriptor was bound for it.
-///
-/// A placeholder is NOT proof of absence, though — it is also what an argument-buffer resource this
-/// translator failed to surface looks like. Where the module declares such a resource, answering
-/// zero is a shader that silently samples black in a module that validates and binds cleanly, so
-/// refuse there instead. See `meta::embedded::unsurfaced_embedded_resources`.
-/// Refuse to answer an absent-resource texture operation while the module declares a resource the
-/// argument-buffer walk did not surface.
-///
-/// A Private placeholder is the translator's representation of a resource the pipeline does not
-/// provide, but it is ALSO what an argument-buffer handle this walk missed looks like. Where the
-/// module declares one of those, "absent" is not a fact, and answering as though it were produces a
-/// shader that silently reads black or drops a store in a module that validates and binds cleanly.
-/// See `meta::embedded::unsurfaced_embedded_resources`.
-fn absent_texture_operand_is_certain(ctx: &Ctx) -> Result<(), String> {
-    match ctx.unsurfaced_embedded_resources.first() {
-        None => Ok(()),
-        Some(declared) => Err(format!(
-            "texture operand resolved to no image, and this module declares a resource the argument-buffer \
-             walk does not surface ({declared}), so an absent-resource zero result cannot be \
-             distinguished from a resource that was missed"
-        )),
-    }
-}
-
-/// A texture WRITE whose image operand is an ABSENT resource: nothing at all.
-///
-/// This is the store half of [`lower_null_texture_result`]'s contract, and the same Metal rule:
-/// a texture operation on a resource the pipeline does not provide reads zero and stores nowhere. A
-/// `[[function_constant]]`-gated texture the variant leaves out is exactly that resource, and its
-/// `air.location_index` is a running sum that names a LIVE texture's slot (see
-/// `meta::variant_texture_slot`) -- so the alternative to dropping the store is not "store
-/// somewhere harmless", it is "overwrite the texture the pipeline did bind".
-pub(in crate::passes) fn lower_absent_texture_write(ctx: &Ctx) -> Result<Vec<Instruction>, String> {
-    absent_texture_operand_is_certain(ctx)?;
-    Ok(vec![])
-}
-
 pub(in crate::passes) fn lower_null_texture_result(
     ctx: &mut Ctx,
     res: Word,
     rty: Word,
 ) -> Result<Vec<Instruction>, String> {
-    absent_texture_operand_is_certain(ctx)?;
     let rdef = type_def_of(ctx, rty);
     let is_struct = rdef
         .as_ref()
@@ -458,11 +323,15 @@ pub(in crate::passes) fn lower_null_texture_result(
     )])
 }
 
-/// One null per type, not one per call. `OpConstantNull` has no operands, so a per-call `fresh_id`
-/// mints a byte-identical global every time -- ten call sites across the image lowerings share this
-/// helper, and one corpus module ended up with 33 `OpConstantNull %v4float` where one would do.
 pub(in crate::passes) fn const_null_of(ctx: &mut Ctx, ty: Word) -> Word {
-    ctx.get_or_create(Op::ConstantNull, Some(ty), vec![])
+    let id = ctx.module.fresh_id();
+    ctx.new_globals.push(Instruction::new(
+        Op::ConstantNull,
+        Some(ty),
+        Some(id),
+        vec![],
+    ));
+    id
 }
 
 pub(in crate::passes) fn coerce_same_shape_integer(
@@ -701,12 +570,19 @@ pub(in crate::passes) fn const_inst(ctx: &Ctx, value: Word) -> Option<&Instructi
 pub(in crate::passes) fn const_sint_vec(ctx: &mut Ctx, values: &[i32]) -> Word {
     let ty = ctx.ty_vec_sint(values.len() as u32);
     let int_ty = ctx.ty_sint();
-    let constituents = values
+    let operands = values
         .iter()
         .copied()
-        .map(|value| ctx.const_int_of(int_ty, value as i64))
+        .map(|value| Operand::IdRef(ctx.const_int_of(int_ty, value as i64)))
         .collect();
-    ctx.const_composite(ty, constituents)
+    let id = ctx.module.fresh_id();
+    ctx.new_globals.push(Instruction::new(
+        Op::ConstantComposite,
+        Some(ty),
+        Some(id),
+        operands,
+    ));
+    id
 }
 
 /// The v4 vector type an OpImageFetch/OpImageSample on image `img` must produce: v4uint / v4int for an
@@ -834,245 +710,4 @@ pub(in crate::passes) fn build_sample_coord(
         _ => return Err("air.sample_texture unsupported arrayed dimension".into()),
     };
     build_arrayed_sample_coord(ctx, spatial, coord, layer_i, out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Every AIR texture-intrinsic FAMILY the local corpus contains, so the shape a recovered image
-    /// operand is checked against is read from the same symbol AIR uses to define the call's ABI.
-    /// A family that stops parsing here stops CHECKING there, silently: `None` means "no expectation"
-    /// at the parse site and "no recovery" at the use site, and the difference between those two is
-    /// a wrong texture rather than an error.
-    #[test]
-    fn every_corpus_texture_intrinsic_family_states_its_shape() {
-        for (name, shape) in [
-            ("air.sample_texture_1d.v4f32", (Dim::Dim1D, false)),
-            ("air.sample_texture_1d_array.v4f32", (Dim::Dim1D, true)),
-            ("air.sample_texture_2d.v4f32", (Dim::Dim2D, false)),
-            ("air.sample_texture_2d_array.v4f32", (Dim::Dim2D, true)),
-            // A trailing modifier is a modifier ON a shape, not a different one.
-            ("air.sample_texture_2d_grad.v4f32", (Dim::Dim2D, false)),
-            ("air.sample_texture_3d.v4f32", (Dim::Dim3D, false)),
-            ("air.sample_texture_cube.v4f32", (Dim::DimCube, false)),
-            ("air.sample_texture_cube_array.v4f32", (Dim::DimCube, true)),
-            ("air.sample_depth_2d.f32", (Dim::Dim2D, false)),
-            ("air.sample_depth_2d_array.f32", (Dim::Dim2D, true)),
-            ("air.sample_compare_depth_2d.f32", (Dim::Dim2D, false)),
-            ("air.gather_texture_2d.v4f32", (Dim::Dim2D, false)),
-            ("air.gather_texture_2d_array.v4f32", (Dim::Dim2D, true)),
-            ("air.gather_depth_2d.v4f32", (Dim::Dim2D, false)),
-            ("air.read_texture_2d.v4f32", (Dim::Dim2D, false)),
-            ("air.read_texture_2d_array.v4f32", (Dim::Dim2D, true)),
-            ("air.read_texture_2d_ms.v4f32", (Dim::Dim2D, false)),
-            ("air.read_texture_cube.v4f32", (Dim::DimCube, false)),
-            ("air.read_depth_2d.f32", (Dim::Dim2D, false)),
-            ("air.read_depth_2d_ms.f32", (Dim::Dim2D, false)),
-            ("air.write_texture_2d.i16.v4f32", (Dim::Dim2D, false)),
-            ("air.write_texture_2d_array.v4f32", (Dim::Dim2D, true)),
-            ("air.write_texture_3d.v4f32", (Dim::Dim3D, false)),
-            ("air.write_texture_cube.v4f32", (Dim::DimCube, false)),
-            ("air.write_texture_cube_array.v4f32", (Dim::DimCube, true)),
-            (
-                "air.write_texture_buffer_1d.u.v4i32",
-                (Dim::DimBuffer, false),
-            ),
-            (
-                "air.write_imageblock_slice_to_texture_2d",
-                (Dim::Dim2D, false),
-            ),
-            (
-                "air.write_imageblock_slice_to_texture_2d_array",
-                (Dim::Dim2D, true),
-            ),
-            (
-                "air.atomic_fetch_max_explicit_texture_2d.i16.u.v4i32",
-                (Dim::Dim2D, false),
-            ),
-            ("air.get_width_texture_2d", (Dim::Dim2D, false)),
-            ("air.get_height_texture_2d_array", (Dim::Dim2D, true)),
-            ("air.get_height_texture_cube", (Dim::DimCube, false)),
-            ("air.get_depth_texture_3d", (Dim::Dim3D, false)),
-            ("air.get_array_size_texture_2d_array", (Dim::Dim2D, true)),
-            (
-                "air.get_num_mip_levels_texture_cube_array",
-                (Dim::DimCube, true),
-            ),
-            ("air.get_num_samples_texture_2d_ms", (Dim::Dim2D, false)),
-            ("air.get_width_depth_2d", (Dim::Dim2D, false)),
-            ("air.get_num_mip_levels_depth_2d", (Dim::Dim2D, false)),
-        ] {
-            assert_eq!(intrinsic_texture_shape(name), Some(shape), "{name}");
-        }
-    }
-
-    /// A module whose only sampled binding is loaded on one arm of a diamond, with an absent
-    /// (Private placeholder) texture operand on the other arm. Returns `(ctx, placeholder, load)`.
-    fn diamond_with_one_binding_loaded_on_the_second_arm() -> (Ctx, Word, Word) {
-        let mut ctx = Ctx::new(crate::spirv_module::Module::new());
-        let image_ty = ctx.ty_image(Dim::Dim2D, false, crate::passes::ImageComp::Float);
-        let private_ptr = ctx.ty_ptr(StorageClass::Private, image_ty);
-        let placeholder = ctx.module.fresh_id();
-        ctx.new_globals.push(Instruction::new(
-            Op::Variable,
-            Some(private_ptr),
-            Some(placeholder),
-            vec![Operand::StorageClass(StorageClass::Private)],
-        ));
-        let uniform_ptr = ctx.ty_ptr(StorageClass::UniformConstant, image_ty);
-        let binding = ctx.module.fresh_id();
-        ctx.new_globals.push(Instruction::new(
-            Op::Variable,
-            Some(uniform_ptr),
-            Some(binding),
-            vec![Operand::StorageClass(StorageClass::UniformConstant)],
-        ));
-        let load = ctx.module.fresh_id();
-        ctx.image_dims.insert(load, (Dim::Dim2D, false));
-
-        let labels: Vec<Word> = (0..4).map(|_| ctx.module.fresh_id()).collect();
-        let bool_ty = ctx.ty_bool();
-        let cond = ctx.module.fresh_id();
-        ctx.new_globals.push(Instruction::new(
-            Op::Undef,
-            Some(bool_ty),
-            Some(cond),
-            vec![],
-        ));
-        let mut function = crate::spirv_module::Function::new();
-        let block = |label: Word, instructions: Vec<Instruction>| crate::spirv_module::Block {
-            label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
-            instructions,
-        };
-        function.blocks.push(block(
-            labels[0],
-            vec![Instruction::new(
-                Op::BranchConditional,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(cond),
-                    Operand::IdRef(labels[1]),
-                    Operand::IdRef(labels[2]),
-                ],
-            )],
-        ));
-        // Block 1: the arm carrying the absent operand. Nothing defines the binding here.
-        function.blocks.push(block(
-            labels[1],
-            vec![Instruction::new(
-                Op::Branch,
-                None,
-                None,
-                vec![Operand::IdRef(labels[3])],
-            )],
-        ));
-        // Block 2: the arm that loads the module's only sampled binding.
-        function.blocks.push(block(
-            labels[2],
-            vec![
-                Instruction::new(
-                    Op::Load,
-                    Some(image_ty),
-                    Some(load),
-                    vec![Operand::IdRef(binding)],
-                ),
-                Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(labels[3])]),
-            ],
-        ));
-        function.blocks.push(block(
-            labels[3],
-            vec![Instruction::new(Op::Return, None, None, vec![])],
-        ));
-        ctx.module.functions.push(function);
-        (ctx, placeholder, load)
-    }
-
-    fn air_call_body(ctx: &Ctx) -> crate::passes::AirCallBody {
-        crate::passes::AirCallBody {
-            function: 0,
-            dominance: crate::passes::spirv_cfg::BlockDominance::of(
-                &ctx.module.functions[0].blocks,
-            ),
-        }
-    }
-
-    /// A recovered image operand has to REACH the call it stands in for.
-    ///
-    /// The one candidate binding is an SSA value -- the load that bound it -- sitting in whichever
-    /// block first needed it. Standing that load in for an absent operand on a sibling arm emits an
-    /// image operation over a definition that does not dominate its use: the owned-construction
-    /// contract rejects the module, and a later pass that deletes the defining block turns the
-    /// operand into a dangling id instead. Only the shape of the candidate used to be checked.
-    #[test]
-    fn a_candidate_that_does_not_reach_the_call_does_not_recover() {
-        let (mut ctx, placeholder, _) = diamond_with_one_binding_loaded_on_the_second_arm();
-        // The merge block, which the loading arm does not dominate either.
-        for block in [1, 3] {
-            ctx.air_call_body = Some(air_call_body(&ctx));
-            ctx.air_call_block = block;
-            assert_eq!(
-                recovered_image_for_private_operand(
-                    &ctx,
-                    placeholder,
-                    "air.sample_texture_2d.v4f32",
-                    ImageOperandUse::Sampled,
-                ),
-                None,
-                "block {block} is not dominated by the arm that loads the binding"
-            );
-        }
-    }
-
-    /// The guard is dominance, not "anywhere else in the body": the same single candidate still
-    /// recovers where it does reach the call, which is every recovery the corpus exercises.
-    #[test]
-    fn a_candidate_that_reaches_the_call_still_recovers() {
-        let (mut ctx, placeholder, load) = diamond_with_one_binding_loaded_on_the_second_arm();
-        ctx.air_call_body = Some(air_call_body(&ctx));
-        ctx.air_call_block = 2;
-        assert_eq!(
-            recovered_image_for_private_operand(
-                &ctx,
-                placeholder,
-                "air.sample_texture_2d.v4f32",
-                ImageOperandUse::Sampled,
-            ),
-            Some(load),
-        );
-    }
-
-    /// Outside AIR-call lowering there is no site to prove reachability against, and an unproven
-    /// substitution is the defect itself.
-    #[test]
-    fn no_call_site_recovers_nothing() {
-        let (ctx, placeholder, _) = diamond_with_one_binding_loaded_on_the_second_arm();
-        assert!(ctx.air_call_body.is_none());
-        assert_eq!(
-            recovered_image_for_private_operand(
-                &ctx,
-                placeholder,
-                "air.sample_texture_2d.v4f32",
-                ImageOperandUse::Sampled,
-            ),
-            None,
-        );
-    }
-
-    /// An intrinsic that names no texture shape must say so, rather than reporting one that then
-    /// admits a recovery it was never evidence for.
-    #[test]
-    fn an_intrinsic_that_names_no_texture_shape_states_none() {
-        for name in [
-            "air.get_num_samples",
-            "air.get_read_sampler",
-            "air.get_simdgroup_size",
-            "air.get_data_pointer_instance_acceleration_structure",
-            "air.get_function_pointer_visible_function_table",
-            "air.write_texture_7d.v4f32",
-        ] {
-            assert_eq!(intrinsic_texture_shape(name), None, "{name}");
-        }
-    }
 }

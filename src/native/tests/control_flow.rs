@@ -1,9 +1,7 @@
 #![allow(unused_imports)]
 use super::super::cfg::{
-    exceeds_local_structured_plan_budget, id_ref_operand, infer_branch_merges,
-    infer_direct_switch_merges, infer_loop_merges, infer_switch_merges,
-    infer_switch_merges_bounded, loop_forest_is_empty, lower_unstructured_switches,
-    split_body_blocks, BodyBlock, CROSS_ARM_EDGE_MAX_BLOCKS,
+    id_ref_operand, infer_branch_merges, infer_loop_merges, infer_switch_merges,
+    lower_unstructured_switches, split_body_blocks, BodyBlock,
 };
 use super::super::emit_vulkan_spirv;
 use super::super::emitter::Emitter;
@@ -265,11 +263,11 @@ b:
         failure.error
     );
     assert_eq!(
-        failure.rejected.ordinary_plan_functions,
+        failure.ordinary_plan_rejected_functions,
         HashSet::from(["k".to_string()])
     );
     assert_eq!(
-        failure.rejected.ownership_plan_functions,
+        failure.ownership_plan_rejected_functions,
         HashSet::from(["k".to_string()])
     );
 }
@@ -399,11 +397,11 @@ declare float @air.fast_fmedian3.f32(float, float, float)
     let asm = disassemble(&out).expect("disassemble transformed");
     let fmax_count = asm
         .lines()
-        .filter(|line| line.contains("OpExtInst") && line.contains(" FMax "))
+        .filter(|line| line.contains("OpExtInst") && line.contains(" NMax "))
         .count();
     let fmin_count = asm
         .lines()
-        .filter(|line| line.contains("OpExtInst") && line.contains(" FMin "))
+        .filter(|line| line.contains("OpExtInst") && line.contains(" NMin "))
         .count();
     assert_eq!(fmax_count, 4, "{asm}");
     assert_eq!(fmin_count, 4, "{asm}");
@@ -5089,183 +5087,4 @@ entry:
         "i24 and i32 share one emitted storage type:\n{asm}"
     );
     tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
-}
-
-/// A CFG the local structured planner declines for *branching density* still gets the complete
-/// switch-merge inference. `exceeds_local_structured_plan_budget` bounds repeated per-header
-/// ownership planning, which is not what `infer_switch_merges` costs — that cost is the candidate
-/// scan, and it is bounded by block count. Downgrading to the direct-edge subset here leaves the
-/// switch without a merge and sends the whole module to raw-buffer construction, so the bound has to
-/// be the block count both fallbacks already agree on.
-#[test]
-fn dense_small_cfg_keeps_complete_switch_merge_inference() {
-    let mut ll = String::from(
-        "define void @dense(i1 %c, i32 %sel) {\n\
-         entry:\n\
-         \x20 switch i32 %sel, label %d [\n\
-         \x20   i32 0, label %a\n\
-         \x20   i32 1, label %b\n\
-         \x20 ]\n\
-         a:\n\
-         \x20 br label %a2\n\
-         a2:\n\
-         \x20 br label %merge\n\
-         b:\n\
-         \x20 br label %b2\n\
-         b2:\n\
-         \x20 br label %merge\n\
-         d:\n\
-         \x20 br label %merge\n\
-         merge:\n\
-         \x20 br label %n0\n",
-    );
-    // 45 diamonds: 99 blocks (under the 128-block ceiling) with 45 branching headers, so the
-    // block-count term admits the graph and only the density term rejects it.
-    const DIAMONDS: usize = 45;
-    for i in 0..DIAMONDS {
-        ll.push_str(&format!(
-            "n{i}:\n  br i1 %c, label %t{i}, label %n{next}\nt{i}:\n  br label %n{next}\n",
-            next = i + 1
-        ));
-    }
-    ll.push_str(&format!("n{DIAMONDS}:\n  ret void\n}}\n"));
-
-    let blocks = super::super::ir::LlModule::parse(&ll)
-        .expect("parse")
-        .functions
-        .into_iter()
-        .find(|function| function.name == "dense")
-        .expect("dense function")
-        .blocks;
-
-    assert!(
-        exceeds_local_structured_plan_budget(&blocks),
-        "the density term must be what declines this graph: {} blocks",
-        blocks.len()
-    );
-    assert!(blocks.len() <= CROSS_ARM_EDGE_MAX_BLOCKS);
-    assert_eq!(
-        infer_direct_switch_merges(&blocks).get("%entry"),
-        None,
-        "arms reconverge through an intermediate block, so the direct subset proves nothing",
-    );
-    assert_eq!(
-        infer_switch_merges_bounded(&blocks).get("%entry"),
-        Some(&"%merge".to_string()),
-    );
-}
-
-/// Above `CROSS_ARM_EDGE_MAX_BLOCKS` the bounded inference is still the linear direct subset: that
-/// is the bound the complete candidate scan actually costs against.
-#[test]
-fn oversized_cfg_keeps_the_direct_switch_merge_subset() {
-    let mut ll = String::from(
-        "define void @wide(i32 %sel) {\n\
-         entry:\n\
-         \x20 switch i32 %sel, label %d [\n\
-         \x20   i32 0, label %a\n\
-         \x20   i32 1, label %b\n\
-         \x20 ]\n\
-         a:\n\
-         \x20 br label %a2\n\
-         a2:\n\
-         \x20 br label %merge\n\
-         b:\n\
-         \x20 br label %b2\n\
-         b2:\n\
-         \x20 br label %merge\n\
-         d:\n\
-         \x20 br label %merge\n\
-         merge:\n\
-         \x20 br label %p0\n",
-    );
-    let pad = CROSS_ARM_EDGE_MAX_BLOCKS + 1;
-    for i in 0..pad {
-        ll.push_str(&format!("p{i}:\n  br label %p{next}\n", next = i + 1));
-    }
-    ll.push_str(&format!("p{pad}:\n  ret void\n}}\n"));
-
-    let blocks = super::super::ir::LlModule::parse(&ll)
-        .expect("parse")
-        .functions
-        .into_iter()
-        .find(|function| function.name == "wide")
-        .expect("wide function")
-        .blocks;
-
-    assert!(blocks.len() > CROSS_ARM_EDGE_MAX_BLOCKS);
-    assert_eq!(
-        infer_switch_merges_bounded(&blocks),
-        infer_direct_switch_merges(&blocks),
-    );
-    assert_eq!(infer_switch_merges_bounded(&blocks).get("%entry"), None);
-}
-
-/// Build a CFG that only the *density* term of `exceeds_local_structured_plan_budget` declines: one
-/// conditional whose arms reconverge two hops apart, then `DIAMONDS` two-way diamonds. `back_edge`
-/// closes the chain into a natural loop without changing the block count.
-#[cfg(test)]
-fn dense_diamond_chain(back_edge: bool) -> Vec<BodyBlock> {
-    const DIAMONDS: usize = 45;
-    let mut ll = String::from(
-        "define void @dense(i1 %c) {\n\
-         entry:\n\
-         \x20 br i1 %c, label %a, label %b\n\
-         a:\n\
-         \x20 br label %a2\n\
-         a2:\n\
-         \x20 br label %join\n\
-         b:\n\
-         \x20 br label %b2\n\
-         b2:\n\
-         \x20 br label %join\n\
-         join:\n\
-         \x20 br label %n0\n",
-    );
-    for i in 0..DIAMONDS {
-        ll.push_str(&format!(
-            "n{i}:\n  br i1 %c, label %t{i}, label %n{next}\nt{i}:\n  br label %n{next}\n",
-            next = i + 1
-        ));
-    }
-    ll.push_str(&if back_edge {
-        format!("n{DIAMONDS}:\n  br i1 %c, label %n0, label %exit\nexit:\n  ret void\n}}\n")
-    } else {
-        format!("n{DIAMONDS}:\n  ret void\n}}\n")
-    });
-    super::super::ir::LlModule::parse(&ll)
-        .expect("parse")
-        .functions
-        .into_iter()
-        .find(|function| function.name == "dense")
-        .expect("dense function")
-        .blocks
-}
-
-/// A loop-free CFG the local planner declined for branching density still gets the complete
-/// branch-merge inference. Like the switch case above, `infer_branch_merges` costs the candidate
-/// scan, not the per-header ownership planning the budget was bounding.
-#[test]
-fn loop_free_dense_cfg_keeps_complete_branch_merge_inference() {
-    let blocks = dense_diamond_chain(false);
-    assert!(exceeds_local_structured_plan_budget(&blocks));
-    assert!(blocks.len() <= CROSS_ARM_EDGE_MAX_BLOCKS);
-    assert!(loop_forest_is_empty(&blocks));
-    assert_eq!(
-        infer_branch_merges(&blocks).get(&("%a".to_string(), "%b".to_string())),
-        Some(&"%join".to_string()),
-        "arms reconverge two hops apart, so only the complete inference proves the merge",
-    );
-}
-
-/// The same CFG with one back edge keeps the bounded header subset. The skip path clears
-/// `loop_merges` because the block order was never structurized, so handing the emitter selection
-/// merges for a CFG that also has loop constructs describes only half the construct tree -- measured
-/// as two modules that stopped translating at all until this gate was added.
-#[test]
-fn a_loop_in_a_dense_cfg_declines_the_complete_branch_merge_inference() {
-    let blocks = dense_diamond_chain(true);
-    assert!(exceeds_local_structured_plan_budget(&blocks));
-    assert!(blocks.len() <= CROSS_ARM_EDGE_MAX_BLOCKS);
-    assert!(!loop_forest_is_empty(&blocks));
 }

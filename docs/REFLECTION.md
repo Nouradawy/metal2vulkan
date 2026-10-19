@@ -43,8 +43,7 @@ Other entry points:
 | `translate_reflected` / `translate_reflected_with_options` | Path to `.air` or `.ll` + stage |
 | `translate_sanitized_native_reflected` | You already have sanitized LLVM IR text and `TransformOptions` |
 | `reflect_sanitized` | You need metadata for link-time tooling even when executable translation is not yet possible; buffer footprints remain absent, and the `BufferAddressTable` binding is predicted rather than read off a module (it can be reported for a module that declares none, or missed for one that does) |
-| `translate_sanitized_native_specialized_reflected_with_options` / `..._linked_specialized_reflected_with_options` | You are BINDING a function-constant-specialized (and possibly linked) module and need the reflection of that exact module |
-| `reflect_sanitized_specialized` | You need metadata for exact function-constant values that can select resources or outputs; buffer footprints remain absent, and the texture shape, `BufferAddressTable` binding, and synthesized placeholder descriptors are the same AIR-text approximations `reflect_sanitized` documents above |
+| `reflect_sanitized_specialized` | You need metadata for exact function-constant values that can select resources or outputs; buffer footprints remain absent |
 | `ShaderReflection::from_{fragment,vertex,kernel}` | You already have `meta::{Frag,Vert,Kern}Meta`; IR-derived fields and buffer footprints remain absent |
 
 Path-based optional transforms use `translate_reflected_with_options`. The sanitized reflected
@@ -73,7 +72,7 @@ metal2vulkan = { version = "0.1", features = ["serde"] }
 ```
 
 `ShaderReflection` and its nested types derive `Serialize`/`Deserialize` under that feature. The
-current `REFLECTION_VERSION` is `49`. Serialized Rust enums use serde's externally tagged default:
+current `REFLECTION_VERSION` is `39`. Serialized Rust enums use serde's externally tagged default:
 unit variants are strings (for example `"Unbounded"`), while data variants are objects (for example
 `{ "Object": { "bytes": 288 } }`). Optional fields serialize as `null`.
 
@@ -143,6 +142,12 @@ reads. A fixed `array<texture..., N>` therefore reports `N`; only a runtime `arr
 whose length is a function constant rather than part of the type name, reports the descriptor-ABI
 capacity (`TEXTURE_HANDLE_ARRAY_DESCRIPTOR_COUNT`, 128) and expects `descriptorBindingPartiallyBound`
 or 128 valid descriptors.
+
+Reflection lists every resource the Metal function declares, but the module declares only the
+`texture`/`sampler` descriptors its code consumes: a parameter the function never samples, reads,
+or writes has no variable, `Binding` decoration, or interface entry in the SPIR-V. A layout built
+from reflection may therefore contain a binding the module omits; that is valid, and nothing needs
+to be bound there.
 
 Descriptor types for `bindings`:
 
@@ -287,15 +292,6 @@ other rooted dereference the affine schema cannot prove. When true, consumers mu
 caller-provided window; the other entries remain useful diagnostics but do not authorize narrowing.
 When false, the union of the static and bounded strided ranges is a conservative staging footprint.
 
-A reflected descriptor the finished module never declares is a special case, because there is no
-variable to walk. Whether its absence proves anything is a property of the module's ADDRESSING
-MODEL, not of what AIR declared about the buffer: under `Logical` addressing every access reaches
-memory through a declared variable, so a binding with no variable executes zero bytes and its
-footprint is bounded and empty. A module that lowered any pointer to a device address carries
-`PhysicalStorageBuffer64`, and there a `PhysicalStorageBuffer` access can reach a buffer that has no
-descriptor, so the footprint stays unbounded. `access` is unaffected either way — it is the declared
-classification widened by what the module was seen doing, and there is nothing to widen it with.
-
 Pointer-select/phi alternatives are analyzed structurally across every descriptor arm. To preserve
 the per-translation memory bound, an adversarial expression with more than 4096 address alternatives
 is compressed to one unbounded result per affected binding rather than allowed to grow
@@ -400,28 +396,6 @@ Successful reflected translation records the applied states in
 `None` for `Unknown`; the corresponding binding's `texture_shape.storage_format` reports the same
 choice. Create the image view and descriptor from the same runtime state used for translation.
 
-### Nil texture bindings are resolved at translation time
-
-Metal decides whether a texture slot is nil when the encoder binds, and `air.is_null_texture_*`
-observes that decision at run time. A Logical SPIR-V module has no equivalent query: a descriptor
-either exists in the module or it does not, and nothing in the shader can ask the host what it
-bound. Translation therefore answers the predicate from the module it is building.
-
-A texture argument that translation surfaces as a descriptor answers `false`. The predicate answers
-`true` only for a handle translation itself synthesized (`air.get_null_texture_*`, reported as
-`SynthesizedNullTexture`) or for an argument the module does not surface at all — for example a
-function-constant-gated argument the selected variant disables. Reads through an absent handle fold
-to zero and writes through one are dropped, matching Metal's contract for an unbound resource.
-
-**Consequence for the consumer:** a translated module COMMITS to "this slot is bound". Binding nil to
-that Metal index at run time does not take the shader's nil branch; the shader reads whatever the
-descriptor holds. If a pipeline can leave the slot nil, that is a second pipeline configuration and
-needs its own translation, in the same way a different runtime sampler or storage-image format does.
-
-Measured over the 14,579-source local corpus: 583 sources name `air.is_null_texture_*`, and 581 of
-them contain no `air.get_null_texture_*` handle at all — so for those the predicate is entirely a
-question about host binding, and translation answers it as "bound".
-
 ## Typical consumer flow
 
 1. Call `translate_reflected` (or a serde-enabled CLI with `--emit-meta`).
@@ -466,8 +440,6 @@ question about host binding, and translation answers it as "bound".
 | `metal2vulkan::reflect_sanitized_specialized` | Reflect the same function-constant-specialized AIR resource contract used by translation |
 | `metal2vulkan::translate_sanitized_native_specialized_with_options` | Translate exact-width scalar/vector FC payloads before structural lowering |
 | `metal2vulkan::translate_sanitized_native_linked_specialized_with_options` | Apply the same AIR-level specialization after authored linkage resolution |
-| `metal2vulkan::translate_sanitized_native_specialized_reflected_with_options` | Translate FC payloads AND get the reflection of the module you are about to bind |
-| `metal2vulkan::translate_sanitized_native_linked_specialized_reflected_with_options` | The same, after authored linkage resolution |
 | `metal2vulkan::specialize_function_constant_bytes` | Repoint FC initializers only in an already emitted module that retained the complete specialized structure |
 
 Unit coverage for binding numbers lives in `src/reflect/tests.rs` (the default ABI uses set 0, bases
@@ -480,6 +452,3 @@ separately).
   descriptor/type/value graph required for conservative buffer footprints.
 - Not a substitute for `spirv-val` or runtime pipeline creation.
 - Not populated for passthrough vertex generation (`translate_passthrough`).
-- Not a description of run-time binding choices. `air.is_null_texture_*` is resolved when the module
-  is built, not when the encoder binds — see *Nil texture bindings are resolved at translation
-  time*.

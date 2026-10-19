@@ -26,7 +26,6 @@ fn prune_constant_branches_impl(
     sweep_dead_values: bool,
 ) -> bool {
     let scalar_int_types = scalar_int_bool_types(module);
-    let lane_conditions = bool_vector_valued_ids(module);
     let consts = module_scalar_constants(module, &scalar_int_types);
     let widths = value_int_widths(module);
     let composites = module_composite_constants(module, &scalar_int_types, &consts);
@@ -67,8 +66,6 @@ fn prune_constant_branches_impl(
             for (g, v) in guards {
                 vals.entry(g).or_insert(v);
             }
-            changed |=
-                collapse_constant_selects(&mut module.functions[fi], &vals, &lane_conditions);
             if sweep_dead_values {
                 changed |= fold_branches(&mut module.functions[fi], &vals);
                 changed |= prune_unreachable(&mut module.functions[fi]);

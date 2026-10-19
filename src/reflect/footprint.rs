@@ -19,9 +19,9 @@ const MAX_ADDRESS_ALTERNATIVES_PER_POINTER: usize = 4096;
 const MAX_FOOTPRINT_RECORDS_PER_BINDING: usize = 16_384;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(super) struct DescriptorKey {
-    pub(super) set: u32,
-    pub(super) binding: u32,
+struct DescriptorKey {
+    set: u32,
+    binding: u32,
 }
 
 impl From<DescriptorLocation> for DescriptorKey {
@@ -130,7 +130,7 @@ struct MatrixLayout {
     row_major: bool,
 }
 
-pub(super) struct Analyzer<'a> {
+struct Analyzer<'a> {
     module: &'a Module,
     definitions: HashMap<Word, &'a Instruction>,
     value_types: HashMap<Word, Word>,
@@ -158,9 +158,6 @@ pub(super) fn attach_buffer_footprints(
 
     let mut analyzer = Analyzer::new(module, &target_bindings);
     let analysis = analyzer.analyze();
-    // Under the Logical addressing model every access reaches memory through a declared variable,
-    // so a descriptor the finished module never declares executes exactly zero bytes.
-    let logical_addressing = addressing_is_logical(module);
 
     for binding in &mut reflection.bindings {
         if !binding_supports_footprint(binding) {
@@ -170,37 +167,16 @@ pub(super) fn attach_buffer_footprints(
             continue;
         };
         let key = DescriptorKey::from(descriptor);
-        let Some(footprint) = analysis.footprints.get(&key).cloned() else {
-            // A descriptor missing from the finished module is unreachable exactly when the module
-            // cannot reach memory any other way. That is a property of the module, not of what AIR
-            // declared about the buffer: under Logical addressing there are no `PhysicalStorageBuffer`
-            // pointers, so a binding with no variable executes zero bytes however it was declared.
-            // Under `PhysicalStorageBuffer64` a device address can reach a buffer that has no
-            // descriptor, so a missing footprint stays conservatively unbounded there unless the
-            // declaration already said the parameter is unused.
-            //
-            // The same proof answers BOTH facts this function reports about the descriptor. A
-            // binding the Logical module never declares executes zero bytes *because* nothing can
-            // reach it, so calling that same binding `ReadOnly` or `ReadWrite` states an access the
-            // module cannot perform. `Unused` is the one classification consistent with the empty
-            // footprint beside it.
-            if logical_addressing {
-                binding.access = Some(ResourceAccess::Unused);
-            }
-            binding.footprint = Some(BufferFootprint {
-                has_unbounded_access: !logical_addressing
-                    && binding.access != Some(ResourceAccess::Unused),
+        binding.footprint = Some(analysis.footprints.get(&key).cloned().unwrap_or_else(|| {
+            // A genuinely unused reflected binding can be optimized out of the final module. Any
+            // other missing descriptor is conservatively unbounded rather than silently empty.
+            BufferFootprint {
+                has_unbounded_access: binding.access != Some(ResourceAccess::Unused),
                 ..BufferFootprint::default()
-            });
-            continue;
-        };
-        binding.footprint = Some(footprint);
-        let observed = analysis.observed.get(&key).copied();
-        if logical_addressing && !analysis.escaped.contains(&key) {
-            // The walk saw every access this descriptor can take, so what it saw IS the access.
-            binding.access = Some(exact_access(observed.unwrap_or_default()));
-        } else if let Some(observed) = observed {
-            binding.access = Some(widen_access(binding.access, observed));
+            }
+        }));
+        if let Some(observed) = analysis.observed.get(&key) {
+            binding.access = Some(widen_access(binding.access, *observed));
         }
     }
     Ok(())
@@ -231,75 +207,11 @@ fn widen_access(declared: Option<ResourceAccess>, observed: AccessDirection) -> 
         declared_reads || observed.reads,
         declared_writes || observed.writes,
     ) {
-        (false, false) => declared.unwrap_or(ResourceAccess::Unused),
-        direction => classify(direction),
-    }
-}
-
-/// Report exactly what the walk saw, because for this descriptor the walk saw everything.
-///
-/// This is the narrowing `widen_access` refuses, and it is sound under exactly the conditions that
-/// let the module decorate the same descriptor `NonWritable`: Logical addressing, and no pointer
-/// rooted at the descriptor escaping into an operand slot the walk cannot follow. Under those the
-/// declaration has nothing left to add -- AIR's `air.read_write` on a buffer the body only loads is
-/// a description of the parameter, not of the program, and reporting it makes a consumer stage,
-/// barrier, and read back memory no instruction touches.
-///
-/// The module already states this conclusion to the driver; see
-/// `decorate_unwritten_storage_buffers`. Reporting the wider answer beside it would be two answers
-/// to one question.
-fn exact_access(observed: AccessDirection) -> ResourceAccess {
-    classify((observed.reads, observed.writes))
-}
-
-fn classify(direction: (bool, bool)) -> ResourceAccess {
-    match direction {
         (true, true) => ResourceAccess::ReadWrite,
         (true, false) => ResourceAccess::ReadOnly,
         (false, true) => ResourceAccess::WriteOnly,
-        (false, false) => ResourceAccess::Unused,
+        (false, false) => declared.unwrap_or(ResourceAccess::Unused),
     }
-}
-
-/// True when the finished module uses the Logical addressing model, which is what makes "no
-/// variable at this binding" mean "no instruction can touch this buffer". A module that lowered any
-/// pointer to a device address carries `PhysicalStorageBuffer64` instead, and there the absence of a
-/// descriptor proves nothing. A module with no memory model at all is treated as the conservative
-/// case rather than assumed Logical.
-pub(super) fn addressing_is_logical(module: &Module) -> bool {
-    module
-        .memory_model
-        .as_ref()
-        .and_then(|instruction| instruction.operands.first())
-        .is_some_and(|operand| {
-            matches!(
-                operand,
-                Operand::AddressingModel(spirv::AddressingModel::Logical)
-            )
-        })
-}
-
-/// The `(set, binding)` of every id the module decorates with both.
-///
-/// One derivation of this fact, shared by everything that needs it. `Decorations::from_module` is
-/// already the module's decoration table; a second reader of `module.annotations` would be a second
-/// answer to "what descriptor is this variable", and the two would drift the first time one of them
-/// learned about an operand spelling the other did not.
-pub(super) fn descriptor_keys(module: &Module) -> HashMap<Word, DescriptorKey> {
-    let decorations = Decorations::from_module(module);
-    decorations
-        .descriptor_sets
-        .iter()
-        .filter_map(|(id, set)| {
-            Some((
-                *id,
-                DescriptorKey {
-                    set: *set,
-                    binding: *decorations.bindings.get(id)?,
-                },
-            ))
-        })
-        .collect()
 }
 
 fn binding_supports_footprint(binding: &ResourceBinding) -> bool {
@@ -312,7 +224,7 @@ fn binding_supports_footprint(binding: &ResourceBinding) -> bool {
 }
 
 impl<'a> Analyzer<'a> {
-    pub(super) fn new(module: &'a Module, targets: &BTreeSet<DescriptorKey>) -> Self {
+    fn new(module: &'a Module, targets: &BTreeSet<DescriptorKey>) -> Self {
         let definitions = module
             .all_inst_iter()
             .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
@@ -362,7 +274,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    pub(super) fn analyze(&mut self) -> Analysis {
+    fn analyze(&mut self) -> Analysis {
         self.propagate_pointer_addresses();
         let mut footprints = self
             .roots
@@ -434,8 +346,7 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
-        let mut escaped = BTreeSet::new();
-        self.mark_unmodeled_pointer_escapes(&mut footprints, &mut escaped);
+        self.mark_unmodeled_pointer_escapes(&mut footprints);
 
         for footprint in footprints.values_mut() {
             coalesce_static_ranges(&mut footprint.static_ranges);
@@ -445,14 +356,12 @@ impl<'a> Analyzer<'a> {
         Analysis {
             footprints,
             observed,
-            escaped,
         }
     }
 
     fn mark_unmodeled_pointer_escapes(
         &self,
         footprints: &mut BTreeMap<DescriptorKey, BufferFootprint>,
-        escaped: &mut BTreeSet<DescriptorKey>,
     ) {
         for instruction in self
             .module
@@ -476,7 +385,6 @@ impl<'a> Analyzer<'a> {
                         .entry(address.root)
                         .or_default()
                         .has_unbounded_access = true;
-                    escaped.insert(address.root);
                 }
             }
         }
@@ -1275,15 +1183,11 @@ impl<'a> Analyzer<'a> {
 }
 
 /// What one walk of the module found for the descriptors it was asked about.
-pub(super) struct Analysis {
+struct Analysis {
     footprints: BTreeMap<DescriptorKey, BufferFootprint>,
     /// Whether the module reads and/or writes through each descriptor. Absent means the walk found
     /// no access it could attribute to that descriptor, which is not the same as no access.
-    pub(super) observed: BTreeMap<DescriptorKey, AccessDirection>,
-    /// Descriptors a pointer reached an operand slot this walk does not model. That is the only way
-    /// a Logical module can touch a descriptor without the walk seeing the access, so `observed`
-    /// answers "what did the walk see" and this answers "was there anywhere left to look".
-    pub(super) escaped: BTreeSet<DescriptorKey>,
+    observed: BTreeMap<DescriptorKey, AccessDirection>,
 }
 
 #[derive(Clone, Copy)]
@@ -1296,10 +1200,10 @@ struct MemoryAccess {
     direction: AccessDirection,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct AccessDirection {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AccessDirection {
     reads: bool,
-    pub(super) writes: bool,
+    writes: bool,
 }
 
 impl AccessDirection {
@@ -1616,30 +1520,5 @@ mod tests {
         ];
         normalize_addresses(&mut addresses);
         assert_eq!(addresses, [Address { root, offset: None }]);
-    }
-
-    /// The predicate that decides whether "no variable at this binding" proves "no access": only a
-    /// Logical module can promise it, and a module with no memory model at all must not be assumed
-    /// Logical, or a half-built module would license narrowing.
-    #[test]
-    fn addressing_is_logical_only_for_a_declared_logical_memory_model() {
-        use spirv::AddressingModel;
-        let with = |addressing| {
-            let mut module = Module::new();
-            module.memory_model = Some(Instruction::new(
-                Op::MemoryModel,
-                None,
-                None,
-                vec![
-                    Operand::AddressingModel(addressing),
-                    Operand::MemoryModel(spirv::MemoryModel::GLSL450),
-                ],
-            ));
-            addressing_is_logical(&module)
-        };
-        assert!(with(AddressingModel::Logical));
-        assert!(!with(AddressingModel::PhysicalStorageBuffer64));
-        assert!(!with(AddressingModel::Physical64));
-        assert!(!addressing_is_logical(&Module::new()));
     }
 }

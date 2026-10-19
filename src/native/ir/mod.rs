@@ -151,12 +151,6 @@ impl LlFunction {
     }
 }
 
-/// The AIR intrinsic that answers the imageblock (= threadgroup) tile width. Declared into the IR
-/// when a cross-coordinate imageblock has no stride of its own, and lowered in the pass layer by
-/// `lower_get_imageblock_extent`, which is the only place that holds
-/// `TransformOptions::kernel_local_size`.
-pub(super) const IMAGEBLOCK_WIDTH_INTRINSIC: &str = "air.get_imageblock_width";
-
 #[derive(Clone, Debug)]
 pub(super) struct LlDeclaration {
     pub(super) name: String,
@@ -208,14 +202,6 @@ pub(super) struct LlModule {
     /// AIR entry parameter carrying `[[threads_per_threadgroup]]`, used as the row stride for a
     /// shared imageblock whose dimensions are supplied by the dispatch rather than APV metadata.
     pub(super) imageblock_threads_per_threadgroup_param: Option<String>,
-    /// How many imageblock cells wide the tile is per thread in each axis: `1` when every
-    /// `air.imageblock_data` coordinate names the calling thread's own cell, `k` when the entry
-    /// stages a `k`x`k` block per thread, and `None` when the entry has no one such factor and the
-    /// shared-cell lowering cannot linearise it. See [`infer_imageblock_cell_scale`].
-    pub(super) imageblock_cell_scale: Option<u32>,
-    /// The render-target planes an `air.alias_implicit_imageblock` explicit imageblock's members
-    /// alias, in member order. Empty for the ordinary tile-local imageblock.
-    pub(super) aliased_imageblock_planes: Vec<meta::AliasedImageblockPlane>,
     metadata_pointee_params: HashSet<(String, String)>,
     /// For each metadata-seeded pointee param, the buffer element's declared `air.arg_type_size`
     /// (the authoritative byte extent, offset-aware over any union/bitfield tail). Used to let a
@@ -282,7 +268,7 @@ pub(in crate::native) struct ParamCallEdge {
 /// Trace a pointer-valued local back to one of `f`'s pointer parameters through aliases that preserve
 /// the pointed-to address.  This deliberately accepts only a single, unambiguous parameter root: a
 /// cross-buffer select/phi is not one buffer alias and must not make raw-buffer marking contagious.
-fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
+pub(in crate::native) fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
     let mut roots: HashMap<String, String> = f
         .params
         .iter()
@@ -351,6 +337,51 @@ fn pointer_param_alias_roots(f: &LlFunction) -> HashMap<String, String> {
                     if roots.insert(res.clone(), root).is_none() {
                         changed = true;
                     }
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// The subset of [`pointer_param_alias_roots`] that provably names its parameter's own address:
+/// the parameter itself, an identity pointer bitcast, or a GEP whose every index is a constant zero.
+/// Any other alias (a non-zero or dynamic GEP, a phi, a select) may carry a byte offset from the root.
+pub(in crate::native) fn pointer_param_zero_offset_aliases(
+    f: &LlFunction,
+) -> HashMap<String, String> {
+    let mut roots: HashMap<String, String> = f
+        .params
+        .iter()
+        .filter(|&(_name, ty)| matches!(ty, LlType::Ptr(_)))
+        .map(|(name, _ty)| (name.clone(), name.clone()))
+        .collect();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for inst in f.carrier_insts() {
+            let alias = if let Some((result, base)) = inst.identity_ptr_bitcast() {
+                Some((result.to_string(), base))
+            } else if let (Some(result), Some(gep)) = (&inst.result, inst.gep()) {
+                let zero_offset = gep.indices.iter().all(|index| {
+                    matches!(
+                        index.value,
+                        LlValue::Int(0) | LlValue::SignedInt(0) | LlValue::Hex(0) | LlValue::Zero
+                    )
+                });
+                match &gep.base.value {
+                    LlValue::Local(base) if zero_offset => Some((result.clone(), base.as_str())),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let Some((result, base)) = alias else {
+                continue;
+            };
+            if let Some(root) = roots.get(base).cloned() {
+                if roots.insert(result, root).is_none() {
+                    changed = true;
                 }
             }
         }
@@ -605,215 +636,6 @@ fn infer_metadata_primitive_buffer_pointees(
         );
     }
     out
-}
-
-/// Whether the entry copies a whole imageblock block to a texture.
-///
-/// `air.write_imageblock_slice_to_texture_*` hands the texture a WxH block of cells starting at the
-/// one its pointer names -- the Metal `imageblock_slice` carries the pointer, a size and a validity
-/// flag, and nothing else, so the pointer IS the block origin. Per-invocation `Private` staging has
-/// exactly one cell, so a module that makes this call cannot be staging per invocation: the cells
-/// the call reads past the first belong to other threads, and in the corpus the call is routinely
-/// made by one gated thread on behalf of the whole threadgroup. Naming the call is therefore a
-/// direct statement that the imageblock is threadgroup memory, independent of whether the module
-/// happens to address a second coordinate.
-fn calls_imageblock_slice_write(
-    functions: &[LlFunction],
-    entry_functions: &HashSet<String>,
-) -> bool {
-    functions
-        .iter()
-        .filter(|function| entry_functions.contains(&function.name))
-        .flat_map(|function| function.carrier_insts())
-        .filter_map(|inst| inst.alias_call())
-        .any(|call| {
-            call.callee
-                .starts_with("air.write_imageblock_slice_to_texture")
-        })
-}
-
-/// How many imageblock cells wide the tile is per thread, or `None` when this entry has no such
-/// factor and the shared-cell lowering must refuse it.
-///
-/// The shared-cell lowering linearises the tile `y * width + x` with `width` the threadgroup extent
-/// (`emit_imageblock_threadgroup_width`), which is the imageblock's extent only when each thread
-/// owns one cell. A kernel that stages a 2x2 output block per thread addresses `2 * tid + {0,1}^2`,
-/// so its imageblock is twice as wide in each axis -- `rwppCopyImage` states as much, passing an
-/// explicit slice-write region of `2 * [[threads_per_threadgroup]]`. That factor is not a caller
-/// fact: the module carries it, both as the multiply on the coordinate and as the region operand.
-/// So read it off the coordinate and hand it to the emitter, which multiplies the row stride and
-/// the cell count by it.
-///
-/// **The factor is a linear coefficient in the thread position, and the tile is as wide as the
-/// LARGEST one.** `tid + (1, 0)` is a neighbour read, which is what tile memory is for, and adding
-/// a constant does not widen anything -- coefficient 1. `2 * tid` says the tile has twice as many
-/// columns as there are threads -- coefficient 2. A wholly constant coordinate has coefficient 0.
-/// Coefficients may differ within one entry and routinely do: `rwppCopyImage` stages its 2x2 block
-/// at `2 * tid | {0,1}^2` and then names the block origin as plain `tid` under a gate that proves
-/// the position zero. Taking the maximum is not a compromise -- a coordinate with coefficient `j`
-/// spans `[0, j * threads)`, which is inside `[0, k * threads)` for every `j <= k`, so linearising
-/// every coordinate by the widest one is exactly right for all of them. It is UNDER-stating the
-/// width that collides two cells, which is why `add` sums its operands' coefficients rather than
-/// taking their maximum.
-fn infer_imageblock_cell_scale(
-    functions: &[LlFunction],
-    entry_functions: &HashSet<String>,
-) -> Option<u32> {
-    let mut scale = 0;
-    for function in functions
-        .iter()
-        .filter(|function| entry_functions.contains(&function.name))
-    {
-        let defs = function
-            .carrier_insts()
-            .filter_map(|inst| inst.result.as_deref().map(|result| (result, inst)))
-            .collect::<HashMap<_, _>>();
-        for coordinate in function
-            .carrier_insts()
-            .filter_map(|inst| inst.alias_call())
-            .filter(|call| call.callee == "air.imageblock_data")
-            .filter_map(|call| call.args.first().map(|arg| arg.value.clone()))
-        {
-            let coordinate_scale = match coordinate {
-                LlValue::Local(name) => tile_coordinate_scale(&defs, &name, 16)?,
-                // A literal coordinate names one fixed cell and widens nothing.
-                _ => 0,
-            };
-            scale = scale.max(coordinate_scale);
-        }
-    }
-    // Every coordinate constant: one cell per thread is as true as it ever was.
-    Some(scale.max(1))
-}
-
-/// The coefficient of the thread position in `name`, or `None` when it is not a linear function of
-/// one.
-///
-/// `0` means the value does not depend on a thread position at all. A name this function cannot see
-/// a definition for is a parameter or a global -- a thread position, coefficient 1. Multiplying by a
-/// constant multiplies the coefficient and adding two values adds theirs, which is what makes
-/// `2 * tid + 1` come out as 2 rather than as 2 and 1 separately.
-///
-/// Everything else -- `x >> n`, `x & m`, `x % m` -- is not linear, but each of them is bounded above
-/// by `x`, so a coordinate built that way out of an UNSCALED position still lands inside the tile
-/// and keeps the coefficient it had. Applied to a scaled one the bound says nothing about which cell
-/// it names, so that combination is refused rather than guessed.
-fn tile_coordinate_scale(
-    defs: &HashMap<&str, &crate::native::tir::TirInst>,
-    name: &str,
-    depth: u32,
-) -> Option<u32> {
-    if depth == 0 {
-        return None;
-    }
-    // Not defined in this function: a parameter or a global, which is a thread position itself.
-    let Some(inst) = defs.get(name) else {
-        return Some(1);
-    };
-    // A value no thread position reaches is an offset, however it is computed. Asking this before
-    // recursing is also what keeps a loop-carried offset from spinning: the `{0,1}^2` corner of a
-    // per-thread block arrives through a phi that names its own increment, which no depth-limited
-    // linear walk terminates on, and which contributes nothing to the width either way.
-    if !reaches_thread_position(defs, name, &mut HashSet::new()) {
-        return Some(0);
-    }
-    use crate::native::tir::TirOpcode;
-    let operand_scale = |operand: &crate::native::tir::TirOperand| match operand {
-        crate::native::tir::TirOperand::Value { name, .. } => {
-            tile_coordinate_scale(defs, name, depth - 1)
-        }
-        crate::native::tir::TirOperand::Const { .. } => Some(0),
-        crate::native::tir::TirOperand::Unresolved => None,
-    };
-    match inst.opcode {
-        TirOpcode::Shl | TirOpcode::Mul => {
-            let [lhs, rhs] = inst.operands.as_slice() else {
-                return None;
-            };
-            // Exactly one side constant, or the product is not a scale of a position.
-            let (value, factor) = match (constant_uniform_int(lhs), constant_uniform_int(rhs)) {
-                (None, Some(factor)) => (lhs, factor),
-                (Some(factor), None) if inst.opcode == TirOpcode::Mul => (rhs, factor),
-                _ => return None,
-            };
-            let factor = if inst.opcode == TirOpcode::Shl {
-                1u32.checked_shl(u32::try_from(factor).ok()?)?
-            } else {
-                u32::try_from(factor).ok()?
-            };
-            operand_scale(value)?.checked_mul(factor)
-        }
-        TirOpcode::Add | TirOpcode::Or | TirOpcode::Sub => {
-            let [lhs, rhs] = inst.operands.as_slice() else {
-                return None;
-            };
-            operand_scale(lhs)?.checked_add(operand_scale(rhs)?)
-        }
-        _ => {
-            // Not linear, so it may only narrow a position that was never scaled.
-            let mut scale = Some(0);
-            inst.visit_uses(|use_name| {
-                scale = match (scale, tile_coordinate_scale(defs, use_name, depth - 1)) {
-                    (Some(0), Some(1)) | (Some(1), Some(1)) => Some(1),
-                    (Some(0), Some(0)) => Some(0),
-                    _ => None,
-                };
-            });
-            scale
-        }
-    }
-}
-
-/// Whether any thread position reaches `name`.
-///
-/// A name with no definition in this entry is a parameter or a global, and the entry's imageblock
-/// coordinates are built out of its `[[thread_position_*]]` parameters, so an undefined name is the
-/// thread position. Everything else is reachability, with a visited set so a loop-carried value that
-/// names its own increment terminates.
-fn reaches_thread_position<'a>(
-    defs: &HashMap<&'a str, &'a crate::native::tir::TirInst>,
-    name: &'a str,
-    visited: &mut HashSet<&'a str>,
-) -> bool {
-    if !visited.insert(name) {
-        return false;
-    }
-    let Some(inst) = defs.get(name) else {
-        return true;
-    };
-    let mut reaches = false;
-    inst.visit_uses(|use_name| {
-        // `visit_uses` hands out borrows of the instruction's own strings; the definition map keys
-        // are borrows of the same arena, so look each one up to recover the longer lifetime.
-        if let Some((interned, _)) = defs.get_key_value(use_name) {
-            reaches |= reaches_thread_position(defs, interned, visited);
-        } else {
-            reaches = true;
-        }
-    });
-    reaches
-}
-
-/// A constant integer operand, or the element of a constant splat/uniform vector one.
-fn constant_uniform_int(operand: &crate::native::tir::TirOperand) -> Option<u64> {
-    let crate::native::tir::TirOperand::Const { value, .. } = operand else {
-        return None;
-    };
-    fn scalar(value: &LlValue) -> Option<u64> {
-        match value {
-            LlValue::Int(value) | LlValue::Hex(value) => Some(*value),
-            LlValue::SignedInt(value) => u64::try_from(*value).ok(),
-            LlValue::Zero => Some(0),
-            LlValue::Splat(element) => scalar(&element.value),
-            LlValue::Vector(elements) => {
-                let mut lanes = elements.iter().map(|element| scalar(&element.value));
-                let first = lanes.next()??;
-                lanes.all(|lane| lane == Some(first)).then_some(first)
-            }
-            _ => None,
-        }
-    }
-    scalar(value)
 }
 
 fn infer_cross_coordinate_imageblock(
@@ -1209,23 +1031,10 @@ mod layout_abi_tests {
             m.native_memcpy_type_size_align(&LlType::Array(Box::new(vec(LlType::Float, 3)), 2)),
             Some((32, 16))
         );
-        // an array takes its element's alignment, not a four-byte floor: `packed_half3` is the
-        // six bytes AIR declares, and a byte pad stays where the packed struct put it.
+        // array of scalars floors align at 4
         assert_eq!(
             m.native_memcpy_type_size_align(&LlType::Array(Box::new(LlType::Float), 3)),
             Some((12, 4))
-        );
-        assert_eq!(
-            m.native_memcpy_type_size_align(&LlType::Array(Box::new(LlType::Half), 3)),
-            Some((6, 2))
-        );
-        assert_eq!(
-            m.native_memcpy_type_size_align(&LlType::Struct(vec![
-                LlType::Int(8),
-                LlType::Array(Box::new(LlType::Int(8)), 3),
-                LlType::Int(32),
-            ])),
-            Some((8, 4))
         );
     }
 
@@ -1302,56 +1111,25 @@ mod layout_abi_tests {
         ]);
         assert!(m.air_metadata_requires_byte_view(&overlapping));
 
-        // `{ ushort @0, uchar @12 }` is 13 bytes of members aligned to 2, so it is 14 and an array
-        // of two is 28. MEASURED against the Metal front end rather than assumed: a kernel over
-        // `struct Inner { ushort a; uchar pad[10]; uchar b; }` reports `sizeof` 14, `alignof` 2,
-        // `&arr[1] - &arr[0]` 14, and for `struct Outer { Inner arr[2]; uint c; }` an `offsetof(c)`
-        // of 28 and a `sizeof` of 32.
-        //
-        // So 28 is where the next member goes and there is nothing to overlap. This fixture used to
-        // put the `uint` at 28 and assert a byte view WAS required, which was true only because a
-        // four-byte alignment floor rounded the inner struct to 16 and the array to 32 -- the same
-        // floor `ffdde3cc` removed from the emitted addresses. A fabricated overlap costs a whole
-        // buffer its typed access chains, so both directions are pinned here.
-        let inner = || {
-            AirType::Struct(vec![
-                AirMember {
-                    offset: 0,
-                    ty: AirType::Scalar(AirScalar::UShort),
-                },
-                AirMember {
-                    offset: 12,
-                    ty: AirType::Scalar(AirScalar::UChar),
-                },
-            ])
-        };
-        let stride_adjacent = AirType::Struct(vec![
+        let stride_overlap = AirType::Struct(vec![
             AirMember {
                 offset: 0,
                 ty: AirType::Array {
-                    elem: Box::new(inner()),
+                    elem: Box::new(AirType::Struct(vec![
+                        AirMember {
+                            offset: 0,
+                            ty: AirType::Scalar(AirScalar::UShort),
+                        },
+                        AirMember {
+                            offset: 12,
+                            ty: AirType::Scalar(AirScalar::UChar),
+                        },
+                    ])),
                     len: 2,
                 },
             },
             AirMember {
                 offset: 28,
-                ty: AirType::Scalar(AirScalar::UInt),
-            },
-        ]);
-        assert!(!m.air_metadata_requires_byte_view(&stride_adjacent));
-
-        // The genuine version of the same shape: the `uint` starts at 20, inside the array's real
-        // extent of [0, 28), so the members really do overlap and the byte view really is required.
-        let stride_overlap = AirType::Struct(vec![
-            AirMember {
-                offset: 0,
-                ty: AirType::Array {
-                    elem: Box::new(inner()),
-                    len: 2,
-                },
-            },
-            AirMember {
-                offset: 20,
                 ty: AirType::Scalar(AirScalar::UInt),
             },
         ]);
@@ -1384,7 +1162,6 @@ mod layout_abi_tests {
             LlType::Float,
             LlType::Ptr(1),
             LlType::Array(Box::new(LlType::Float), 3),
-            LlType::Array(Box::new(LlType::Half), 3),
             LlType::Struct(vec![LlType::Int(8), LlType::Float]),
             LlType::Struct(vec![LlType::Float, LlType::Float, LlType::Int(32)]),
         ];

@@ -32,9 +32,9 @@ pub(in crate::passes) fn lower_bfloat_fmuladd(
     }
 
     let mut out = vec![];
-    let a = widen_bf16_to_f32(ctx, &mut out, args[0], 1);
-    let b = widen_bf16_to_f32(ctx, &mut out, args[1], 1);
-    let c = widen_bf16_to_f32(ctx, &mut out, args[2], 1);
+    let a = bfloat_to_f32(ctx, &mut out, args[0]);
+    let b = bfloat_to_f32(ctx, &mut out, args[1]);
+    let c = bfloat_to_f32(ctx, &mut out, args[2]);
     let fma = ctx.module.fresh_id();
     let ext = ctx.glsl();
     let float = ctx.ty_float();
@@ -50,107 +50,100 @@ pub(in crate::passes) fn lower_bfloat_fmuladd(
             Operand::IdRef(c),
         ],
     ));
-    narrow_f32_to_bf16(ctx, &mut out, fma, 1, rty, res);
+    f32_to_bfloat(ctx, &mut out, fma, rty, res);
     Ok(out)
 }
 
-/// Widen a bf16 bit pattern (modeled as int16, scalar or vN) to f32: bf16 is the top 16 bits of an
-/// f32, so `f32 = bitcast<float>(zext_u32(bits) << 16)`.
-pub(super) fn widen_bf16_to_f32(
+pub(in crate::passes) fn bfloat_to_f32(
     ctx: &mut Ctx,
     out: &mut Vec<Instruction>,
-    bits: Word,
-    n: u32,
+    value: Word,
 ) -> Word {
-    let u32_ty = ty_u32_shaped(ctx, n);
-    let f32_ty = ty_f32_shaped(ctx, n);
+    let uint = ctx.ty_uint();
+    let float = ctx.ty_float();
     let widened = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::UConvert,
-        Some(u32_ty),
+        Some(uint),
         Some(widened),
-        vec![Operand::IdRef(bits)],
+        vec![Operand::IdRef(value)],
     ));
-    let shamt = shift_amount_16(ctx, n);
+    let shift = ctx.const_uint(16);
     let shifted = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::ShiftLeftLogical,
-        Some(u32_ty),
+        Some(uint),
         Some(shifted),
-        vec![Operand::IdRef(widened), Operand::IdRef(shamt)],
+        vec![Operand::IdRef(widened), Operand::IdRef(shift)],
     ));
-    let f = ctx.module.fresh_id();
+    let result = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::Bitcast,
-        Some(f32_ty),
-        Some(f),
+        Some(float),
+        Some(result),
         vec![Operand::IdRef(shifted)],
     ));
-    f
+    result
 }
 
-/// Narrow an f32 (scalar or vN) to a bf16 bit pattern, writing `res`/`rty` (the int16 storage type).
-/// LLVM `fptrunc float to bfloat` rounds to nearest-even, so add the bf16 rounding bias before
-/// taking the top 16 bits.
-pub(super) fn narrow_f32_to_bf16(
+pub(in crate::passes) fn f32_to_bfloat(
     ctx: &mut Ctx,
     out: &mut Vec<Instruction>,
-    f32val: Word,
-    n: u32,
-    rty: Word,
-    res: Word,
+    value: Word,
+    result_type: Word,
+    result: Word,
 ) {
-    let u32_ty = ty_u32_shaped(ctx, n);
-    let as_u32 = ctx.module.fresh_id();
+    let uint = ctx.ty_uint();
+    let bits = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::Bitcast,
-        Some(u32_ty),
-        Some(as_u32),
-        vec![Operand::IdRef(f32val)],
+        Some(uint),
+        Some(bits),
+        vec![Operand::IdRef(value)],
     ));
-    let shamt = shift_amount_16(ctx, n);
+    let shift = ctx.const_uint(16);
     let high = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::ShiftRightLogical,
-        Some(u32_ty),
+        Some(uint),
         Some(high),
-        vec![Operand::IdRef(as_u32), Operand::IdRef(shamt)],
+        vec![Operand::IdRef(bits), Operand::IdRef(shift)],
     ));
-    let one = shaped_u32_const(ctx, n, 1);
+    let one = ctx.const_uint(1);
     let lsb = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::BitwiseAnd,
-        Some(u32_ty),
+        Some(uint),
         Some(lsb),
         vec![Operand::IdRef(high), Operand::IdRef(one)],
     ));
-    let bias_base = shaped_u32_const(ctx, n, 0x7fff);
+    let bias_base = ctx.const_uint(0x7fff);
     let bias = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::IAdd,
-        Some(u32_ty),
+        Some(uint),
         Some(bias),
         vec![Operand::IdRef(bias_base), Operand::IdRef(lsb)],
     ));
     let rounded = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::IAdd,
-        Some(u32_ty),
+        Some(uint),
         Some(rounded),
-        vec![Operand::IdRef(as_u32), Operand::IdRef(bias)],
+        vec![Operand::IdRef(bits), Operand::IdRef(bias)],
     ));
     let shifted = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::ShiftRightLogical,
-        Some(u32_ty),
+        Some(uint),
         Some(shifted),
-        vec![Operand::IdRef(rounded), Operand::IdRef(shamt)],
+        vec![Operand::IdRef(rounded), Operand::IdRef(shift)],
     ));
-    let shifted = select_canonical_bfloat_nan_bits(ctx, out, as_u32, shifted, n);
+    let shifted = select_canonical_bfloat_nan_bits(ctx, out, bits, shifted);
     out.push(Instruction::new(
         Op::UConvert,
-        Some(rty),
-        Some(res),
+        Some(result_type),
+        Some(result),
         vec![Operand::IdRef(shifted)],
     ));
 }
@@ -160,18 +153,17 @@ fn select_canonical_bfloat_nan_bits(
     out: &mut Vec<Instruction>,
     bits: Word,
     narrowed: Word,
-    n: u32,
 ) -> Word {
-    let u32_ty = ty_u32_shaped(ctx, n);
-    let bool_ty = ty_bool_shaped(ctx, n);
-    let exp_mask = shaped_u32_const(ctx, n, 0x7f80_0000);
-    let mant_mask = shaped_u32_const(ctx, n, 0x007f_ffff);
-    let zero = shaped_u32_const(ctx, n, 0);
+    let uint = ctx.ty_uint();
+    let bool_ty = ctx.ty_bool();
+    let exp_mask = ctx.const_uint(0x7f80_0000);
+    let mant_mask = ctx.const_uint(0x007f_ffff);
+    let zero = ctx.const_uint(0);
 
     let exp_bits = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::BitwiseAnd,
-        Some(u32_ty),
+        Some(uint),
         Some(exp_bits),
         vec![Operand::IdRef(bits), Operand::IdRef(exp_mask)],
     ));
@@ -186,7 +178,7 @@ fn select_canonical_bfloat_nan_bits(
     let mant_bits = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::BitwiseAnd,
-        Some(u32_ty),
+        Some(uint),
         Some(mant_bits),
         vec![Operand::IdRef(bits), Operand::IdRef(mant_mask)],
     ));
@@ -206,11 +198,11 @@ fn select_canonical_bfloat_nan_bits(
         vec![Operand::IdRef(exp_all_ones), Operand::IdRef(mant_nonzero)],
     ));
 
-    let canonical_nan = shaped_u32_const(ctx, n, 0x7fc0);
+    let canonical_nan = ctx.const_uint(0x7fc0);
     let selected = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::Select,
-        Some(u32_ty),
+        Some(uint),
         Some(selected),
         vec![
             Operand::IdRef(is_nan),
@@ -221,42 +213,11 @@ fn select_canonical_bfloat_nan_bits(
     selected
 }
 
-/// Pick the min/max/clamp opcode whose NaN contract is the one the AIR symbol asked for.
-///
-/// Metal's plain `fmin`/`fmax` are specified NaN-aware -- "if one argument is a NaN, returns the
-/// other argument; if both are NaNs, returns a NaN" -- and `clamp`/`saturate` inherit that through
-/// the `fmin(fmax(x, lo), hi)` they are defined as. That is GLSL.std.450 `NMin`/`NMax`/`NClamp`
-/// word for word. `FMin`/`FMax`/`FClamp` compute the same thing for ordered operands but leave the
-/// NaN case **undefined**, so emitting them says less than Metal guarantees and lets a driver
-/// answer either way.
-///
-/// An `air.fast_*` symbol names Metal's `fast::` namespace, which defines neither NaN nor infinity.
-/// `F*` is the faithful opcode for those and they keep it.
-///
-/// This changes no answer MoltenVK produces today: measured on an Apple M3 Max, `max`, `fmax`,
-/// `fast::max` and `precise::max` are bit-identical on all of (qNaN, 3), (3, qNaN), (qNaN, -3),
-/// (sNaN, 3), (qNaN, +-inf), (qNaN, qNaN) and both signed zeros, and `min`/`clamp` likewise --
-/// Apple's `fast::` select-ops are the same instruction, unlike its transcendentals. What it buys
-/// is that the emitted module states the contract instead of relying on that coincidence, which is
-/// what lets [`super::normalized_pack_nan_to_zero`]'s hand-rolled guard go away.
-pub(in crate::passes) fn nan_aware_if_precise(name: &str, op: GLSLstd450) -> GLSLstd450 {
-    use spirv::GlslStd450Op::*;
-    if name.starts_with("air.fast_") {
-        return op;
-    }
-    match op {
-        FMin => NMin,
-        FMax => NMax,
-        FClamp => NClamp,
-        other => other,
-    }
-}
-
 /// GLSL.std.450 opcode for the simple unary/binary/ternary math intrinsics.
 pub(in crate::passes) fn glsl_extinst(name: &str) -> Option<GLSLstd450> {
     use spirv::GlslStd450Op::*;
     // atan2 is binary; keep it early for clarity. The ExtInst caller forwards all args.
-    let op = if is_air_math(name, "atan2") {
+    Some(if is_air_math(name, "atan2") {
         Atan2
     } else if is_air_math(name, "asin") {
         Asin
@@ -268,12 +229,16 @@ pub(in crate::passes) fn glsl_extinst(name: &str) -> Option<GLSLstd450> {
         || is_air_math(name, "fmax")
         || is_air_math(name, "max")
     {
-        FMax
+        // Metal: "If one argument is a NaN, fmax() returns the other argument",
+        // and `llvm.maxnum` is IEEE maxNum. That is NMax; FMax leaves the NaN
+        // case undefined, and a GPU that returns the NaN turns one degenerate
+        // path edge into a streak across RenderBox's coverage accumulator.
+        NMax
     } else if name.starts_with("llvm.minnum.")
         || is_air_math(name, "fmin")
         || is_air_math(name, "min")
     {
-        FMin
+        NMin
     } else if is_air_math(name, "sqrt") {
         Sqrt
     } else if is_air_math(name, "rsqrt") {
@@ -285,17 +250,6 @@ pub(in crate::passes) fn glsl_extinst(name: &str) -> Option<GLSLstd450> {
     } else if is_air_math(name, "sign") {
         FSign
     } else if is_air_math(name, "mix") {
-        // Plain `FMix`, with nothing wrapped around it. This used to carry an endpoint guard --
-        // `select(t == 0, x, ...)` and `select(t == 1, y, ...)` around the blend -- which for a
-        // FINITE pair changes nothing, because `x * (1 - a) + y * a` already returns exactly `x`
-        // at 0 and exactly `y` at 1, and for a non-finite pair made us disagree with Metal.
-        // Measured on an Apple M3 Max: `mix(inf, 5, 1)`, `mix(5, inf, 0)`, `mix(NaN, 5, 1)`,
-        // `mix(5, NaN, 0)` and `mix(inf, inf, 1)` are all NaN, where the guard answered 5, 5, 5, 5
-        // and inf; and `mix(1, -0, 1)` is `+0`, where the guard answered `-0`. Eight of ten probed
-        // endpoint rows were wrong and the two it got right were the two `FMix` already had.
-        //
-        // SPIRV-Cross renders `FMix` as MSL `mix`, so what MoltenVK runs IS the function AIR named
-        // and every one of those rows comes back to Metal's own answer.
         FMix
     } else if is_air_math(name, "floor") {
         Floor
@@ -338,11 +292,11 @@ pub(in crate::passes) fn glsl_extinst(name: &str) -> Option<GLSLstd450> {
     } else if is_air_math(name, "fma") || name.starts_with("llvm.fmuladd.") {
         Fma
     } else if is_air_math(name, "clamp") {
-        FClamp
+        // Metal defines clamp as fmin(fmax(x, lo), hi), so a NaN clamps to lo.
+        NClamp
     } else {
         return None;
-    };
-    Some(nan_aware_if_precise(name, op))
+    })
 }
 
 pub(in crate::passes) fn is_air_math(name: &str, stem: &str) -> bool {

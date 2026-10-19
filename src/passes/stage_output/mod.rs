@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::passes::stage_input::{
-    decorate_builtin, decorate_location, decorate_with, scalar_or_vector_component,
+    decorate_builtin, decorate_index, decorate_location, decorate_with, scalar_or_vector_component,
 };
 
 fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Option<u32> {
@@ -10,6 +10,12 @@ fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Optio
         Some(meta) => meta.render_target_location_for_member(member_idx as u32),
         None => Some(member_idx as u32),
     }
+}
+
+/// The output's dual-source blend index; 0 for an ordinary color output.
+fn fragment_output_dual_index(frag: Option<&FragMeta>, member_idx: usize) -> u32 {
+    frag.map(|meta| meta.render_target_dual_index_for_member(member_idx as u32))
+        .unwrap_or(0)
 }
 
 fn fragment_output_is_depth(frag: Option<&FragMeta>, member_idx: usize) -> bool {
@@ -417,12 +423,6 @@ pub(in crate::passes) fn rewrite_return(
         .and_then(|d| d.result_type)
         .ok_or_else(|| "entry function has no result type".to_string())?;
 
-    // A vertex output variable is half of a cross-stage linkage contract, so every member AIR
-    // declares has to reach the module even when the shader leaves its value undefined. A fragment
-    // output is a write to an attachment, and an attachment nothing writes is better left unwritten
-    // than written with garbage.
-    let declared_outputs_must_be_written = matches!(stage, Stage::Vertex);
-
     enum OutputWrite {
         Direct {
             var: Word,
@@ -457,31 +457,15 @@ pub(in crate::passes) fn rewrite_return(
     }
 
     impl OutputWrite {
-        /// The stores this output needs, or none when the value is statically undefined and
-        /// `declared_outputs_must_be_written` says the variable may go with it.
-        ///
-        /// Skipping the store leaves the Output variable unreferenced, and `module_cleanup`'s
-        /// unreferenced-global rule then removes it — variable, `Location` decoration and
-        /// entry-point interface entry together. For a VERTEX output that is a linkage contract
-        /// broken: the fragment stage translated from the same Metal varying struct declares the
-        /// matching Input, and Vulkan requires every consumed input to have a producing output at
-        /// that `Location`. AIR declares the member because Metal declares it; that the shader
-        /// leaves it undefined makes its VALUE undefined, not its existence.
-        fn stores(
-            &self,
-            ctx: &mut Ctx,
-            retval: Word,
-            declared_outputs_must_be_written: bool,
-        ) -> Vec<Instruction> {
+        fn stores(&self, ctx: &mut Ctx, retval: Word) -> Vec<Instruction> {
             let mut stores = Vec::new();
-            let skip_undef = !declared_outputs_must_be_written;
             let (var, value, src_ty, dst_ty) = match *self {
                 OutputWrite::Direct {
                     var,
                     src_ty,
                     dst_ty,
                 } => {
-                    if skip_undef && value_is_statically_undef(ctx, retval) {
+                    if value_is_statically_undef(ctx, retval) {
                         return stores;
                     }
                     (var, retval, src_ty, dst_ty)
@@ -492,7 +476,7 @@ pub(in crate::passes) fn rewrite_return(
                     src_ty,
                     dst_ty,
                 } => {
-                    if skip_undef && composite_member_is_statically_undef(ctx, retval, member) {
+                    if composite_member_is_statically_undef(ctx, retval, member) {
                         return stores;
                     }
                     let ext = ctx.module.fresh_id();
@@ -512,9 +496,7 @@ pub(in crate::passes) fn rewrite_return(
                 } => {
                     let ext = match member {
                         Some(member) => {
-                            if skip_undef
-                                && composite_member_is_statically_undef(ctx, retval, member)
-                            {
+                            if composite_member_is_statically_undef(ctx, retval, member) {
                                 return stores;
                             }
                             let ext = ctx.module.fresh_id();
@@ -527,7 +509,7 @@ pub(in crate::passes) fn rewrite_return(
                             ext
                         }
                         None => {
-                            if skip_undef && value_is_statically_undef(ctx, retval) {
+                            if value_is_statically_undef(ctx, retval) {
                                 return stores;
                             }
                             retval
@@ -786,7 +768,11 @@ pub(in crate::passes) fn rewrite_return(
                         let var = make_output_var(ctx, output_ty);
                         match kind {
                             OutKind::Location(location) => {
-                                decorate_location(&mut ctx.module, var, location)
+                                decorate_location(&mut ctx.module, var, location);
+                                let index = fragment_output_dual_index(frag, mi);
+                                if index != 0 {
+                                    decorate_index(&mut ctx.module, var, index);
+                                }
                             }
                             OutKind::Depth => {
                                 decorate_builtin(&mut ctx.module, var, BuiltIn::FragDepth);
@@ -852,6 +838,10 @@ pub(in crate::passes) fn rewrite_return(
                         let output_ty = fragment_output_type(ctx, frag, 0, ret_ty, defs);
                         let var = make_output_var(ctx, output_ty);
                         decorate_location(&mut ctx.module, var, location);
+                        let index = fragment_output_dual_index(frag, 0);
+                        if index != 0 {
+                            decorate_index(&mut ctx.module, var, index);
+                        }
                         ctx.interface.push(var);
                         outputs.push(OutputWrite::Direct {
                             var,
@@ -973,7 +963,7 @@ pub(in crate::passes) fn rewrite_return(
     for (bi, ii, retval) in ret_locs.into_iter().rev() {
         let mut replacement = Vec::new();
         for output in &outputs {
-            replacement.extend(output.stores(ctx, retval, declared_outputs_must_be_written));
+            replacement.extend(output.stores(ctx, retval));
         }
         if ctx.uses_fragment_imageblock {
             replacement.push(Instruction::new(

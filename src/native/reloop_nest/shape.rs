@@ -154,8 +154,8 @@ impl Graph {
                 .filter_map(|target| index.get(target).map(|target| swap(*target)))
                 .collect();
         }
-        let predecessors = crate::dominators::build_predecessors(&successors);
-        let (_, intervals, _) = crate::dominators::dominance(&successors, &predecessors);
+        let predecessors = crate::native::dominators::build_predecessors(&successors);
+        let (_, intervals, _) = crate::native::dominators::dominance(&successors, &predecessors);
         Dominators {
             block: index
                 .into_iter()
@@ -188,7 +188,7 @@ impl Dominators {
         else {
             return false;
         };
-        crate::dominators::dominates_interval(&self.intervals, ancestor, node)
+        crate::native::dominators::dominates_interval(&self.intervals, ancestor, node)
     }
 
     /// How many blocks the tree numbers, which is what the linear bound is about.

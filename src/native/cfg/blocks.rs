@@ -1039,24 +1039,6 @@ pub(in crate::native) fn switch_default_is_inferred_merge(blocks: &[BodyBlock]) 
     })
 }
 
-/// Switch-merge inference for a CFG the structured planner declined, keyed on the cost driver the
-/// complete inference actually has: block count. `infer_switch_merges` scans every later block as a
-/// merge candidate and proves reconvergence per switch arm, so its cost grows with the graph, not
-/// with why the planner stopped. The planner is skipped for two different reasons — a graph over
-/// `CROSS_ARM_EDGE_MAX_BLOCKS`, and a graph whose *branching density* exceeds the local ownership
-/// work budget — and only the first makes the complete inference expensive. A dense but small CFG
-/// keeps it: downgrading there costs the switch its merge and sends the whole module to raw-buffer
-/// construction, without saving work the planner skip was protecting.
-pub(in crate::native) fn infer_switch_merges_bounded(
-    blocks: &[BodyBlock],
-) -> HashMap<String, String> {
-    if blocks.len() > crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS {
-        infer_direct_switch_merges(blocks)
-    } else {
-        infer_switch_merges(blocks)
-    }
-}
-
 /// Infer only switches whose live targets are the merge itself or branch directly to one common
 /// merge. This linear-time subset is used when a rejected function is too large for the complete
 /// structured planner and the transitive-closure switch heuristic. It never guesses through an

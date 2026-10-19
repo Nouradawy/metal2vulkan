@@ -77,19 +77,8 @@ fn first_define_name(ll: &str) -> Option<String> {
 }
 
 fn symbol_after_ptr_at(s: &str) -> Option<String> {
-    // The entry node's first operand is the function pointer. Opaque-pointer AIR spells it
-    // `ptr @k`; `xcrun metal -S -emit-llvm` still spells it `void (i32 addrspace(1)*, i32)* @k`,
-    // where the pointer is the `*` closing the function type. Accept both, and take whichever
-    // comes first so a later operand can never be read as the entry.
-    let opaque = s.find("ptr @");
-    let typed = s.find("* @");
-    let p = match (opaque, typed) {
-        (Some(a), Some(b)) => a.min(b),
-        (Some(a), None) => a,
-        (None, Some(b)) => b,
-        (None, None) => return None,
-    };
-    symbol_after_at(s[p..s.len()].trim_start_matches(|c| c != '@'))
+    let p = s.find("ptr @")?;
+    symbol_after_at(&s[p + 4..])
 }
 
 fn symbol_after_at(s: &str) -> Option<String> {

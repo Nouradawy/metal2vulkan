@@ -13,18 +13,7 @@ use base64::Engine as _;
 use metal2vulkan::reflect::ShaderReflection;
 use std::path::Path;
 
-pub const EXECUTOR_ABI: &str = "vulkan-maintenance5-point-size-v46";
-
-/// Ask the Vulkan driver to build a compute pipeline for `spv` against the descriptor layout
-/// `reflection` describes, then discard it. Nothing is bound and nothing is dispatched.
-///
-/// This is the cheapest question with a real driver in the loop, and the only one a sweep over
-/// every corpus source can afford: does the module we emitted LOAD? A module can be valid
-/// SPIR-V and still be refused -- MoltenVK compiles it through MSL, so a shape SPIRV-Cross
-/// mistranslates is caught here and nowhere else in this repository.
-pub fn compile_kernel_pipeline(reflection: &ShaderReflection, spv: &[u8]) -> Result<(), String> {
-    platform::compile_kernel_pipeline(reflection, spv)
-}
+pub const EXECUTOR_ABI: &str = "vulkan-literal-resources-v38";
 
 pub fn execute_case(
     root: &Path,
@@ -63,14 +52,8 @@ pub fn execute_case(
         crate::case::product_transform_options_with_reflection(&checked.case, &checked.reflection)?;
     let linked_functions = candidate_linkage(&checked)?;
     let function_constants = resources.function_constant_values();
-    // Bind the module this executor just built, through the reflection OF that module. The checked
-    // reflection is `reflect_sanitized`'s, which constructs no module and therefore answers the
-    // AIR type name where only the finished module knows: a `texturecube` that is texel-read
-    // rather than direction-sampled binds as a 2D ARRAY image, and a consumer that creates a
-    // `VK_IMAGE_VIEW_TYPE_CUBE` view for it reads the wrong texel instead of failing. This runner
-    // IS such a consumer, so it follows the same reflection a shipped one would.
-    let (spv, reflection) = if linked_functions.is_empty() {
-        metal2vulkan::translate_sanitized_native_specialized_reflected_with_options(
+    let spv = if linked_functions.is_empty() {
+        metal2vulkan::translate_sanitized_native_specialized_with_options(
             &checked.source.air_ll,
             checked.case.stage.product(),
             scratch.path(),
@@ -78,7 +61,7 @@ pub fn execute_case(
             &function_constants,
         )?
     } else {
-        metal2vulkan::translate_sanitized_native_linked_specialized_reflected_with_options(
+        metal2vulkan::translate_sanitized_native_linked_specialized_with_options(
             &checked.source.air_ll,
             checked.case.stage.product(),
             scratch.path(),
@@ -116,29 +99,17 @@ pub fn execute_case(
             })
         }
     };
-    let tessellation_spv = tessellation_companion_spvasm(&resources, &reflection)?
+    let tessellation_spv = tessellation_companion_spvasm(&resources, &checked.reflection)?
         .map(|assembly| assemble_spvasm(&assembly, "tessellation-companion"))
         .transpose()?;
     let mut pipeline_modules = vec![spv.as_slice()];
     pipeline_modules.extend(tessellation_spv.as_deref());
     pipeline_modules.extend(companion_spv.as_deref());
     let spv_sha256 = pipeline_spv_sha256(&pipeline_modules);
-    drop(pipeline_modules);
-    // Bound every dispatched module before it reaches a real device. A committed command buffer
-    // cannot be cancelled, so a loop bound the translator dropped would pin the GPU until reboot
-    // rather than fail the case. The budget is applied AFTER `spv_sha256`, which identifies what
-    // the translator emitted; the instrumentation is a harness guard, not part of the translation.
-    let spv = bound_loops(spv, "candidate", &checked.case.case_id)?;
-    let companion_spv = companion_spv
-        .map(|spv| bound_loops(spv, "graphics companion", &checked.case.case_id))
-        .transpose()?;
-    let tessellation_spv = tessellation_spv
-        .map(|spv| bound_loops(spv, "tessellation companion", &checked.case.case_id))
-        .transpose()?;
     let (output, environment) = platform::execute(
         &checked.case,
         &resources,
-        &reflection,
+        &checked.reflection,
         &spv,
         companion_spv.as_deref(),
         tessellation_spv.as_deref(),
@@ -191,75 +162,6 @@ fn candidate_linkage(
 ) -> Result<metal2vulkan::linked_functions::LinkedFunctionLinkage, String> {
     crate::check::product_linkage(&checked.reflection, &checked.linked_functions)
 }
-/// Apply the pre-submission loop budget to one module about to be dispatched.
-///
-/// Loop-free modules are returned unchanged, so the overwhelming majority of the corpus dispatches
-/// exactly the bytes the translator emitted. A module that does carry loops is reported on stderr,
-/// because the operator needs to be able to tell an instrumented dispatch apart from a plain one.
-///
-/// **A loopy module is NOT compared as translated, and that is observable.** The bound adds a
-/// counter, an increment and a check block to every loop, and MoltenVK's runtime compiles the
-/// result to MSL and then to Metal -- so the Metal compiler sees a different loop body and can make
-/// different contraction and scheduling choices for the floating-point arithmetic inside it.
-/// Measured 2026-09-02: ten authored cases -- `ndArrayFFTRadix{5,7,9,11,13}` and their `_half`
-/// variants -- Mismatch with the bound and Match without it, all ten, and the difference in the
-/// smallest is one half: `0x8002` where Metal writes it and zero where we do, at one offset out of
-/// twenty bytes. That is a cancellation residue, the signature of a contraction difference.
-///
-/// **Budget invariance does not prove a mismatch is not the bound's doing**, and the commit that
-/// introduced this used it as if it did. Those same ten produce an identical output sha across
-/// budgets of 1024, 65536 and 262144 -- a 256x range -- because changing the budget changes one
-/// constant while the instructions stay put. The A/B that answers the question is instrumented
-/// against NOT instrumented, which is what `METAL2VULKAN_UNSAFE_NO_LOOP_BUDGET` is for.
-fn bound_loops(spv: Vec<u8>, label: &str, case_id: &str) -> Result<Vec<u8>, String> {
-    if bypass_loop_budget() {
-        eprintln!(
-            "case {case_id}: {label} module dispatched WITHOUT the loop bound; an unbounded loop \
-             here pins the GPU until the machine is rebooted"
-        );
-        return Ok(spv);
-    }
-    let budget = loop_budget();
-    let (bounded, report) = metal2vulkan::instrument_spirv_loop_budget(&spv, budget)
-        .map_err(|error| format!("bound {label} loops for case {case_id}: {error}"))?;
-    if report.had_loops() {
-        eprintln!(
-            "case {case_id}: {label} module bounded to {} iterations/loop ({} in place, {} via early return, {} non-iterating); \
-             a mismatch on this case is not conclusive until it is re-run with METAL2VULKAN_UNSAFE_NO_LOOP_BUDGET",
-            budget,
-            report.loops_bounded_in_place,
-            report.loops_bounded_via_early_return,
-            report.loops_skipped
-        );
-    }
-    Ok(bounded)
-}
-
-/// Iterations allowed per loop before the pre-submission budget forces an exit.
-///
-/// Overridable so a bisect can tighten the bound without a rebuild; an unparseable or zero value is
-/// ignored rather than honoured, because a zero budget would abandon every loop on its first
-/// iteration and turn the whole corpus red.
-/// UNSAFE diagnostic: dispatch loopy candidate modules exactly as translated, with no bound.
-///
-/// This is the only A/B that can tell an instrumentation artefact apart from a translation bug, so
-/// it has to exist -- but it hands the GPU a module whose termination nothing has checked, and a
-/// committed Metal command buffer cannot be cancelled. A kernel that does not terminate pins the
-/// GPU until the machine is rebooted; it does not fault, it starves WindowServer past its
-/// 40-second watchdog and takes the login session with it. Use it on one named `--case-id` whose
-/// bounded run already completed, never on a sweep.
-fn bypass_loop_budget() -> bool {
-    std::env::var_os("METAL2VULKAN_UNSAFE_NO_LOOP_BUDGET").is_some()
-}
-
-fn loop_budget() -> u32 {
-    std::env::var("METAL2VULKAN_LOOP_BUDGET")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|budget| *budget > 0)
-        .unwrap_or(metal2vulkan::DEFAULT_LOOP_BUDGET)
-}
-
 fn pipeline_spv_sha256(modules: &[&[u8]]) -> String {
     if modules.len() == 1 {
         return sha256_bytes(modules[0]);
@@ -988,25 +890,6 @@ mod platform {
     ) -> Result<(Vec<u8>, serde_json::Value), String> {
         debug_assert!(validate_backend_host(backend).is_ok());
         debug_assert!(crate::executor_contract::require_case(case, "candidate executor").is_ok());
-        with_context(|context| {
-            execute_with_context(
-                context,
-                case,
-                resources,
-                reflection,
-                spv,
-                companion_spv,
-                tessellation_spv,
-            )
-        })
-    }
-
-    /// Run `body` against this thread's Vulkan context, creating the device on first use. One
-    /// device serves every call on the thread: device creation dominates the cost of a single
-    /// case, and a corpus sweep makes thousands of calls.
-    fn with_context<R>(
-        body: impl FnOnce(&VulkanContext) -> Result<R, String>,
-    ) -> Result<R, String> {
         thread_local! {
             static CONTEXT: RefCell<Option<VulkanContext>> = const { RefCell::new(None) };
         }
@@ -1015,34 +898,15 @@ mod platform {
             if slot.is_none() {
                 *slot = Some(VulkanContext::new()?);
             }
-            body(slot.as_ref().expect("initialized Vulkan context"))
-        })
-    }
-
-    /// Build a kernel's descriptor-set layouts, pipeline layout, shader module and compute
-    /// pipeline, and throw all of it away. No resources are allocated and no work is submitted, so
-    /// the only question this answers is whether the driver ACCEPTS the module we emitted against
-    /// the layout our own reflection describes -- which is the question a whole-corpus sweep can
-    /// afford to ask of every source. It shares [`pipeline_layout_objects`] with the executor, so a
-    /// pipeline that builds here is the pipeline a case would have run.
-    ///
-    /// The local size is left unspecialized: the module's own default is what a
-    /// `KernelDispatch::Workgroups` case would use, and a sweep has no dispatch to derive the
-    /// other contracts' per-region sizes from.
-    pub fn compile_kernel_pipeline(
-        reflection: &ShaderReflection,
-        spv: &[u8],
-    ) -> Result<(), String> {
-        if reflection.stage != metal2vulkan::reflect::ShaderStage::Kernel {
-            return Err(format!(
-                "pipeline compilation covers kernels only, not {:?}",
-                reflection.stage
-            ));
-        }
-        with_context(|context| {
-            let (mut objects, _bindings) = pipeline_layout_objects(context, reflection)?;
-            objects.shader = create_shader_module(context, spv, "primary")?;
-            create_compute_pipeline(context, &mut objects, None)
+            execute_with_context(
+                slot.as_ref().expect("initialized Vulkan context"),
+                case,
+                resources,
+                reflection,
+                spv,
+                companion_spv,
+                tessellation_spv,
+            )
         })
     }
 
@@ -1080,9 +944,67 @@ mod platform {
             .bindings
             .iter()
             .any(|binding| binding.kind == metal2vulkan::reflect::ResourceKind::ColorInput);
-        let (mut objects, descriptor_bindings) = pipeline_layout_objects(context, reflection)?;
+        let descriptor_bindings = descriptor_bindings(reflection)?;
+        let mut objects = DeviceObjects::new(&context.device);
+        objects.descriptor_set_index = reflection.descriptor_layout.set;
+        let max_bound_descriptor_sets = unsafe {
+            context
+                .instance
+                .get_physical_device_properties(context.physical)
+        }
+        .limits
+        .max_bound_descriptor_sets;
+        if reflection.descriptor_layout.set >= max_bound_descriptor_sets {
+            return Err(format!(
+                "effective descriptor set {} exceeds device maxBoundDescriptorSets {}",
+                reflection.descriptor_layout.set, max_bound_descriptor_sets
+            ));
+        }
+        let set_count = reflection
+            .descriptor_layout
+            .set
+            .checked_add(1)
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or_else(|| {
+                "descriptor set index cannot be represented by the executor".to_string()
+            })?;
+        for set in 0..set_count {
+            let set_layout_info = if set == reflection.descriptor_layout.set as usize {
+                vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_bindings)
+            } else {
+                vk::DescriptorSetLayoutCreateInfo::default()
+            };
+            let layout = unsafe {
+                context
+                    .device
+                    .create_descriptor_set_layout(&set_layout_info, None)
+            }
+            .map_err(|error| format!("create descriptor-set layout {set}: {error}"))?;
+            objects.set_layouts.push(layout);
+        }
         let set_layout = objects.set_layouts[reflection.descriptor_layout.set as usize];
         objects.framebuffer_fetch = framebuffer_fetch;
+
+        let push_constant_ranges = reflection
+            .kernel_dispatch
+            .and_then(metal2vulkan::reflect::KernelDispatch::push_constant_range)
+            .map(|range| {
+                vec![vk::PushConstantRange::default()
+                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                    .offset(range.offset)
+                    .size(range.size)]
+            })
+            .unwrap_or_default();
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&objects.set_layouts)
+            .push_constant_ranges(&push_constant_ranges);
+        objects.pipeline_layout = unsafe {
+            context
+                .device
+                .create_pipeline_layout(&pipeline_layout_info, None)
+        }
+        .map_err(|error| format!("create pipeline layout: {error}"))?;
+
         objects.shader = create_shader_module(context, spv, "primary")?;
         match case.stage {
             Stage::Kernel => {
@@ -1352,7 +1274,7 @@ mod platform {
                     &objects,
                 ),
             }
-            copy_images_to_readback(&context.device, command, &images);
+            make_images_host_readable(&context.device, command, &images);
             make_texel_buffers_host_readable(&context.device, command, &texel_buffers);
             context
                 .device
@@ -1393,74 +1315,6 @@ mod platform {
             )?,
             environment,
         ))
-    }
-
-    /// Every descriptor-set layout up to and including the effective set, and the pipeline layout
-    /// over them. Returns the `DeviceObjects` that owns them -- so dropping the result destroys
-    /// them in the right order whether the caller went on to build a pipeline or not -- alongside
-    /// the effective set's bindings, which the executor sizes its descriptor pool from.
-    fn pipeline_layout_objects(
-        context: &VulkanContext,
-        reflection: &ShaderReflection,
-    ) -> Result<(DeviceObjects, Vec<vk::DescriptorSetLayoutBinding<'static>>), String> {
-        let descriptor_bindings = descriptor_bindings(reflection)?;
-        let mut objects = DeviceObjects::new(&context.device);
-        objects.descriptor_set_index = reflection.descriptor_layout.set;
-        let max_bound_descriptor_sets = unsafe {
-            context
-                .instance
-                .get_physical_device_properties(context.physical)
-        }
-        .limits
-        .max_bound_descriptor_sets;
-        if reflection.descriptor_layout.set >= max_bound_descriptor_sets {
-            return Err(format!(
-                "effective descriptor set {} exceeds device maxBoundDescriptorSets {}",
-                reflection.descriptor_layout.set, max_bound_descriptor_sets
-            ));
-        }
-        let set_count = reflection
-            .descriptor_layout
-            .set
-            .checked_add(1)
-            .and_then(|count| usize::try_from(count).ok())
-            .ok_or_else(|| {
-                "descriptor set index cannot be represented by the executor".to_string()
-            })?;
-        for set in 0..set_count {
-            let set_layout_info = if set == reflection.descriptor_layout.set as usize {
-                vk::DescriptorSetLayoutCreateInfo::default().bindings(&descriptor_bindings)
-            } else {
-                vk::DescriptorSetLayoutCreateInfo::default()
-            };
-            let layout = unsafe {
-                context
-                    .device
-                    .create_descriptor_set_layout(&set_layout_info, None)
-            }
-            .map_err(|error| format!("create descriptor-set layout {set}: {error}"))?;
-            objects.set_layouts.push(layout);
-        }
-        let push_constant_ranges = reflection
-            .kernel_dispatch
-            .and_then(metal2vulkan::reflect::KernelDispatch::push_constant_range)
-            .map(|range| {
-                vec![vk::PushConstantRange::default()
-                    .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                    .offset(range.offset)
-                    .size(range.size)]
-            })
-            .unwrap_or_default();
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&objects.set_layouts)
-            .push_constant_ranges(&push_constant_ranges);
-        objects.pipeline_layout = unsafe {
-            context
-                .device
-                .create_pipeline_layout(&pipeline_layout_info, None)
-        }
-        .map_err(|error| format!("create pipeline layout: {error}"))?;
-        Ok((objects, descriptor_bindings))
     }
 
     fn create_shader_module(
@@ -2338,10 +2192,6 @@ mod platform {
         tessellation_shader: bool,
         shader_stencil_export: bool,
         fragment_shader_pixel_interlock: bool,
-        shader_int64: bool,
-        shader_subgroup_extended_types: bool,
-        shader_demote_to_helper_invocation: bool,
-        multisample_array_image: bool,
         max_sampler_anisotropy: f32,
     }
 
@@ -2413,244 +2263,62 @@ mod platform {
             let interlock_extension = device_extensions
                 .iter()
                 .any(|extension| extension_name(&extension.extension_name) == interlock_name);
-            // A translated module whose source divided without `arcp` decorates that division
-            // `FPFastMathMode` with no bits set, which is the only per-instruction way to say the
-            // quotient may not become a multiply by an approximate reciprocal. The decoration needs
-            // `SPV_KHR_float_controls2`, so the device has to enable its Vulkan extension or such a
-            // module is not legal to load here.
-            let float_controls2_name = ash::khr::shader_float_controls2::NAME;
-            let float_controls2_extension = device_extensions
-                .iter()
-                .any(|extension| extension_name(&extension.extension_name) == float_controls2_name);
-            // `OpDemoteToHelperInvocation` is `discard_fragment()`. 199 corpus modules declare it,
-            // and on an API-1.2 device the SPIR-V extension is legal only behind this Vulkan one.
-            let demote_name = ash::ext::shader_demote_to_helper_invocation::NAME;
-            let demote_extension = device_extensions
-                .iter()
-                .any(|extension| extension_name(&extension.extension_name) == demote_name);
-            // `AtomicFloat32AddEXT`, 12 corpus modules.
-            let atomic_float_name = ash::ext::shader_atomic_float::NAME;
-            let atomic_float_extension = device_extensions
-                .iter()
-                .any(|extension| extension_name(&extension.extension_name) == atomic_float_name);
-            // `FragmentBarycentricKHR`, 13 corpus modules.
-            let barycentric_name = ash::khr::fragment_shader_barycentric::NAME;
-            let barycentric_extension = device_extensions
-                .iter()
-                .any(|extension| extension_name(&extension.extension_name) == barycentric_name);
-            // A `vertex void` Metal function has no position output at all, let alone a
-            // `[[point_size]]`. Three cases in the store draw points with one, and without
-            // `maintenance5` VUID-VkGraphicsPipelineCreateInfo-topology-08773 makes a POINT_LIST
-            // pipeline demand that the last vertex-processing stage write `PointSize` -- so those
-            // pipelines were invalid, and a result recorded from an invalid pipeline is not entitled
-            // to be trusted whatever it happens to be. `maintenance5` is exactly the guarantee the
-            // case needs: it DEFINES the unwritten `PointSize` as 1.0 rather than leaving it
-            // undefined.
-            //
-            // Substituting a different topology is not an alternative, and this was measured rather
-            // than assumed: under TRIANGLE_LIST both rasterization-disabled point cases flip to
-            // Mismatch, because a one-vertex draw assembles no triangle and the vertex shader never
-            // runs. `rasterization_disabled_vertex_executes_narrow_attributes_without_a_companion`
-            // fails on that substitution too, so the topology is load-bearing and guarded.
-            //
-            // `VK_KHR_maintenance5` requires `VK_KHR_dynamic_rendering` in the same enabled list
-            // (VUID-vkCreateDevice-ppEnabledExtensionNames-01387), so both are asked for or neither
-            // is. Nothing here begins a dynamic-rendering pass; that dependency is a listing rule,
-            // not a change to how this executor draws.
-            let maintenance5_name = ash::khr::maintenance5::NAME;
-            let dynamic_rendering_name = ash::khr::dynamic_rendering::NAME;
-            let maintenance5_extension =
-                [maintenance5_name, dynamic_rendering_name]
-                    .iter()
-                    .all(|wanted| {
-                        device_extensions
-                            .iter()
-                            .any(|extension| extension_name(&extension.extension_name) == *wanted)
-                    });
             let priorities = [1.0f32];
             let queue_info = [vk::DeviceQueueCreateInfo::default()
                 .queue_family_index(queue_family)
                 .queue_priorities(&priorities)];
-            // What the modules under test actually declare, censused over the 13318 of 14579 corpus
-            // sources that translate: `Int64` 7811, `Int8` 10474, `Int16` 8069, `Float16` 6908,
-            // `ShaderViewportIndex` 523, `PhysicalStorageBufferAddresses` 387, `Geometry` 236,
-            // `Tessellation` 233, `DemoteToHelperInvocation` 199, `ShaderLayer` 154, `ClipDistance`
-            // 85, `StorageImageExtendedFormats` 74, `VariablePointers{,StorageBuffer}` 110,
-            // `FragmentBarycentricKHR` 13, `AtomicFloat32AddEXT` 12. A capability the module
-            // declares and the device has not enabled is not a slow path, it is an invalid
-            // `VkShaderModule`: the executor was creating 500 of them per store-wide sweep and the
-            // results it recorded from them were not entitled to be trusted.
-            //
-            // The two aggregate structs replace the four single-purpose ones they subsume
-            // (`16BitStorage`, `8BitStorage`, `ShaderFloat16Int8`, `BufferDeviceAddress`). Vulkan
-            // forbids chaining both forms, and the aggregates are where the newly required members
-            // live -- `shaderSubgroupExtendedTypes`, `shaderOutputViewportIndex`, `variablePointers`
-            // have no single-purpose struct we could add beside the old four.
-            let mut supported_11 = vk::PhysicalDeviceVulkan11Features::default();
-            let mut supported_12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut supported_bda = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+            let mut supported_16 = vk::PhysicalDevice16BitStorageFeatures::default();
+            let mut supported_float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default();
             let mut supported_interlock =
                 vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default();
-            let mut supported_float_controls2 =
-                vk::PhysicalDeviceShaderFloatControls2FeaturesKHR::default();
-            let mut supported_demote =
-                vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default();
-            let mut supported_atomic_float =
-                vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default();
-            let mut supported_barycentric =
-                vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default();
-            let mut supported_maintenance5 = vk::PhysicalDeviceMaintenance5FeaturesKHR::default();
-            // A portable implementation reports everything it CANNOT do here, and the struct
-            // defaults to all-false. Enabling `VK_KHR_portability_subset` without chaining it means
-            // asking for none of it -- which is why every multisampled array image this executor
-            // created was rejected by `multisampleArrayImage`.
-            let mut supported_subset = vk::PhysicalDevicePortabilitySubsetFeaturesKHR::default();
-            let core = {
+            let (sampler_anisotropy, sample_rate_shading, tessellation_shader, shader_int16) = {
                 let mut features = vk::PhysicalDeviceFeatures2::default()
-                    .push_next(&mut supported_11)
-                    .push_next(&mut supported_12)
-                    .push_next(&mut supported_interlock)
-                    .push_next(&mut supported_float_controls2);
-                if demote_extension {
-                    features = features.push_next(&mut supported_demote);
-                }
-                if atomic_float_extension {
-                    features = features.push_next(&mut supported_atomic_float);
-                }
-                if barycentric_extension {
-                    features = features.push_next(&mut supported_barycentric);
-                }
-                if maintenance5_extension {
-                    features = features.push_next(&mut supported_maintenance5);
-                }
-                if subset {
-                    features = features.push_next(&mut supported_subset);
-                }
+                    .push_next(&mut supported_bda)
+                    .push_next(&mut supported_16)
+                    .push_next(&mut supported_float16)
+                    .push_next(&mut supported_interlock);
                 unsafe { instance.get_physical_device_features2(physical, &mut features) };
-                features.features
+                (
+                    features.features.sampler_anisotropy == vk::TRUE,
+                    features.features.sample_rate_shading == vk::TRUE,
+                    features.features.tessellation_shader == vk::TRUE,
+                    features.features.shader_int16 == vk::TRUE,
+                )
             };
-            let on = |supported: vk::Bool32| supported == vk::TRUE;
-            let sampler_anisotropy = on(core.sampler_anisotropy);
-            let sample_rate_shading = on(core.sample_rate_shading);
-            let tessellation_shader = on(core.tessellation_shader);
-            let buffer_device_address = on(supported_12.buffer_device_address);
-            let fragment_shader_pixel_interlock =
-                interlock_extension && on(supported_interlock.fragment_shader_pixel_interlock);
-            let shader_float_controls2 =
-                float_controls2_extension && on(supported_float_controls2.shader_float_controls2);
-            let shader_demote_to_helper_invocation =
-                demote_extension && on(supported_demote.shader_demote_to_helper_invocation);
-            let shader_buffer_float32_atomic_add = atomic_float_extension
-                && on(supported_atomic_float.shader_buffer_float32_atomic_add);
-            let fragment_shader_barycentric =
-                barycentric_extension && on(supported_barycentric.fragment_shader_barycentric);
-            let maintenance5 = maintenance5_extension && on(supported_maintenance5.maintenance5);
+            let buffer_device_address = supported_bda.buffer_device_address == vk::TRUE;
+            let fragment_shader_pixel_interlock = interlock_extension
+                && supported_interlock.fragment_shader_pixel_interlock == vk::TRUE;
             let enabled_device_extensions = subset
                 .then_some(subset_name.as_ptr())
                 .into_iter()
                 .chain(stencil_export.then_some(stencil_export_name.as_ptr()))
                 .chain(fragment_shader_pixel_interlock.then_some(interlock_name.as_ptr()))
-                .chain(shader_float_controls2.then_some(float_controls2_name.as_ptr()))
-                .chain(shader_demote_to_helper_invocation.then_some(demote_name.as_ptr()))
-                .chain(shader_buffer_float32_atomic_add.then_some(atomic_float_name.as_ptr()))
-                .chain(fragment_shader_barycentric.then_some(barycentric_name.as_ptr()))
-                .chain(maintenance5.then_some(maintenance5_name.as_ptr()))
-                .chain(maintenance5.then_some(dynamic_rendering_name.as_ptr()))
                 .collect::<Vec<_>>();
             let enabled_features = vk::PhysicalDeviceFeatures::default()
                 .sampler_anisotropy(sampler_anisotropy)
                 .sample_rate_shading(sample_rate_shading)
                 .tessellation_shader(tessellation_shader)
-                .shader_int16(on(core.shader_int16))
-                .shader_int64(on(core.shader_int64))
-                .shader_clip_distance(on(core.shader_clip_distance))
-                .shader_cull_distance(on(core.shader_cull_distance))
-                .shader_storage_image_extended_formats(on(
-                    core.shader_storage_image_extended_formats
-                ))
-                .image_cube_array(on(core.image_cube_array))
-                .geometry_shader(on(core.geometry_shader))
-                // A graphics-stage module that genuinely writes a storage buffer still needs these.
-                // 50 of the 2608 corpus modules that declare one do; the other 2558 now say so with
-                // `NonWritable` and ask for nothing.
-                .fragment_stores_and_atomics(on(core.fragment_stores_and_atomics))
-                .vertex_pipeline_stores_and_atomics(on(core.vertex_pipeline_stores_and_atomics));
-            let mut enabled_11 = vk::PhysicalDeviceVulkan11Features::default()
-                .storage_input_output16(on(supported_11.storage_input_output16))
-                .storage_buffer16_bit_access(on(supported_11.storage_buffer16_bit_access))
-                .uniform_and_storage_buffer16_bit_access(on(
-                    supported_11.uniform_and_storage_buffer16_bit_access
-                ))
-                .storage_push_constant16(on(supported_11.storage_push_constant16))
-                .variable_pointers(on(supported_11.variable_pointers))
-                .variable_pointers_storage_buffer(
-                    on(supported_11.variable_pointers_storage_buffer),
-                );
-            let mut enabled_12 = vk::PhysicalDeviceVulkan12Features::default()
-                .storage_buffer8_bit_access(on(supported_12.storage_buffer8_bit_access))
-                .uniform_and_storage_buffer8_bit_access(on(
-                    supported_12.uniform_and_storage_buffer8_bit_access
-                ))
-                .storage_push_constant8(on(supported_12.storage_push_constant8))
-                .shader_float16(on(supported_12.shader_float16))
-                .shader_int8(on(supported_12.shader_int8))
-                .shader_subgroup_extended_types(on(supported_12.shader_subgroup_extended_types))
-                .shader_output_viewport_index(on(supported_12.shader_output_viewport_index))
-                .shader_output_layer(on(supported_12.shader_output_layer))
+                .shader_int16(shader_int16);
+            let mut enabled_bda = vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
                 .buffer_device_address(buffer_device_address);
+            let mut enabled_16 = vk::PhysicalDevice16BitStorageFeatures::default()
+                .storage_input_output16(supported_16.storage_input_output16 == vk::TRUE);
+            let mut enabled_float16 = vk::PhysicalDeviceShaderFloat16Int8Features::default()
+                .shader_float16(supported_float16.shader_float16 == vk::TRUE)
+                .shader_int8(supported_float16.shader_int8 == vk::TRUE);
             let mut enabled_interlock =
                 vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT::default()
                     .fragment_shader_pixel_interlock(fragment_shader_pixel_interlock);
-            let mut enabled_float_controls2 =
-                vk::PhysicalDeviceShaderFloatControls2FeaturesKHR::default()
-                    .shader_float_controls2(shader_float_controls2);
-            let mut enabled_demote =
-                vk::PhysicalDeviceShaderDemoteToHelperInvocationFeatures::default()
-                    .shader_demote_to_helper_invocation(shader_demote_to_helper_invocation);
-            let mut enabled_atomic_float =
-                vk::PhysicalDeviceShaderAtomicFloatFeaturesEXT::default()
-                    .shader_buffer_float32_atomic_add(shader_buffer_float32_atomic_add)
-                    .shader_shared_float32_atomic_add(
-                        atomic_float_extension
-                            && on(supported_atomic_float.shader_shared_float32_atomic_add),
-                    );
-            let mut enabled_barycentric =
-                vk::PhysicalDeviceFragmentShaderBarycentricFeaturesKHR::default()
-                    .fragment_shader_barycentric(fragment_shader_barycentric);
-            let mut enabled_maintenance5 =
-                vk::PhysicalDeviceMaintenance5FeaturesKHR::default().maintenance5(maintenance5);
-            // Ask a portable implementation for exactly what it says it has. Every member is a
-            // capability the executor may need and none of them is a behaviour change on an
-            // implementation that reports it.
-            //
-            // `supported_subset` was chained into the QUERY, so its `p_next` still points at the
-            // struct that followed it there. Copying the answer copies that link, and the device
-            // chain then contains every one of those structures twice -- which Vulkan rejects under
-            // `VUID-VkDeviceCreateInfo-sType-unique`. Only the members are being copied here.
-            let mut enabled_subset = supported_subset;
-            enabled_subset.p_next = std::ptr::null_mut();
-            let multisample_array_image = subset && on(supported_subset.multisample_array_image);
             let mut device_info = vk::DeviceCreateInfo::default()
                 .queue_create_infos(&queue_info)
                 .enabled_extension_names(&enabled_device_extensions)
                 .enabled_features(&enabled_features)
-                .push_next(&mut enabled_11)
-                .push_next(&mut enabled_12)
-                .push_next(&mut enabled_interlock)
-                .push_next(&mut enabled_float_controls2);
-            if shader_demote_to_helper_invocation {
-                device_info = device_info.push_next(&mut enabled_demote);
-            }
-            if atomic_float_extension && shader_buffer_float32_atomic_add {
-                device_info = device_info.push_next(&mut enabled_atomic_float);
-            }
-            if fragment_shader_barycentric {
-                device_info = device_info.push_next(&mut enabled_barycentric);
-            }
-            if maintenance5 {
-                device_info = device_info.push_next(&mut enabled_maintenance5);
-            }
-            if subset {
-                device_info = device_info.push_next(&mut enabled_subset);
+                .push_next(&mut enabled_16)
+                .push_next(&mut enabled_float16)
+                .push_next(&mut enabled_interlock);
+            if buffer_device_address {
+                device_info = device_info.push_next(&mut enabled_bda);
             }
             let device = unsafe { instance.create_device(physical, &device_info, None) }
                 .map_err(|error| format!("create Vulkan device: {error}"))?;
@@ -2672,10 +2340,6 @@ mod platform {
                 tessellation_shader,
                 shader_stencil_export: stencil_export,
                 fragment_shader_pixel_interlock,
-                shader_int64: on(core.shader_int64),
-                shader_subgroup_extended_types: on(supported_12.shader_subgroup_extended_types),
-                shader_demote_to_helper_invocation,
-                multisample_array_image,
                 max_sampler_anisotropy,
             })
         }
@@ -2693,10 +2357,6 @@ mod platform {
                 "api_version": properties.api_version,
                 "buffer_device_address": self.buffer_device_address,
                 "fragment_shader_pixel_interlock": self.fragment_shader_pixel_interlock,
-                "shader_int64": self.shader_int64,
-                "shader_subgroup_extended_types": self.shader_subgroup_extended_types,
-                "shader_demote_to_helper_invocation": self.shader_demote_to_helper_invocation,
-                "multisample_array_image": self.multisample_array_image,
                 "sampler_anisotropy": self.sampler_anisotropy,
                 "sample_rate_shading": self.sample_rate_shading,
                 "shader_stencil_export": self.shader_stencil_export,
@@ -2765,7 +2425,7 @@ mod platform {
         array_layers: u32,
         extent: vk::Extent3D,
         staging: Option<HostBuffer>,
-        readback: Option<HostBuffer>,
+        general_ready: bool,
     }
 
     struct TexelBufferAllocation {
@@ -2797,6 +2457,11 @@ mod platform {
                 count: self.descriptor_count,
             })
             .chain(self.descriptor_aliases.iter().copied())
+        }
+
+        fn uses_descriptor_type(&self, descriptor_type: vk::DescriptorType) -> bool {
+            self.descriptor_targets()
+                .any(|target| target.descriptor_type == descriptor_type)
         }
     }
 
@@ -2882,7 +2547,6 @@ mod platform {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum ImageIdentity {
         Texture(u32),
-        SynthesizedNullTexture(u32),
         TextureArrayElement {
             binding: u32,
             element: u32,
@@ -3151,11 +2815,7 @@ mod platform {
                         vk::DescriptorType::STORAGE_BUFFER
                     }
                     metal2vulkan::reflect::ResourceKind::Texture
-                    | metal2vulkan::reflect::ResourceKind::StorageImage
-                    // The translator invents this descriptor to type an image the module selects
-                    // dynamically; there is no Metal argument behind it, but the module still reads
-                    // through it, so the executor supplies a deterministic all-zero placeholder.
-                    | metal2vulkan::reflect::ResourceKind::SynthesizedNullTexture => {
+                    | metal2vulkan::reflect::ResourceKind::StorageImage => {
                         vulkan_texture_descriptor_type(binding)
                     }
                     metal2vulkan::reflect::ResourceKind::TextureArray => {
@@ -3173,11 +2833,7 @@ mod platform {
                         }
                     }
                     metal2vulkan::reflect::ResourceKind::Sampler
-                    | metal2vulkan::reflect::ResourceKind::StaticSampler
-                    // Invented by the translator to give a cube texel read and a sampler-free LOD
-                    // query the sampler SPIR-V demands. No Metal argument is behind it, so the
-                    // executor binds the state the reflection reports rather than an authored one.
-                    | metal2vulkan::reflect::ResourceKind::SynthesizedReadSampler => {
+                    | metal2vulkan::reflect::ResourceKind::StaticSampler => {
                         vk::DescriptorType::SAMPLER
                     }
                     metal2vulkan::reflect::ResourceKind::ColorInput => {
@@ -3419,16 +3075,14 @@ mod platform {
             .map(|resource| {
                 let mut targets = top_level_texture_targets(reflection, resource.binding, false)?;
                 let primary = targets.remove(0);
-                let view_type = reflected_view_type(
-                    descriptor_texture_shape(reflection, primary.binding),
-                    resource.texture_type,
-                );
                 create_image(
                     context,
                     &TextureLiteralRef::top_level(resource),
-                    primary,
+                    primary.binding,
+                    primary.descriptor_type,
+                    primary.element,
+                    primary.count,
                     targets,
-                    view_type,
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -3439,77 +3093,28 @@ mod platform {
             for (element, resource) in array.elements.iter().enumerate() {
                 let mut targets = texture_array_targets(reflection, array.binding, element as u32)?;
                 let primary = targets.remove(0);
-                let view_type = reflected_view_type(
-                    descriptor_texture_shape(reflection, primary.binding),
-                    resource.texture_type,
-                );
                 images.push(create_image(
                     context,
                     &TextureLiteralRef::array_element(array.binding, element as u32, resource),
-                    primary,
+                    primary.binding,
+                    primary.descriptor_type,
+                    primary.element,
+                    primary.count,
                     targets,
-                    view_type,
                 )?);
             }
-        }
-        // Metal's null texture reads as zero at every coordinate. A one-texel image whose single
-        // texel is zero reproduces that for a sample or a fetch at any coordinate and any address
-        // mode, which is what the modules reaching this binding do with it. It does NOT reproduce a
-        // size query -- Metal answers 0 there and this image answers 1 -- so a module that asks a
-        // null texture for its extent is still not executable, and none of the twelve that reach
-        // this binding does -- all twelve select the image dynamically and then sample it.
-        let null_texture_zero = [0u8; 8];
-        for binding in reflection.bindings.iter().filter(|binding| {
-            binding.kind == metal2vulkan::reflect::ResourceKind::SynthesizedNullTexture
-        }) {
-            let descriptor = binding.descriptor.ok_or_else(|| {
-                format!(
-                    "synthesized null texture {} has no descriptor binding",
-                    binding.metal_index
-                )
-            })?;
-            let shape = binding.texture_shape.ok_or_else(|| {
-                format!(
-                    "synthesized null texture {} has no reflected texture shape",
-                    binding.metal_index
-                )
-            })?;
-            let texture_type = synthesized_null_texture_type(shape)?;
-            let literal = TextureLiteralRef {
-                identity: ImageIdentity::SynthesizedNullTexture(descriptor.binding),
-                label: format!("synthesized null texture {}", binding.metal_index),
-                texture_type,
-                format: crate::case::TextureFormat::Rgba16Float,
-                dimensions: [1, 1, 1],
-                sample_count: 1,
-                bytes: &null_texture_zero,
-            };
-            images.push(create_image(
-                context,
-                &literal,
-                TextureDescriptorTarget {
-                    binding: descriptor.binding,
-                    descriptor_type: vulkan_texture_descriptor_type(binding),
-                    element: 0,
-                    count: 1,
-                },
-                Vec::new(),
-                reflected_view_type(Some(shape), texture_type),
-            )?);
         }
         for resource in &resources.argument_buffer_textures {
             let mut targets = embedded_texture_targets(reflection, resource)?;
             let primary = targets.remove(0);
-            let view_type = reflected_view_type(
-                descriptor_texture_shape(reflection, primary.binding),
-                resource.texture_type,
-            );
             images.push(create_image(
                 context,
                 &TextureLiteralRef::argument_buffer(resource),
-                primary,
+                primary.binding,
+                primary.descriptor_type,
+                primary.element,
+                primary.count,
                 targets,
-                view_type,
             )?);
         }
         for attachment in &reflection.implicit_imageblock_attachments {
@@ -3549,17 +3154,11 @@ mod platform {
             images.push(create_image(
                 context,
                 &input,
-                TextureDescriptorTarget {
-                    binding: attachment.binding,
-                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-                    element: 0,
-                    count: 1,
-                },
+                attachment.binding,
+                vk::DescriptorType::STORAGE_IMAGE,
+                0,
+                1,
                 Vec::new(),
-                reflected_view_type(
-                    descriptor_texture_shape(reflection, attachment.binding),
-                    input.texture_type,
-                ),
             )?);
         }
         if let (Some(authored), Some(reflected)) = (
@@ -3595,17 +3194,11 @@ mod platform {
                 images.push(create_image(
                     context,
                     &input,
-                    TextureDescriptorTarget {
-                        binding,
-                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-                        element: 0,
-                        count: 1,
-                    },
+                    binding,
+                    vk::DescriptorType::STORAGE_IMAGE,
+                    0,
+                    1,
                     Vec::new(),
-                    reflected_view_type(
-                        descriptor_texture_shape(reflection, binding),
-                        input.texture_type,
-                    ),
                 )?);
             }
         }
@@ -4021,16 +3614,12 @@ mod platform {
     fn create_image(
         context: &VulkanContext,
         resource: &TextureLiteralRef<'_>,
-        descriptor: TextureDescriptorTarget,
+        descriptor_binding: u32,
+        descriptor_type: vk::DescriptorType,
+        descriptor_element: u32,
+        descriptor_count: u32,
         descriptor_aliases: Vec<TextureDescriptorTarget>,
-        view_type: vk::ImageViewType,
     ) -> Result<ImageAllocation, String> {
-        let TextureDescriptorTarget {
-            binding: descriptor_binding,
-            descriptor_type,
-            element: descriptor_element,
-            count: descriptor_count,
-        } = descriptor;
         let layout = resource.layout()?;
         let label = &resource.label;
         if layout.sample_count != 1 {
@@ -4065,8 +3654,8 @@ mod platform {
             || descriptor_aliases
                 .iter()
                 .any(|target| target.descriptor_type == vk::DescriptorType::SAMPLED_IMAGE);
-        let mut required_features =
-            vk::FormatFeatureFlags::TRANSFER_SRC | vk::FormatFeatureFlags::TRANSFER_DST;
+        let optimal_staging = sampled_only_requires_staging(uses_sampled, uses_storage);
+        let mut required_features = vk::FormatFeatureFlags::empty();
         if uses_storage {
             required_features |= vk::FormatFeatureFlags::STORAGE_IMAGE;
         }
@@ -4078,12 +3667,15 @@ mod platform {
                 .instance
                 .get_physical_device_format_properties(context.physical, format)
         };
-        if !properties
-            .optimal_tiling_features
-            .contains(required_features)
-        {
+        let available_features = if optimal_staging {
+            properties.optimal_tiling_features
+        } else {
+            properties.linear_tiling_features
+        };
+        if !available_features.contains(required_features) {
             return Err(format!(
-                "Vulkan device lacks optimal-tiling feature {:#x} for texture {} format {}",
+                "Vulkan device lacks {}-tiling feature {:#x} for texture {} format {}",
+                if optimal_staging { "optimal" } else { "linear" },
                 required_features.as_raw(),
                 label,
                 format.as_raw(),
@@ -4110,7 +3702,11 @@ mod platform {
         if uses_sampled {
             usage |= vk::ImageUsageFlags::SAMPLED;
         }
-        usage |= vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        usage |= if optimal_staging {
+            vk::ImageUsageFlags::TRANSFER_DST
+        } else {
+            vk::ImageUsageFlags::empty()
+        };
         let extent = vk::Extent3D {
             width: layout.width,
             height: layout.height,
@@ -4124,16 +3720,28 @@ mod platform {
             .mip_levels(1)
             .array_layers(layout.array_layers)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
+            .tiling(if optimal_staging {
+                vk::ImageTiling::OPTIMAL
+            } else {
+                vk::ImageTiling::LINEAR
+            })
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
+            .initial_layout(if optimal_staging {
+                vk::ImageLayout::UNDEFINED
+            } else {
+                vk::ImageLayout::PREINITIALIZED
+            });
         let image = unsafe { context.device.create_image(&create_info, None) }
             .map_err(|error| format!("create {label} image: {error}"))?;
         let requirements = unsafe { context.device.get_image_memory_requirements(image) };
         let memory_type = context.memory_type(
             requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            if optimal_staging {
+                vk::MemoryPropertyFlags::DEVICE_LOCAL
+            } else {
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT
+            },
         )?;
         let allocation_info = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
@@ -4152,21 +3760,20 @@ mod platform {
         } else {
             vk::ImageAspectFlags::COLOR
         };
-        let staging = Some(create_host_buffer(
-            context,
-            &format!("{label} staging"),
-            resource.bytes,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-        )?);
-        let readback = Some(create_host_buffer(
-            context,
-            &format!("{label} readback"),
-            resource.bytes,
-            vk::BufferUsageFlags::TRANSFER_DST,
-        )?);
+        let staging = if optimal_staging {
+            Some(create_host_buffer(
+                context,
+                &format!("{label} staging"),
+                resource.bytes,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+            )?)
+        } else {
+            upload_linear_image(context, image, memory, resource, layout, aspect)?;
+            None
+        };
         let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
-            .view_type(view_type)
+            .view_type(vulkan_view_type(resource.texture_type))
             .format(format)
             .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: aspect,
@@ -4192,8 +3799,12 @@ mod platform {
             array_layers: layout.array_layers,
             extent,
             staging,
-            readback,
+            general_ready: false,
         })
+    }
+
+    pub(super) fn sampled_only_requires_staging(uses_sampled: bool, uses_storage: bool) -> bool {
+        uses_sampled && !uses_storage
     }
 
     fn vulkan_sample_count(count: u32) -> Result<vk::SampleCountFlags, String> {
@@ -4337,19 +3948,15 @@ mod platform {
                 .instance
                 .get_physical_device_format_properties(context.physical, format)
         };
-        // The image below is OPTIMAL and is filled by `vkCmdCopyBufferToImage`, so what it needs of
-        // the format is that optimal tiling can be sampled and attached. This used to demand
-        // SAMPLED_IMAGE of LINEAR tiling as well, from when the per-sample source was a linear
-        // image; `a584e7be` made that image OPTIMAL too and left the requirement behind. MoltenVK
-        // reports no linear features at all for `VK_FORMAT_D32_SFLOAT` -- Metal has no linear depth
-        // texture -- so the stale half of this gate refused every multisample depth case for a
-        // capability nothing asks for.
         if !properties
             .optimal_tiling_features
             .contains(attachment_feature | vk::FormatFeatureFlags::SAMPLED_IMAGE)
+            || !properties
+                .linear_tiling_features
+                .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE)
         {
             return Err(format!(
-                "Vulkan device lacks multisample attachment support for {label} format {}",
+                "Vulkan device lacks multisample attachment/staging support for {label} format {}",
                 format.as_raw()
             ));
         }
@@ -4461,7 +4068,7 @@ mod platform {
                 depth: layout.depth,
             },
             staging: None,
-            readback: None,
+            general_ready: true,
         })
     }
 
@@ -4482,10 +4089,6 @@ mod platform {
             .array_layers
             .checked_mul(layout.sample_count)
             .ok_or_else(|| "multisample staging layer count overflows".to_string())?;
-        // The per-sample source is a 2D ARRAY image with one layer per (array layer, sample), and
-        // Vulkan requires `arrayLayers == 1` for LINEAR tiling -- so it cannot be filled by mapping
-        // its memory. Stage it the way every other image here is staged: an OPTIMAL image filled by
-        // one `vkCmdCopyBufferToImage` from a host buffer holding the layers tightly packed.
         let staging_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
@@ -4497,10 +4100,10 @@ mod platform {
             .mip_levels(1)
             .array_layers(staging_layers)
             .samples(vk::SampleCountFlags::TYPE_1)
-            .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+            .tiling(vk::ImageTiling::LINEAR)
+            .usage(vk::ImageUsageFlags::SAMPLED)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED);
+            .initial_layout(vk::ImageLayout::PREINITIALIZED);
         objects.staging_image = unsafe { context.device.create_image(&staging_info, None) }
             .map_err(|error| format!("create multisample staging image: {error}"))?;
         let requirements = unsafe {
@@ -4510,7 +4113,7 @@ mod platform {
         };
         let memory_type = context.memory_type(
             requirements.memory_type_bits,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
         let allocation = vk::MemoryAllocateInfo::default()
             .allocation_size(requirements.size)
@@ -4523,35 +4126,53 @@ mod platform {
                 .bind_image_memory(objects.staging_image, objects.staging_memory, 0)
         }
         .map_err(|error| format!("bind multisample staging image: {error}"))?;
+        let mapped = unsafe {
+            context.device.map_memory(
+                objects.staging_memory,
+                0,
+                vk::WHOLE_SIZE,
+                vk::MemoryMapFlags::empty(),
+            )
+        }
+        .map_err(|error| format!("map multisample staging image: {error}"))?;
         let pixel_size = literal_format.bytes_per_pixel();
-        // Authored order is texel-major, sample-minor; the copy wants layer-major, tightly packed.
-        let mut packed = vec![0u8; bytes.len()];
-        for layer in 0..layout.array_layers as usize {
-            for sample in 0..layout.sample_count as usize {
-                let staging_layer = layer * layout.sample_count as usize + sample;
-                for y in 0..layout.height as usize {
-                    for x in 0..layout.width as usize {
-                        let source =
-                            (((layer * layout.height as usize + y) * layout.width as usize + x)
-                                * layout.sample_count as usize
-                                + sample)
-                                * pixel_size;
-                        let destination = ((staging_layer * layout.height as usize + y)
+        for layer in 0..layout.array_layers {
+            for sample in 0..layout.sample_count {
+                let staging_layer = layer * layout.sample_count + sample;
+                let host_layout = unsafe {
+                    context.device.get_image_subresource_layout(
+                        objects.staging_image,
+                        vk::ImageSubresource {
+                            aspect_mask: aspect,
+                            mip_level: 0,
+                            array_layer: staging_layer,
+                        },
+                    )
+                };
+                for y in 0..layout.height {
+                    for x in 0..layout.width {
+                        let source_texel = (((layer as usize * layout.height as usize
+                            + y as usize)
                             * layout.width as usize
-                            + x)
+                            + x as usize)
+                            * layout.sample_count as usize
+                            + sample as usize)
                             * pixel_size;
-                        packed[destination..destination + pixel_size]
-                            .copy_from_slice(&bytes[source..source + pixel_size]);
+                        let destination_texel = host_layout.offset as usize
+                            + y as usize * host_layout.row_pitch as usize
+                            + x as usize * pixel_size;
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                bytes.as_ptr().add(source_texel),
+                                mapped.cast::<u8>().add(destination_texel),
+                                pixel_size,
+                            );
+                        }
                     }
                 }
             }
         }
-        let staging_transfer = create_host_buffer(
-            context,
-            "multisample staging",
-            &packed,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-        )?;
+        unsafe { context.device.unmap_memory(objects.staging_memory) };
 
         for layer in 0..layout.array_layers {
             let view_info = vk::ImageViewCreateInfo::default()
@@ -4805,62 +4426,25 @@ mod platform {
             )
         }
         .map_err(|error| format!("begin multisample initializer command: {error}"))?;
-        let staging_range = vk::ImageSubresourceRange {
-            aspect_mask: aspect,
-            base_mip_level: 0,
-            level_count: 1,
-            base_array_layer: 0,
-            layer_count: staging_layers,
-        };
-        let to_transfer = [vk::ImageMemoryBarrier::default()
-            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-            .image(objects.staging_image)
-            .subresource_range(staging_range)];
         let staging_barrier = [vk::ImageMemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .src_access_mask(vk::AccessFlags::HOST_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .old_layout(vk::ImageLayout::PREINITIALIZED)
             .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(objects.staging_image)
-            .subresource_range(staging_range)];
-        let staging_copy = [vk::BufferImageCopy::default()
-            .image_subresource(vk::ImageSubresourceLayers {
+            .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: aspect,
-                mip_level: 0,
+                base_mip_level: 0,
+                level_count: 1,
                 base_array_layer: 0,
                 layer_count: staging_layers,
-            })
-            .image_extent(vk::Extent3D {
-                width: layout.width,
-                height: layout.height,
-                depth: 1,
             })];
         unsafe {
             context.device.cmd_pipeline_barrier(
                 command,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &to_transfer,
-            );
-            context.device.cmd_copy_buffer_to_image(
-                command,
-                staging_transfer.buffer,
-                objects.staging_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &staging_copy,
-            );
-            context.device.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::HOST,
                 vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -4916,6 +4500,55 @@ mod platform {
         Ok(())
     }
 
+    fn upload_linear_image(
+        context: &VulkanContext,
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        resource: &TextureLiteralRef<'_>,
+        layout: crate::literal::TextureLayout,
+        aspect: vk::ImageAspectFlags,
+    ) -> Result<(), String> {
+        let mapped = unsafe {
+            context
+                .device
+                .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+        }
+        .map_err(|error| format!("map {}: {error}", resource.label))?;
+        let row_bytes = resource.dimensions[0] as usize * resource.format.bytes_per_pixel();
+        let image_bytes = row_bytes * resource.dimensions[1] as usize;
+        for layer in 0..layout.array_layers {
+            let subresource = vk::ImageSubresource {
+                aspect_mask: aspect,
+                mip_level: 0,
+                array_layer: layer,
+            };
+            let host_layout = unsafe {
+                context
+                    .device
+                    .get_image_subresource_layout(image, subresource)
+            };
+            for z in 0..layout.depth {
+                for y in 0..layout.height {
+                    let source_offset = layer as usize * image_bytes
+                        + z as usize * image_bytes
+                        + y as usize * row_bytes;
+                    let destination_offset = host_layout.offset as usize
+                        + z as usize * host_layout.depth_pitch as usize
+                        + y as usize * host_layout.row_pitch as usize;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            resource.bytes.as_ptr().add(source_offset),
+                            mapped.cast::<u8>().add(destination_offset),
+                            row_bytes,
+                        );
+                    }
+                }
+            }
+        }
+        unsafe { context.device.unmap_memory(memory) };
+        Ok(())
+    }
+
     fn create_samplers(
         context: &VulkanContext,
         case: &AuthoredCase,
@@ -4956,19 +4589,16 @@ mod platform {
                         context.max_sampler_anisotropy,
                     )?
                 }
-                metal2vulkan::reflect::ResourceKind::StaticSampler
-                | metal2vulkan::reflect::ResourceKind::SynthesizedReadSampler => {
-                    sampler_info_from_static(
-                        binding.static_sampler.as_ref().ok_or_else(|| {
-                            format!(
-                                "{:?} {} has no reflected state",
-                                binding.kind, descriptor.binding
-                            )
-                        })?,
-                        context.sampler_anisotropy,
-                        context.max_sampler_anisotropy,
-                    )?
-                }
+                metal2vulkan::reflect::ResourceKind::StaticSampler => sampler_info_from_static(
+                    binding.static_sampler.as_ref().ok_or_else(|| {
+                        format!(
+                            "static sampler {} has no reflected state",
+                            descriptor.binding
+                        )
+                    })?,
+                    context.sampler_anisotropy,
+                    context.max_sampler_anisotropy,
+                )?,
                 _ => continue,
             };
             let sampler = unsafe { context.device.create_sampler(&state, None) }
@@ -5112,7 +4742,6 @@ mod platform {
             crate::case::TextureFormat::Rg32Float => vk::Format::R32G32_SFLOAT,
             crate::case::TextureFormat::Rgba16Float => vk::Format::R16G16B16A16_SFLOAT,
             crate::case::TextureFormat::Rgba16Uint => vk::Format::R16G16B16A16_UINT,
-            crate::case::TextureFormat::Rgba16Sint => vk::Format::R16G16B16A16_SINT,
             crate::case::TextureFormat::R32Uint => vk::Format::R32_UINT,
             crate::case::TextureFormat::R32Sint => vk::Format::R32_SINT,
             crate::case::TextureFormat::R32Float => vk::Format::R32_SFLOAT,
@@ -5129,7 +4758,7 @@ mod platform {
             F::Rgba8Uint | F::R16Uint | F::Rgba16Uint | F::R32Uint | F::Rgba32Uint => {
                 ("uint", "%v4uint", "%ptr_output_v4uint", "%color")
             }
-            F::Rgba8Sint | F::R32Sint | F::Rgba16Sint | F::Rgba32Sint => {
+            F::Rgba8Sint | F::R32Sint | F::Rgba32Sint => {
                 ("int", "%v4int", "%ptr_output_v4int", "%color")
             }
             F::R8Unorm
@@ -5281,71 +4910,6 @@ OpFunctionEnd
         }
     }
 
-    /// The image-view type the MODULE binds at this descriptor, falling back to the authored Metal
-    /// texture type when reflection carries no shape for it.
-    ///
-    /// Vulkan requires a view's type to match the `Dim`/`Arrayed` of the image variable the
-    /// descriptor is read through, and the emitted image is not always the one the AIR type name
-    /// implies: SPIR-V has no cube texel fetch, so a `texturecube` that is only ever read binds as a
-    /// 2D ARRAY image with the face in the layer slot. A `VK_IMAGE_VIEW_TYPE_CUBE` view for that
-    /// variable is not rejected by MoltenVK -- it silently reads one texel for every thread.
-    /// The authored texture type behind a synthesized null-texture descriptor.
-    ///
-    /// Only the shapes the corpus actually reaches are answered. Every other shape is refused by
-    /// name rather than approximated, because a placeholder of the wrong dimensionality would bind
-    /// cleanly and then read the wrong thing.
-    fn synthesized_null_texture_type(
-        shape: metal2vulkan::meta::TextureShape,
-    ) -> Result<crate::case::TextureType, String> {
-        use metal2vulkan::meta::TextureDimension;
-        match (shape.dimension, shape.arrayed, shape.multisampled) {
-            (TextureDimension::D2, false, false) => Ok(crate::case::TextureType::D2),
-            (TextureDimension::D3, false, false) => Ok(crate::case::TextureType::D3),
-            other => Err(format!(
-                "synthesized null texture shape {other:?} has no placeholder image"
-            )),
-        }
-    }
-
-    pub(super) fn reflected_view_type(
-        shape: Option<metal2vulkan::meta::TextureShape>,
-        texture_type: crate::case::TextureType,
-    ) -> vk::ImageViewType {
-        use metal2vulkan::meta::TextureDimension;
-        match shape.map(|shape| (shape.dimension, shape.arrayed)) {
-            Some((TextureDimension::D1, false)) => vk::ImageViewType::TYPE_1D,
-            Some((TextureDimension::D1, true)) => vk::ImageViewType::TYPE_1D_ARRAY,
-            Some((TextureDimension::D2, false)) => vk::ImageViewType::TYPE_2D,
-            Some((TextureDimension::D2, true)) => vk::ImageViewType::TYPE_2D_ARRAY,
-            Some((TextureDimension::D3, false)) => vk::ImageViewType::TYPE_3D,
-            Some((TextureDimension::Cube, false)) => vk::ImageViewType::CUBE,
-            Some((TextureDimension::Cube, true)) => vk::ImageViewType::CUBE_ARRAY,
-            // A 3D array and a buffer texture have no image view of their own; the authored type is
-            // the only answer left, and for a buffer texture this function is never reached.
-            Some(_) | None => vulkan_view_type(texture_type),
-        }
-    }
-
-    /// The reflected texture shape behind an exact Vulkan descriptor binding.
-    ///
-    /// Keyed on the descriptor the runner is about to fill rather than on a second copy of each
-    /// caller's own reflection filter. Aliased bindings share one shape by construction: reflection
-    /// only reconciles a shape from the module when every image variable at that binding agrees.
-    fn descriptor_texture_shape(
-        reflection: &ShaderReflection,
-        descriptor_binding: u32,
-    ) -> Option<metal2vulkan::meta::TextureShape> {
-        reflection
-            .bindings
-            .iter()
-            .filter(|binding| {
-                binding
-                    .descriptor
-                    .is_some_and(|descriptor| descriptor.binding == descriptor_binding)
-            })
-            .find_map(|binding| binding.texture_shape)
-    }
-
     fn vulkan_view_type(texture_type: crate::case::TextureType) -> vk::ImageViewType {
         match texture_type {
             crate::case::TextureType::Buffer => {
@@ -5437,6 +5001,40 @@ OpFunctionEnd
         command: vk::CommandBuffer,
         images: &[ImageAllocation],
     ) {
+        let linear_barriers = images
+            .iter()
+            .filter(|image| !image.general_ready && image.staging.is_none())
+            .map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::HOST_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .old_layout(vk::ImageLayout::PREINITIALIZED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: image.aspect,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: image.array_layers,
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !linear_barriers.is_empty() {
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command,
+                    vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &linear_barriers,
+                );
+            }
+        }
         let staged = images
             .iter()
             .filter_map(|image| image.staging.as_ref().map(|staging| (image, staging)))
@@ -5496,7 +5094,7 @@ OpFunctionEnd
             .map(|(image, _)| {
                 vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
                     .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
                     .new_layout(vk::ImageLayout::GENERAL)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -5524,31 +5122,20 @@ OpFunctionEnd
         }
     }
 
-    /// Copy every device-local image back into its tightly packed host readback buffer.
-    ///
-    /// Images are `OPTIMAL`-tiled, so their memory has no host-visible layout to map. The copy
-    /// writes exactly the packed order the authored literal declares: layer-major (or, for a 3D
-    /// texture, slice-major) rows of `width * bytes_per_pixel`.
-    unsafe fn copy_images_to_readback(
+    unsafe fn make_images_host_readable(
         device: &Device,
         command: vk::CommandBuffer,
         images: &[ImageAllocation],
     ) {
-        let readable = images
+        let barriers = images
             .iter()
-            .filter_map(|image| image.readback.as_ref().map(|readback| (image, readback)))
-            .collect::<Vec<_>>();
-        if readable.is_empty() {
-            return;
-        }
-        let transfer_barriers = readable
-            .iter()
-            .map(|(image, _)| {
+            .filter(|image| image.uses_descriptor_type(vk::DescriptorType::STORAGE_IMAGE))
+            .map(|image| {
                 vk::ImageMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
                     .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(image.image)
@@ -5561,45 +5148,18 @@ OpFunctionEnd
                     })
             })
             .collect::<Vec<_>>();
-        let host_barrier = [vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ)];
-        unsafe {
-            device.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &transfer_barriers,
-            );
-            for (image, readback) in &readable {
-                let copy = vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: image.aspect,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: image.array_layers,
-                    })
-                    .image_extent(image.extent);
-                device.cmd_copy_image_to_buffer(
+        if !barriers.is_empty() {
+            unsafe {
+                device.cmd_pipeline_barrier(
                     command,
-                    image.image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    readback.buffer,
-                    &[copy],
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
                 );
             }
-            device.cmd_pipeline_barrier(
-                command,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &host_barrier,
-                &[],
-                &[],
-            );
         }
     }
 
@@ -5641,13 +5201,7 @@ OpFunctionEnd
                 buffer_address_table: false,
                 device_address_index: Some(resource.binding),
                 label: format!("buffer {}", resource.binding),
-                // The same declared size Metal binds. See
-                // `executor_contract::buffer_bytes_padded_to_declared_size`: a short binding is
-                // undefined on both APIs, and the two executors have to read the same window.
-                bytes: crate::executor_contract::buffer_bytes_padded_to_declared_size(
-                    &resource.bytes,
-                    reflected.declared_size.map(|size| size as usize),
-                ),
+                bytes: (&resource.bytes[..]).into(),
             });
         }
         for resource in &resources.acceleration_structure_shadows {
@@ -6509,53 +6063,51 @@ OpFunctionEnd
     ) -> Result<Vec<u8>, String> {
         let layout = resource.layout()?;
         let pixel_size = resource.format.bytes_per_pixel();
-        let row_bytes = layout.width as usize * pixel_size;
-        let plane_bytes = row_bytes * layout.height as usize;
-        let planes = if resource.texture_type == crate::case::TextureType::D3 {
-            layout.depth
-        } else {
-            layout.array_layers
-        };
         let selected_row = dimensions[0] as usize * pixel_size;
-        let readback = allocation
-            .readback
-            .as_ref()
-            .ok_or_else(|| format!("Vulkan {} has no host readback buffer", resource.label))?;
         let mut output =
             Vec::with_capacity(selected_row * dimensions[1] as usize * dimensions[2] as usize);
         let mapped = unsafe {
             context.device.map_memory(
-                readback.memory,
+                allocation.memory,
                 0,
-                readback.len,
+                vk::WHOLE_SIZE,
                 vk::MemoryMapFlags::empty(),
             )
         }
         .map_err(|error| format!("map output {}: {error}", resource.label))?;
-        let mut overflow = false;
-        'planes: for selected_z in 0..dimensions[2] {
-            let plane = origin[2] + selected_z;
-            if plane >= planes {
-                overflow = true;
-                break;
+        for selected_z in 0..dimensions[2] {
+            let (array_layer, depth_slice) =
+                if resource.texture_type == crate::case::TextureType::D3 {
+                    (0, origin[2] + selected_z)
+                } else {
+                    (origin[2] + selected_z, 0)
+                };
+            if array_layer >= layout.array_layers || depth_slice >= layout.depth {
+                unsafe { context.device.unmap_memory(allocation.memory) };
+                return Err(format!("selected region exceeds Vulkan {}", resource.label));
             }
+            let subresource = vk::ImageSubresource {
+                aspect_mask: allocation.aspect,
+                mip_level: 0,
+                array_layer,
+            };
+            let host_layout = unsafe {
+                context
+                    .device
+                    .get_image_subresource_layout(allocation.image, subresource)
+            };
             for y in 0..dimensions[1] {
-                let offset = plane as usize * plane_bytes
-                    + (origin[1] + y) as usize * row_bytes
+                let source_offset = host_layout.offset as usize
+                    + depth_slice as usize * host_layout.depth_pitch as usize
+                    + (origin[1] + y) as usize * host_layout.row_pitch as usize
                     + origin[0] as usize * pixel_size;
-                if offset + selected_row > readback.len as usize {
-                    overflow = true;
-                    break 'planes;
-                }
-                output.extend_from_slice(unsafe {
-                    std::slice::from_raw_parts(mapped.cast::<u8>().add(offset), selected_row)
-                });
+                let row = unsafe {
+                    std::slice::from_raw_parts(mapped.cast::<u8>().add(source_offset), selected_row)
+                };
+                output.extend_from_slice(row);
             }
         }
-        unsafe { context.device.unmap_memory(readback.memory) };
-        if overflow {
-            return Err(format!("selected region exceeds Vulkan {}", resource.label));
-        }
+        unsafe { context.device.unmap_memory(allocation.memory) };
         Ok(output)
     }
 
@@ -6621,14 +6173,6 @@ OpFunctionEnd
 mod tests {
     use super::*;
 
-    mod access_fuzz;
-    mod gpu_fuzz;
-    mod inline_fuzz;
-    mod irreducible_fuzz;
-    mod pointer_select_fuzz;
-    mod structured_fuzz;
-    mod workgroup_fuzz;
-
     #[test]
     fn backend_names_cannot_relabel_the_hosts_vulkan_stack() {
         if cfg!(target_os = "macos") {
@@ -6638,32 +6182,6 @@ mod tests {
             assert!(validate_backend_host(Backend::Moltenvk).is_err());
             assert!(validate_backend_host(Backend::Vulkan).is_ok());
         }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn an_image_view_follows_the_shape_the_module_binds_not_the_authored_metal_type() {
-        use metal2vulkan::meta::texture_shape_from_name;
-        let cube = crate::case::TextureType::Cube;
-        let view = |name: Option<&str>, authored| {
-            platform::reflected_view_type(name.map(texture_shape_from_name), authored)
-        };
-
-        // A cube the module direction-samples stays a cube on both sides.
-        assert!(view(Some("texturecube<float, sample>"), cube) == ash::vk::ImageViewType::CUBE);
-
-        // SPIR-V has no cube texel fetch, so a `texturecube` that is only ever read binds as a 2D
-        // ARRAY image and reflection reconciles the shape to match. The view has to follow, or the
-        // descriptor names an image type the module does not declare -- which MoltenVK does not
-        // reject, it just reads one texel for every thread.
-        assert!(
-            view(Some("texture2d_array<float, read>"), cube)
-                == ash::vk::ImageViewType::TYPE_2D_ARRAY
-        );
-
-        // With no reflected shape the authored Metal type is the only answer there is.
-        assert!(view(None, cube) == ash::vk::ImageViewType::CUBE);
-        assert!(view(None, crate::case::TextureType::D3) == ash::vk::ImageViewType::TYPE_3D);
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -6723,223 +6241,6 @@ mod tests {
         assert_eq!(output, expected);
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn a_translated_kernel_builds_a_pipeline_with_no_case_behind_it() {
-        // The whole-corpus oracle asks this of every kernel source, so it has to work with nothing
-        // but a translated module and its reflection -- no authored case, no resources, no
-        // dispatch. If the layout this builds ever drifts from the executor's, the sweep's verdicts
-        // stop being transferable, which is why both come from `pipeline_layout_objects`.
-        let ll = include_str!("../fixtures/public/kernel_atomic_xor_and_subtract.ll");
-        let scratch = crate::ScratchDir::new("compile-only-kernel").expect("scratch");
-        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
-            ll,
-            metal2vulkan::passes::Stage::Kernel,
-            scratch.path(),
-            metal2vulkan::passes::TransformOptions::default(),
-        )
-        .expect("translate the fixture");
-        compile_kernel_pipeline(&reflection, &spv).expect("driver accepts the translated kernel");
-    }
-
-    #[test]
-    fn pipeline_compilation_refuses_a_stage_it_cannot_build() {
-        // `create_compute_pipeline` hard-codes the compute stage flag, so a fragment reflection
-        // would be built against a layout declaring the wrong stages. Refuse it by name rather than
-        // let the driver report something less specific.
-        let ll = include_str!("../fixtures/public/fragment_constant_color.ll");
-        let scratch = crate::ScratchDir::new("compile-only-fragment").expect("scratch");
-        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
-            ll,
-            metal2vulkan::passes::Stage::Fragment,
-            scratch.path(),
-            metal2vulkan::passes::TransformOptions {
-                raster_sample_count: Some(1),
-                ..metal2vulkan::passes::TransformOptions::default()
-            },
-        )
-        .expect("translate the fixture");
-        let error =
-            compile_kernel_pipeline(&reflection, &spv).expect_err("fragment is not a kernel");
-        assert!(
-            error.contains("kernels only"),
-            "unexpected refusal: {error}"
-        );
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn exact_thread_regions_report_the_requested_threadgroup_size_unchanged() {
-        // Metal answers the two threadgroup-size attributes differently in a short final
-        // threadgroup: a 10-thread dispatch in groups of 4 gives `threads_per_threadgroup == 2` and
-        // `dispatch_threads_per_threadgroup == 4` there. The exact-thread plan reproduces the first
-        // by specializing the tail region's local size, so the second has to come from somewhere the
-        // region cannot move it.
-        let ll = include_str!("../fixtures/public/kernel_dispatch_threads_requested_local_size.ll");
-        let initial = base64::engine::general_purpose::STANDARD.encode(vec![0xaa; 60 * 4]);
-        let case: AuthoredCase = serde_json::from_value(serde_json::json!({
-            "air_sha256": sha256_bytes(ll.as_bytes()),
-            "case_id": "test-dispatch-threads-requested-local-size",
-            "name": "dispatch-threads-requested-local-size",
-            "entry": "kernel_dispatch_threads_requested_local_size",
-            "stage": "kernel",
-            "buffers": [{"binding": 0, "role": "output", "initial_bytes_b64": initial}],
-            "dispatch": {"grid": [10, 3, 1], "threads_per_threadgroup": [8, 2, 1]},
-            "output": {"kind": "buffer", "binding": 0, "offset": 0, "length": 240},
-            "compare": {"kind": "exact"},
-            "execution_safety": "loop_free"
-        }))
-        .expect("synthetic authored case");
-        let resources = LiteralResources::prepare(&case).expect("literal resources");
-        let scratch =
-            crate::ScratchDir::new("dispatch-threads-requested-candidate").expect("scratch");
-        let options = metal2vulkan::passes::TransformOptions {
-            kernel_local_size: [8, 2, 1],
-            ..metal2vulkan::passes::TransformOptions::default()
-        };
-        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
-            ll,
-            metal2vulkan::passes::Stage::Kernel,
-            scratch.path(),
-            options,
-        )
-        .expect("translate exact-thread kernel");
-        let backend = if cfg!(target_os = "macos") {
-            Backend::Moltenvk
-        } else {
-            Backend::Vulkan
-        };
-        let (output, _) =
-            platform::execute(&case, &resources, &reflection, &spv, None, None, backend)
-                .expect("execute requested-size regions");
-        let mut expected = Vec::with_capacity(240);
-        for y in 0..3 {
-            for x in 0..10 {
-                let local_x: u32 = if x < 8 { 8 } else { 2 };
-                let local_y: u32 = if y < 2 { 2 } else { 1 };
-                expected.extend_from_slice(&(local_y * 100 + local_x).to_le_bytes());
-                expected.extend_from_slice(&(2_u32 * 100 + 8).to_le_bytes());
-            }
-        }
-        assert_eq!(output, expected);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn exact_thread_regions_carry_every_grid_fact_a_short_group_must_not_move() {
-        // Expectations are the measured Metal answers for `dispatchThreads(10x3, 4x2)`, not a
-        // reading of the plan: threads_per_grid is 10x3 and threadgroups_per_grid 3x2 in every
-        // region, threadgroup_position_in_grid is the region's base plus its workgroup id, and
-        // thread_index_in_threadgroup flattens with the SHORT group's extent -- thread (8,1) is
-        // index 2 in a 2x2 group, not 4 as a 4x2 flattening would give.
-        let ll = include_str!("../fixtures/public/kernel_dispatch_threads_region_facts.ll");
-        let initial = base64::engine::general_purpose::STANDARD.encode(vec![0xaa; 30 * 4 * 4]);
-        let case: AuthoredCase = serde_json::from_value(serde_json::json!({
-            "air_sha256": sha256_bytes(ll.as_bytes()),
-            "case_id": "test-dispatch-threads-region-facts",
-            "name": "dispatch-threads-region-facts",
-            "entry": "kernel_dispatch_threads_region_facts",
-            "stage": "kernel",
-            "buffers": [{"binding": 0, "role": "output", "initial_bytes_b64": initial}],
-            "dispatch": {"grid": [10, 3, 1], "threads_per_threadgroup": [4, 2, 1]},
-            "output": {"kind": "buffer", "binding": 0, "offset": 0, "length": 480},
-            "compare": {"kind": "exact"},
-            "execution_safety": "loop_free"
-        }))
-        .expect("synthetic authored case");
-        let resources = LiteralResources::prepare(&case).expect("literal resources");
-        let scratch = crate::ScratchDir::new("dispatch-threads-region-facts").expect("scratch");
-        let options = metal2vulkan::passes::TransformOptions {
-            kernel_local_size: [4, 2, 1],
-            ..metal2vulkan::passes::TransformOptions::default()
-        };
-        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
-            ll,
-            metal2vulkan::passes::Stage::Kernel,
-            scratch.path(),
-            options,
-        )
-        .expect("translate exact-thread kernel");
-        let backend = if cfg!(target_os = "macos") {
-            Backend::Moltenvk
-        } else {
-            Backend::Vulkan
-        };
-        let (output, _) =
-            platform::execute(&case, &resources, &reflection, &spv, None, None, backend)
-                .expect("execute region-fact regions");
-        let mut expected = Vec::with_capacity(480);
-        for y in 0..3_u32 {
-            for x in 0..10_u32 {
-                let local_x = if x < 8 { 4 } else { 2 };
-                let flat = (y % 2) * local_x + (x % 4);
-                expected.extend_from_slice(&flat.to_le_bytes());
-                expected.extend_from_slice(&(10_u32 * 10 + 3).to_le_bytes());
-                expected.extend_from_slice(&(3_u32 * 10 + 2).to_le_bytes());
-                expected.extend_from_slice(&((x / 4) * 10 + y / 2).to_le_bytes());
-            }
-        }
-        assert_eq!(output, expected);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn short_threadgroups_keep_metals_simdgroup_answers() {
-        // Measured on the device for `dispatchThreads(10x3, 4x2)`: every thread reports
-        // threads_per_simdgroup 32 and simdgroups_per_threadgroup 1, simdgroup_index_in_threadgroup
-        // 0, and thread_index_in_simdgroup equal to its flattened index in the group that actually
-        // ran -- so the 2x2 tail groups number 0..3, not 0..7. The simd width is the hardware's and
-        // must not follow the region's local size down.
-        let ll = include_str!("../fixtures/public/kernel_dispatch_threads_short_group_simd.ll");
-        let initial = base64::engine::general_purpose::STANDARD.encode(vec![0xaa; 30 * 3 * 4]);
-        let case: AuthoredCase = serde_json::from_value(serde_json::json!({
-            "air_sha256": sha256_bytes(ll.as_bytes()),
-            "case_id": "test-dispatch-threads-short-group-simd",
-            "name": "dispatch-threads-short-group-simd",
-            "entry": "kernel_dispatch_threads_short_group_simd",
-            "stage": "kernel",
-            "buffers": [{"binding": 0, "role": "output", "initial_bytes_b64": initial}],
-            "dispatch": {"grid": [10, 3, 1], "threads_per_threadgroup": [4, 2, 1]},
-            "output": {"kind": "buffer", "binding": 0, "offset": 0, "length": 360},
-            "compare": {"kind": "exact"},
-            "execution_safety": "loop_free"
-        }))
-        .expect("synthetic authored case");
-        let resources = LiteralResources::prepare(&case).expect("literal resources");
-        let scratch = crate::ScratchDir::new("dispatch-threads-short-group-simd").expect("scratch");
-        let options = metal2vulkan::passes::TransformOptions {
-            kernel_local_size: [4, 2, 1],
-            ..metal2vulkan::passes::TransformOptions::default()
-        };
-        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
-            ll,
-            metal2vulkan::passes::Stage::Kernel,
-            scratch.path(),
-            options,
-        )
-        .expect("translate exact-thread kernel");
-        let backend = if cfg!(target_os = "macos") {
-            Backend::Moltenvk
-        } else {
-            Backend::Vulkan
-        };
-        let (output, _) =
-            platform::execute(&case, &resources, &reflection, &spv, None, None, backend)
-                .expect("execute short-group simd regions");
-        let mut expected = Vec::with_capacity(360);
-        // The fixture packs a threadgroup size as height * 100 + width; the dispatch asked 32x1.
-        let (requested_h, requested_w) = (1_u32, 32_u32);
-        for y in 0..3_u32 {
-            for x in 0..10_u32 {
-                let local_x = if x < 8 { 4 } else { 2 };
-                expected.extend_from_slice(&((y % 2) * local_x + (x % 4)).to_le_bytes());
-                expected.extend_from_slice(&(requested_h * 100 + requested_w).to_le_bytes());
-                expected.extend_from_slice(&0_u32.to_le_bytes());
-            }
-        }
-        assert_eq!(output, expected);
-    }
-
     #[test]
     fn graphics_pipeline_hash_covers_every_shader_module() {
         let primary = [1, 2, 3, 4];
@@ -6952,176 +6253,11 @@ mod tests {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
-    fn storage_texture_array_executes_and_reads_back_every_layer() {
-        let ll = r#"target datalayout = "e-p:64:64:64"
-target triple = "air64-apple-macosx14.0.0"
-
-define void @write_two_layers(ptr addrspace(1) %out) local_unnamed_addr #0 {
-entry:
-  tail call void @air.write_texture_2d_array.v4f32(ptr addrspace(1) %out, <2 x i32> zeroinitializer, i32 0, <4 x float> <float 2.500000e-01, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>, i32 0, i32 2) #1
-  tail call void @air.write_texture_2d_array.v4f32(ptr addrspace(1) %out, <2 x i32> zeroinitializer, i32 1, <4 x float> <float 7.500000e-01, float 0.000000e+00, float 0.000000e+00, float 1.000000e+00>, i32 0, i32 2) #1
-  ret void
-}
-
-declare void @air.write_texture_2d_array.v4f32(ptr addrspace(1), <2 x i32>, i32, <4 x float>, i32, i32) local_unnamed_addr #1
-
-attributes #0 = { convergent nounwind }
-attributes #1 = { convergent nounwind memory(argmem: write) }
-
-!air.kernel = !{!0}
-!0 = !{ptr @write_two_layers, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.write", !"air.arg_type_name", !"texture2d_array<float, write>", !"air.arg_name", !"out"}
-"#;
-        let expected = [0.25f32, 0.0, 0.0, 1.0, 0.75, 0.0, 0.0, 1.0]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let case: AuthoredCase = serde_json::from_value(serde_json::json!({
-            "air_sha256": sha256_bytes(ll.as_bytes()),
-            "case_id": "test-storage-texture-array",
-            "name": "storage-texture-array-two-layers",
-            "entry": "write_two_layers",
-            "stage": "kernel",
-            "textures": [{
-                "binding": 0,
-                "role": "output",
-                "texture_type": "d2_array",
-                "format": "rgba32_float",
-                "dimensions": [1, 1, 2],
-                "initial_bytes_b64": base64::engine::general_purpose::STANDARD
-                    .encode([0xABu8; 32])
-            }],
-            "dispatch": {"grid": [1, 1, 1], "threads_per_threadgroup": [1, 1, 1]},
-            "output": {
-                "kind": "texture",
-                "binding": 0,
-                "origin": [0, 0, 0],
-                "dimensions": [1, 1, 2]
-            },
-            "compare": {"kind": "exact"},
-            "execution_safety": "loop_free"
-        }))
-        .expect("synthetic storage texture-array case");
-        let resources = LiteralResources::prepare(&case).expect("texture-array literal resources");
-        let scratch = crate::ScratchDir::new("storage-texture-array-candidate").expect("scratch");
-        let options = crate::case::product_transform_options(&case).expect("transform options");
-        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
-            ll,
-            metal2vulkan::passes::Stage::Kernel,
-            scratch.path(),
-            options,
-        )
-        .expect("translate storage texture-array kernel");
-        let backend = if cfg!(target_os = "macos") {
-            Backend::Moltenvk
-        } else {
-            Backend::Vulkan
-        };
-        let (output, _) =
-            platform::execute(&case, &resources, &reflection, &spv, None, None, backend)
-                .expect("execute storage texture-array kernel");
-        assert_eq!(output, expected);
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    #[test]
-    fn multisample_literal_executes_from_its_per_sample_staging_layers() {
-        // The per-sample source image carries one layer per sample, and Vulkan forbids LINEAR
-        // tiling above one array layer -- so it has to be staged through a buffer copy like every
-        // other image here. Reading sample 1 of four distinct samples also pins the packing order
-        // the authored bytes are in: texel-major, sample-minor.
-        let ll = r#"target datalayout = "e-p:64:64:64"
-target triple = "air64-apple-macosx14.0.0"
-
-define <4 x float> @fragment_read_ms(ptr addrspace(1) %texture) {
-  %read = call { <4 x float>, i8 } @air.read_texture_2d_ms.v4f32(ptr addrspace(1) %texture, <2 x i32> zeroinitializer, i32 1, i32 1)
-  %value = extractvalue { <4 x float>, i8 } %read, 0
-  ret <4 x float> %value
-}
-
-declare { <4 x float>, i8 } @air.read_texture_2d_ms.v4f32(ptr addrspace(1), <2 x i32>, i32, i32)
-
-!air.fragment = !{!0}
-!0 = !{ptr @fragment_read_ms, !1, !2}
-!1 = !{!3}
-!2 = !{!4}
-!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!4 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_name", !"texture2d_ms<float, read>"}
-"#;
-        let samples = [
-            [0.0f32, 0.0, 0.0, 1.0],
-            [0.25, 0.5, 0.75, 1.0],
-            [2.0, 2.0, 2.0, 2.0],
-            [3.0, 3.0, 3.0, 3.0],
-        ];
-        let texture = samples
-            .iter()
-            .flat_map(|sample| sample.iter().copied().flat_map(f32::to_le_bytes))
-            .collect::<Vec<_>>();
-        let expected = samples[1]
-            .into_iter()
-            .flat_map(f32::to_le_bytes)
-            .collect::<Vec<_>>();
-        let case: AuthoredCase = serde_json::from_value(serde_json::json!({
-            "air_sha256": sha256_bytes(ll.as_bytes()),
-            "case_id": "test-multisample-staging",
-            "name": "multisample-staging",
-            "entry": "fragment_read_ms",
-            "stage": "fragment",
-            "textures": [{
-                "binding": 0,
-                "role": "input",
-                "texture_type": "d2_multisample",
-                "format": "rgba32_float",
-                "dimensions": [1, 1, 1],
-                "sample_count": 4,
-                "bytes_b64": base64::engine::general_purpose::STANDARD.encode(texture)
-            }],
-            "render_targets": [{
-                "index": 0,
-                "format": "rgba32_float",
-                "dimensions": [1, 1],
-                "initial_bytes_b64": "q6urq6urq6urq6urq6urqw=="
-            }],
-            "draw": {"primitive": "triangle", "vertex_start": 0, "vertex_count": 3, "instance_count": 1},
-            "output": {"kind": "render_target", "index": 0, "origin": [0, 0], "dimensions": [1, 1]},
-            "compare": {"kind": "exact"},
-            "execution_safety": "loop_free"
-        }))
-        .expect("synthetic multisample case");
-        let resources = LiteralResources::prepare(&case).expect("multisample literal resources");
-        let scratch = crate::ScratchDir::new("multisample-staging-candidate").expect("scratch");
-        let options = crate::case::product_transform_options(&case).expect("transform options");
-        let (spv, reflection) = metal2vulkan::translate_sanitized_native_reflected(
-            ll,
-            metal2vulkan::passes::Stage::Fragment,
-            scratch.path(),
-            options,
-        )
-        .expect("translate multisample fragment");
-        let companion_ll = scratch.path().join("graphics-companion.ll");
-        std::fs::write(&companion_ll, ll).expect("write companion input");
-        let companion =
-            metal2vulkan::translate_passthrough(companion_ll.to_str().unwrap(), scratch.path())
-                .expect("translate companion");
-        let backend = if cfg!(target_os = "macos") {
-            Backend::Moltenvk
-        } else {
-            Backend::Vulkan
-        };
-        let (output, _) = platform::execute(
-            &case,
-            &resources,
-            &reflection,
-            &spv,
-            Some(&companion),
-            None,
-            backend,
-        )
-        .expect("execute multisample fragment");
-        assert_eq!(output, expected);
+    fn sampled_only_literals_use_portable_optimal_tiling_uploads() {
+        assert!(platform::sampled_only_requires_staging(true, false));
+        assert!(!platform::sampled_only_requires_staging(false, false));
+        assert!(!platform::sampled_only_requires_staging(false, true));
+        assert!(!platform::sampled_only_requires_staging(true, true));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -7733,12 +6869,5 @@ mod platform {
         _backend: Backend,
     ) -> Result<(Vec<u8>, serde_json::Value), String> {
         Err("candidate execution is supported only on Linux and macOS".into())
-    }
-
-    pub fn compile_kernel_pipeline(
-        _reflection: &ShaderReflection,
-        _spv: &[u8],
-    ) -> Result<(), String> {
-        Err("pipeline compilation is supported only on Linux and macOS".into())
     }
 }

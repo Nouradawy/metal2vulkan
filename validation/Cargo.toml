@@ -89,10 +89,6 @@ name = "corpus-vulkan"
 path = "src/bin/corpus-vulkan.rs"
 
 [[bin]]
-name = "corpus-pipeline"
-path = "src/bin/corpus-pipeline.rs"
-
-[[bin]]
 name = "corpus-openrouter-propose"
 path = "src/bin/corpus-openrouter-propose.rs"
 

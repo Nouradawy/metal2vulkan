@@ -171,34 +171,6 @@ pub(super) fn inline_pointer_select_consumers(
     }
 }
 
-/// Splice the named helper calls into their callers so no descriptor-relative byte cursor has to
-/// cross a SPIR-V function boundary. Each site is `(callee, the caller-local name of the argument
-/// that carries the cursor)`; the argument name selects the exact call, so a helper called with a
-/// plain buffer root elsewhere keeps that call site and its body.
-///
-/// Returns `None` when nothing could be spliced -- a caller uses this only after an emission that
-/// already failed, so leaving the source alone simply preserves that failure.
-pub(super) fn inline_cursor_call_sites(
-    san_ll: &str,
-    sites: &HashSet<(String, String)>,
-) -> Option<String> {
-    let mut ordered = sites.iter().collect::<Vec<_>>();
-    ordered.sort();
-    let mut source = san_ll.to_string();
-    let mut changed = false;
-    for (callee, argument) in ordered {
-        // The typed IR names a callee bare; every name in the AIR text keeps its `@` sigil.
-        let targets = HashSet::from([format!("@{}", callee.trim_start_matches('@'))]);
-        // No caller filter: the cursor may be built in a helper rather than the entry, and an
-        // argument name that also occurs in an unrelated caller only inlines one more call.
-        if let Some(inlined) = try_inline(&source, Some((&targets, argument.as_str(), None))) {
-            changed |= inlined != source;
-            source = inlined;
-        }
-    }
-    changed.then_some(source)
-}
-
 // ---------------------------------------------------------------------------------------------
 // Module model
 // ---------------------------------------------------------------------------------------------

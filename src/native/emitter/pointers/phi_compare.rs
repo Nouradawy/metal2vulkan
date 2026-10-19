@@ -470,9 +470,7 @@ impl Emitter {
         // A `null`/`undef` incoming must carry the phi's resolved pointer type (storage + pointee), the
         // same the select path already does — otherwise it is emitted with the generic default type and
         // mismatches the phi result (the cross-storage `_ptr_UniformConstant_uchar` validation reject).
-        if let Some(id) =
-            self.typed_null_or_undef_pointer_id(value, meta.storage, pointee, instructions)?
-        {
+        if let Some(id) = self.typed_null_or_undef_pointer_id(value, meta.storage, pointee)? {
             return Ok(id);
         }
         let Some(template) = result_provenance else {

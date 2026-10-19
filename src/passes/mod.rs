@@ -19,7 +19,6 @@ use crate::meta::{
 use crate::reflect::{
     RuntimeSamplerState, RuntimeStorageImageState, StaticSamplerState,
     SAMPLER_ARGUMENT_COUNT_USIZE, TEXTURE_ARGUMENT_COUNT_USIZE,
-    THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE,
 };
 use crate::spirv_module::{is_block_terminator, Block, Function, Instruction, Module, Operand};
 use spirv::{
@@ -46,6 +45,12 @@ pub struct TransformOptions {
     /// with its payload at offset zero. `Workgroups` explicitly asserts that every dispatched
     /// workgroup is complete.
     pub kernel_dispatch: Option<crate::reflect::KernelDispatch>,
+    /// M-D2: lower `air.simd_{sum,min,max,and,or,xor}` REDUCE as a `GroupNonUniform ClusteredReduce`
+    /// over a 32-lane cluster (Metal's simdgroup width) instead of a whole-subgroup Reduce, so a
+    /// driver whose subgroup is WIDER than 32 still reduces over exactly the 32 lanes Apple's `simd_*`
+    /// intrinsics define. Default false → emitted bytes are identical to the whole-subgroup form; the
+    /// caller opts in only for a wider-subgroup driver (see kb conformance M-D2, pending G7).
+    pub simd_cluster32: bool,
     /// AIR `air.compile.denorms_disable` requests flush-to-zero behavior for floating-point
     /// denormals. Vulkan exposes this only through optional float-controls features, so the native
     /// path records the request but does not emit a portability-breaking execution mode.
@@ -64,25 +69,6 @@ pub struct TransformOptions {
     /// entries; sampled textures retain their AIR-derived image type.
     pub runtime_storage_image_states:
         [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
-    /// Vertex amplification count the render pass encodes, which AIR reads back through
-    /// `[[amplification_id]]` and `[[amplification_count]]`.
-    ///
-    /// Metal's own default is 1 and only `setVertexAmplificationCount:viewMappings:` raises it, so
-    /// 1 here is the API's default rather than an assumption about unknown state. At 1 the
-    /// amplification id is zero at every vertex by definition, so both roles bind constants and the
-    /// module declares no multiview interface. Above 1 the id becomes `BuiltIn ViewIndex`, which is
-    /// the same feature under the other name -- but note that an entry which ALSO writes
-    /// `[[render_target_array_index]]` then carries `ViewIndex` beside `Layer`, and SPIRV-Cross
-    /// renders a second `[[render_target_array_index]]` member for the view index, which Metal
-    /// refuses to compile. 27 of 14579 corpus vertex entries do both.
-    pub vertex_amplification_count: u32,
-    /// Byte length the pipeline allocates for each `[[threadgroup(n)]]` buffer parameter. Metal
-    /// sets this at encode time with `setThreadgroupMemoryLength:`, but Vulkan fixes a `Workgroup`
-    /// array's length in the module, so it has to be chosen here. Supply the largest length this
-    /// pipeline will ever bind; a slot left `None` keeps whichever length the
-    /// module was built with -- the fixed-size array the stage-input pass builds, or native
-    /// emission's 2048-word raw array -- which silently truncates a longer binding.
-    pub threadgroup_memory_lengths: [Option<u32>; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
 }
 
 impl Default for TransformOptions {
@@ -91,12 +77,11 @@ impl Default for TransformOptions {
             descriptor_layout: crate::reflect::DescriptorLayout::default(),
             kernel_local_size: [64, 1, 1],
             kernel_dispatch: None,
+            simd_cluster32: false,
             denorm_flush_to_zero_f32: false,
             raster_sample_count: None,
-            vertex_amplification_count: 1,
             runtime_sampler_states: [None; SAMPLER_ARGUMENT_COUNT_USIZE],
             runtime_storage_image_states: [None; TEXTURE_ARGUMENT_COUNT_USIZE],
-            threadgroup_memory_lengths: [None; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
         }
     }
 }
@@ -174,34 +159,6 @@ impl TransformOptions {
                 )
             })?;
         self.runtime_storage_image_states[slot] = Some(state);
-        Ok(self)
-    }
-
-    /// Fix the byte length one `[[threadgroup(n)]]` buffer parameter is bound with, so its
-    /// `Workgroup` array holds exactly that many bytes instead of the default element count.
-    /// Indices outside the Metal threadgroup argument table fail before translation mutates the
-    /// module; a length of zero is refused, because SPIR-V has no zero-length array and an empty
-    /// binding is a caller mistake rather than a shape to emit.
-    pub fn with_threadgroup_memory_length(
-        mut self,
-        metal_index: u32,
-        length: u32,
-    ) -> Result<Self, String> {
-        let slot = usize::try_from(metal_index)
-            .ok()
-            .filter(|slot| *slot < THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE)
-            .ok_or_else(|| {
-                format!(
-                    "Metal threadgroup buffer index {metal_index} exceeds the threadgroup argument range 0..{}",
-                    THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE
-                )
-            })?;
-        if length == 0 {
-            return Err(format!(
-                "threadgroup buffer {metal_index} was given a zero byte length"
-            ));
-        }
-        self.threadgroup_memory_lengths[slot] = Some(length);
         Ok(self)
     }
 
@@ -317,22 +274,10 @@ pub(in crate::passes) enum SynthCacheKey {
     IntType { bits: u32, signed: bool },
     /// `OpTypeVector <elem> <lanes>` synthesized by `conversions::vector_type`.
     VecType { elem: Word, lanes: u32 },
+    /// `OpConstantComposite <ty> <value×lanes>` synthesized by `access::const_composite_splat`.
+    CompositeSplat { ty: Word, value: Word, lanes: u32 },
     /// The singleton `SubgroupLocalInvocationId` builtin Input variable (`matrix_shuffle`).
     SubgroupLocalInvocationIdInputVar,
-}
-
-/// The entry body AIR-call lowering is walking, and its block dominance.
-///
-/// A lowering that substitutes an SSA value it found elsewhere in the body for an operand it could
-/// not resolve in place owes a dominance proof: the substitute has to dominate the call it is
-/// standing in for, or the module it produces references a definition that does not reach the use.
-/// Computed once per [`air_calls::lower_air_calls`] run -- that pass rewrites instruction lists
-/// inside blocks and adds none, so the block graph it measures does not move under it.
-struct AirCallBody {
-    /// Index into `Ctx::module.functions` of the entry function being lowered.
-    function: usize,
-    /// Dominance over that function's positional block order.
-    dominance: spirv_cfg::BlockDominance,
 }
 
 /// All state needed while rewriting; the module owns result-id allocation.
@@ -349,10 +294,9 @@ struct Ctx {
     /// new type/constant/variable instructions to append to types_global_values.
     new_globals: Vec<Instruction>,
     /// memoized synthesized array-type + numeric-constant ids, keyed structurally by
-    /// [`SynthCacheKey`]. `ty_array` mints fresh on a miss (an array type is keyed by its length
-    /// CONSTANT id, which the scan cannot reconstruct); the three numeric-constant builders
-    /// (`const_int_of`, `const_float`, `const_half`) now all delegate to `get_or_create`, so a
-    /// constant the native emitter already declared is reused rather than declared a second time.
+    /// [`SynthCacheKey`]. Used by the bespoke synthesizers that carry their own scan predicate or
+    /// mint-fresh scheme (`ty_array`, `const_int_of`, `const_float`, `const_half`); each keeps its
+    /// exact scan / no-scan behavior, this map only changes the key representation.
     synth_cache: HashMap<SynthCacheKey, Word>,
     /// Singleton finalize-synthesized types, memoized by their typed identity rather than a string key
     /// (cleanup-plan S4): the `void ()` function type, and the `i8`/`i16` scalar int types. Each carries
@@ -409,19 +353,17 @@ struct Ctx {
     /// Exact-thread dispatches use specialization constants; whole-workgroup dispatches use
     /// ordinary constants.
     kernel_local_size_ids: Option<[Word; 3]>,
+    /// The `get_num_samples()` specialization constant, once per module (see `raster_sample_count_spec`).
+    raster_sample_count_spec_id: Option<Word>,
     kernel_workgroup_size_id: Option<Word>,
     /// Shared source for AIR grid builtins and exact boundary-region decomposition.
     kernel_dispatch: crate::reflect::KernelDispatch,
+    /// M-D2 simd-reduce clustering opt-in (see [`TransformOptions::simd_cluster32`]).
+    simd_cluster32: bool,
     /// Exact graphics-pipeline sample count used to lower `air.get_num_samples.i32`.
     raster_sample_count: Option<u32>,
-    /// Vertex amplification count the render pass encodes (see
-    /// [`TransformOptions::vertex_amplification_count`]).
-    vertex_amplification_count: u32,
     runtime_sampler_states: [Option<RuntimeSamplerState>; SAMPLER_ARGUMENT_COUNT_USIZE],
     runtime_storage_image_states: [Option<RuntimeStorageImageState>; TEXTURE_ARGUMENT_COUNT_USIZE],
-    /// Byte length the pipeline allocates per `[[threadgroup(n)]]` buffer, sizing its `Workgroup`
-    /// array (see [`TransformOptions::threadgroup_memory_lengths`]).
-    threadgroup_memory_lengths: [Option<u32>; THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE],
     /// Storage-image variable/load ids carrying caller-provided runtime format state.
     runtime_storage_image_values: HashMap<Word, (u32, RuntimeStorageImageState)>,
     /// Metal texture indices whose storage-image binding consumed its specialization entry.
@@ -429,39 +371,9 @@ struct Ctx {
     /// lazily-created default sampler variable id, for `air.get_read_sampler()` (a sampler-less
     /// `texture.read` still passes a sampler operand AIR-side; we synthesize one valid sampler).
     default_sampler_var: Option<Word>,
-    /// Result ids of `air.get_read_sampler()` calls in the entry body, collected before AIR-call
-    /// lowering rewrites them. These are the only pointer-shaped sampler operands whose state the
-    /// translator may replace with its own default: AIR itself declares no state for them. Every
-    /// other pointer-shaped sampler operand carries a state the shader chose, so substituting the
-    /// default would silently sample with the wrong filter/address mode
-    /// (see [`air_calls::images::gather::valid_sampler_value`]).
-    read_sampler_values: HashSet<Word>,
-    /// The body AIR-call lowering is walking, set for the whole of
-    /// [`air_calls::lower_air_calls`] and unset outside it. See [`AirCallBody`].
-    air_call_body: Option<AirCallBody>,
-    /// Positional index of the block whose calls are being lowered. Meaningful only while
-    /// `air_call_body` is set.
-    air_call_block: usize,
-    /// Resource handles the stage's argument buffers declare inside a nested `air.struct_type_info`
-    /// member, which the embedded-argument walk does not surface (see
-    /// `meta::embedded::unsurfaced_embedded_resources`). While this is non-empty a texture operand
-    /// the resource binding could not recover may be a declared resource rather than an absent one,
-    /// so the "absent resource samples zero" fold has to refuse instead of answering.
-    unsurfaced_embedded_resources: Vec<String>,
-    /// The Private placeholder variables standing in for texture arguments the variant this module
-    /// describes declares no slot for.
-    ///
-    /// Metal reads zero through such a resource and stores nowhere, and this translator has a
-    /// contract for exactly that (`lower_null_texture_result`, `lower_absent_texture_write`). But
-    /// the placeholder is the SAME shape as the one an unmodeled pointer parameter gets, so without
-    /// this set "the module's only same-shaped image" is an equally good explanation and the
-    /// recovery in `recovered_image_for_private_operand` takes it -- reading and writing a texture
-    /// the shader never named. Recording the variable at the one point that knows which argument it
-    /// stands for is what keeps the two apart.
-    pub(in crate::passes) variant_absent_texture_values: HashSet<Word>,
     /// Descriptor variables the translator invented to give an AIR value a legal SPIR-V type, with
     /// no Metal argument behind them, mapped to the binding each was decorated with. Retracted when
-    /// unconsumed (see [`stage_input::drop_unconsumed_placeholder_descriptor_loads`]); the ones that
+    /// unconsumed (the unconsumed-handle sweep in `module_cleanup`); the ones that
     /// survive are reported to reflection, since no Metal argument would otherwise describe them.
     placeholder_descriptor_vars: HashMap<Word, u32>,
     /// Loaded sampler value ids with an exact static or pipeline-provided state.
@@ -539,23 +451,18 @@ impl Ctx {
             descriptor_layout: options.descriptor_layout,
             kernel_local_size: options.kernel_local_size,
             kernel_local_size_ids: None,
+            raster_sample_count_spec_id: None,
             kernel_workgroup_size_id: None,
             kernel_dispatch: options
                 .kernel_dispatch
                 .unwrap_or_else(crate::reflect::KernelDispatch::safe_default),
+            simd_cluster32: options.simd_cluster32,
             raster_sample_count: options.raster_sample_count,
-            vertex_amplification_count: options.vertex_amplification_count,
             runtime_sampler_states: options.runtime_sampler_states,
             runtime_storage_image_states: options.runtime_storage_image_states,
-            threadgroup_memory_lengths: options.threadgroup_memory_lengths,
             runtime_storage_image_values: HashMap::new(),
             applied_runtime_storage_image_indices: HashSet::new(),
             default_sampler_var: None,
-            read_sampler_values: HashSet::new(),
-            air_call_body: None,
-            air_call_block: 0,
-            unsurfaced_embedded_resources: Vec::new(),
-            variant_absent_texture_values: HashSet::new(),
             sampler_states: HashMap::new(),
             specialized_runtime_sampler_values: HashSet::new(),
             ambiguous_sampler_states: HashSet::new(),
@@ -1050,36 +957,6 @@ fn ptr_storage(defs: &HashMap<Word, Instruction>, ptr: Word) -> Option<StorageCl
 }
 
 impl Ctx {
-    /// Whether `value`'s definition dominates the AIR call currently being lowered.
-    ///
-    /// Answers `false` outside AIR-call lowering: with no call site there is nothing a substitution
-    /// could be justified against, and an unjustified substitution is exactly what this exists to
-    /// refuse. A value with no definition in the entry body is a module-scope declaration, which
-    /// dominates every use in it; anything else -- a definition in another function, or none at all
-    /// -- does not reach this call and is refused.
-    fn dominates_air_call_site(&self, value: Word) -> bool {
-        let Some(body) = self.air_call_body.as_ref() else {
-            return false;
-        };
-        let Some(function) = self.module.functions.get(body.function) else {
-            return false;
-        };
-        match function.blocks.iter().position(|block| {
-            block
-                .instructions
-                .iter()
-                .any(|inst| inst.result_id == Some(value))
-        }) {
-            Some(block) => body.dominance.dominates(block, self.air_call_block),
-            None => self
-                .module
-                .types_global_values
-                .iter()
-                .chain(self.new_globals.iter())
-                .any(|inst| inst.result_id == Some(value)),
-        }
-    }
-
     /// Get-or-create skeleton shared by the `ty_*`/`const_*` synthesizers (refactor S6/S11): return
     /// the cached id for the structural `(op, result_type, operands)` key; else the id of the first
     /// existing `types_global_values`/`new_globals` instruction with exactly that shape; else allocate
@@ -1443,27 +1320,6 @@ impl Ctx {
         self.get_or_create(Op::Constant, Some(uint), vec![Operand::LiteralBit32(v)])
     }
 
-    /// A constant composite of `constituents`, shaped like `ty`.
-    ///
-    /// Every caller here builds a pure value out of ids the module already declares, so two requests
-    /// for the same shape are one constant. Routing through `get_or_create` also finds the composite
-    /// the native emitter (or an earlier pass) has already declared, which the four mint-fresh
-    /// callers could not: 19,183 redundant `OpConstantComposite` over 1,173 corpus modules.
-    fn const_composite(&mut self, ty: Word, constituents: Vec<Word>) -> Word {
-        let operands = constituents.into_iter().map(Operand::IdRef).collect();
-        self.get_or_create(Op::ConstantComposite, Some(ty), operands)
-    }
-
-    /// The threadgroup size the dispatch asked for, as plain constants.
-    ///
-    /// `kernel_local_size` is `TransformOptions::kernel_local_size`, which is exactly the value a
-    /// caller decomposes with `KernelDispatchPlan::new`, so the requested size is fixed at
-    /// translation time even when the grid is not. It deliberately does NOT go through the region
-    /// spec constants: those carry the EXECUTING size, and a tail region specializes them smaller.
-    fn kernel_requested_local_size_ids(&mut self) -> [Word; 3] {
-        self.kernel_local_size.map(|value| self.const_uint(value))
-    }
-
     fn kernel_local_size_ids(&mut self) -> [Word; 3] {
         if let Some(ids) = self.kernel_local_size_ids {
             return ids;
@@ -1500,6 +1356,35 @@ impl Ctx {
         };
         self.kernel_local_size_ids = Some(ids);
         ids
+    }
+
+    /// A `uint` specialization constant, default 1, decorated with
+    /// [`crate::reflect::RASTER_SAMPLE_COUNT_SPEC_ID`]: the pipeline's rasterization sample count when the
+    /// translation was not given it. One per module.
+    pub(in crate::passes) fn raster_sample_count_spec(&mut self) -> Word {
+        if let Some(id) = self.raster_sample_count_spec_id {
+            return id;
+        }
+        let uint_ty = self.ty_uint();
+        let id = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::SpecConstant,
+            Some(uint_ty),
+            Some(id),
+            vec![Operand::LiteralBit32(1)],
+        ));
+        self.module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(id),
+                Operand::Decoration(Decoration::SpecId),
+                Operand::LiteralBit32(crate::reflect::RASTER_SAMPLE_COUNT_SPEC_ID),
+            ],
+        ));
+        self.raster_sample_count_spec_id = Some(id);
+        id
     }
 
     fn kernel_workgroup_size_id(&mut self) -> Word {
@@ -1547,37 +1432,50 @@ impl Ctx {
         if let Some(&id) = self.synth_cache.get(&key) {
             return id;
         }
-        let (bits, signed) = self
+        let bits = self
             .module
             .types_global_values
             .iter()
             .chain(self.new_globals.iter())
             .find_map(|inst| {
                 if inst.class.opcode == Op::TypeInt && inst.result_id == Some(int_ty) {
-                    match (inst.operands.first(), inst.operands.get(1)) {
-                        (Some(Operand::LiteralBit32(bits)), Some(Operand::LiteralBit32(sign))) => {
-                            Some((*bits, *sign == 1))
-                        }
+                    match inst.operands.first() {
+                        Some(Operand::LiteralBit32(bits)) => Some(*bits),
                         _ => None,
                     }
                 } else {
                     None
                 }
             })
-            .unwrap_or((32, false));
-        let lit = match bits {
-            64 => Operand::LiteralBit64(v as u64),
-            // SPIR-V 2.2.1: a literal narrower than a word has zero high-order bits when the type's
-            // Signedness is 0, and is sign-extended when it is 1. `v as u32` sign-extends, which for
-            // `const_int_of(i16, -8)` wrote `OpConstant %ushort 4294967288` -- spirv-val rejects the
-            // whole module. `air.get_descriptor_size_tensor` is the reachable caller; it asks for an
-            // i16 alignment mask of -8.
-            bits if bits < 32 && !signed => {
-                Operand::LiteralBit32((v as u32) & ((1u32 << bits) - 1))
-            }
-            _ => Operand::LiteralBit32(v as u32),
+            .unwrap_or(32);
+        let lit = if bits == 64 {
+            Operand::LiteralBit64(v as u64)
+        } else {
+            Operand::LiteralBit32(v as u32)
         };
-        let id = self.get_or_create(Op::Constant, Some(int_ty), vec![lit]);
+        for inst in self
+            .module
+            .types_global_values
+            .iter()
+            .chain(self.new_globals.iter())
+        {
+            if inst.class.opcode == Op::Constant
+                && inst.result_type == Some(int_ty)
+                && inst.operands.first() == Some(&lit)
+            {
+                if let Some(rid) = inst.result_id {
+                    self.synth_cache.insert(key, rid);
+                    return rid;
+                }
+            }
+        }
+        let id = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::Constant,
+            Some(int_ty),
+            Some(id),
+            vec![lit],
+        ));
         self.synth_cache.insert(key, id);
         id
     }
@@ -1591,15 +1489,15 @@ impl Ctx {
             return id;
         }
         let f = self.ty_float();
-        // Scan as well as memoize. The native emitter has already declared most of the float
-        // constants a pass then asks for, and minting a second `OpConstant %float <same bits>`
-        // leaves two ids standing for one value -- 5113 redundant f32 constants over 3071 corpus
-        // modules before this scan.
-        let id = self.get_or_create(
+        let id = self.module.fresh_id();
+        self.new_globals.push(type_inst(
             Op::Constant,
-            Some(f),
+            id,
             vec![Operand::LiteralBit32(bits.to_bits())],
-        );
+        ));
+        // fix result_type (Constant needs it)
+        let last = self.new_globals.last_mut().unwrap();
+        last.result_type = Some(f);
         self.synth_cache.insert(key, id);
         id
     }
@@ -1618,11 +1516,13 @@ impl Ctx {
             return id;
         }
         let h = self.ty_half();
-        let id = self.get_or_create(
+        let id = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
             Op::Constant,
             Some(h),
+            Some(id),
             vec![Operand::LiteralBit32(bits as u32)],
-        );
+        ));
         self.synth_cache.insert(key, id);
         id
     }
@@ -1654,19 +1554,14 @@ impl Ctx {
 }
 
 mod access;
+mod agx_cluster;
 mod air_calls;
-mod aliased_imageblock;
 mod emitted_inline;
 mod finalize;
-pub(crate) mod loop_budget;
 #[cfg(test)]
 mod lowering_regression_tests;
 mod module_cleanup;
-mod subgroup_materialize;
-pub(crate) use module_cleanup::{
-    drop_dangling_debug, drop_unreferenced_global_variables, drop_unreferenced_scalar_types,
-    drop_unrequired_capabilities, drop_unused_scalar_width_capabilities,
-};
+pub(crate) use module_cleanup::{drop_dangling_debug, drop_unreferenced_global_variables};
 mod prune;
 mod resources;
 mod spirv_cfg;
@@ -1679,8 +1574,8 @@ mod workgroup;
 use access::{
     compose_derived_access_chains, decorate_ptr_access_chain_base_strides,
     drop_overindexed_zero_tail, drop_writeonly_dead_local_array_stores,
-    expose_nullable_memory_bases, fold_block_view_element_offsets, guard_integer_division_by_zero,
-    hoist_function_variables, lower_cross_member_subword_load, lower_cross_member_subword_store,
+    expose_nullable_memory_bases, guard_integer_division_by_zero, hoist_function_variables,
+    lower_cross_member_subword_load, lower_cross_member_subword_store,
     lower_private_byte_aggregate_reinterpret, lower_private_low_byte_word_load,
     lower_private_memory_atomics, lower_scalar_i64_arithmetic_to_u32_halves,
     lower_subword_scalar_store, materialize_inlined_local_pointer_field_stores,
@@ -1715,7 +1610,6 @@ use stage_input::{
     build_stage_input, load_kernel_dispatch_component, materialize_kernel_dispatch_field,
 };
 use stage_output::rewrite_return;
-use subgroup_materialize::materialize_selected_subgroup_results;
 use value_queries::*;
 use workgroup::*;
 
@@ -1986,36 +1880,6 @@ fn canonicalize_ids_and_collect_remap(
             });
         }
     }
-    // An id this module never defines still reaches here whenever an earlier stage left a forward
-    // reference unresolved -- the measured case is `phi_value_id` reserving an id for a phi incoming
-    // whose definition is then never emitted. Leaving such an id UNCHANGED is not the same as
-    // leaving it dangling: every defined id is renumbered into the dense range `1..next`, so the
-    // stale number silently becomes a reference to whichever instruction now owns it. Measured on
-    // four corpus sources, a phi's value operand became a block LABEL that way, and the module then
-    // failed the owned contract with a type verdict about a store that was never the defect.
-    // Giving each undefined id its own number above every mapped one keeps the reference visibly
-    // undefined, so `owned_module_failure` names it instead of describing an unrelated instruction.
-    for inst in module.all_inst_iter() {
-        for operand in &inst.operands {
-            let (Operand::IdRef(id) | Operand::IdMemorySemantics(id) | Operand::IdScope(id)) =
-                operand
-            else {
-                continue;
-            };
-            remap.entry(*id).or_insert_with(|| {
-                let id = next;
-                next += 1;
-                id
-            });
-        }
-        for id in inst.result_type.iter() {
-            remap.entry(*id).or_insert_with(|| {
-                let id = next;
-                next += 1;
-                id
-            });
-        }
-    }
     let map = |w: Word| remap.get(&w).copied().unwrap_or(w);
     for inst in module.all_inst_iter_mut() {
         if let Some(result_type) = inst.result_type.as_mut() {
@@ -2065,66 +1929,6 @@ mod canonicalize_tests {
         assert_eq!(tracked, [2]);
         assert_eq!(module.types_global_values[1].result_id, Some(2));
         assert_eq!(module.header.as_ref().map(|header| header.bound), Some(3));
-    }
-
-    /// An id nothing defines must not be renumbered onto an id something does.
-    ///
-    /// Canonicalization packs every DEFINED id into `1..bound`. An operand naming an id this module
-    /// never defined therefore cannot keep its old number: whatever instruction the dense
-    /// renumbering gives that number is what the operand then reads. Measured on four corpus
-    /// sources, a phi value operand became a block label exactly this way, and the module failed
-    /// the owned contract with a verdict about a store's value type -- a description of an
-    /// instruction that was never the defect. The reference has to stay visibly undefined so
-    /// `owned_module_failure` reports what is actually wrong.
-    #[test]
-    fn canonicalize_does_not_alias_an_undefined_id_onto_a_defined_one() {
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(81));
-        module.types_global_values = vec![
-            Instruction::new(
-                Op::TypeInt,
-                None,
-                Some(50),
-                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
-            ),
-            Instruction::new(Op::ConstantNull, Some(50), Some(80), vec![]),
-            // %1 is defined nowhere. Under a remap that leaves unmapped ids alone it stays %1,
-            // which is the number `%50` (the TypeInt) is about to be given.
-            Instruction::new(
-                Op::ConstantComposite,
-                Some(50),
-                Some(70),
-                vec![Operand::IdRef(1)],
-            ),
-        ];
-
-        canonicalize_ids(&mut module);
-
-        let type_id = module.types_global_values[0].result_id;
-        let composite = &module.types_global_values[2];
-        let Some(&Operand::IdRef(undefined)) = composite.operands.first() else {
-            panic!("the composite kept its operand");
-        };
-        assert_ne!(
-            Some(undefined),
-            type_id,
-            "an undefined operand was renumbered onto the TypeInt"
-        );
-        let defined = module
-            .all_inst_iter()
-            .filter_map(|inst| inst.result_id)
-            .collect::<Vec<_>>();
-        assert!(
-            !defined.contains(&undefined),
-            "an undefined operand was renumbered onto a defined id: {undefined} in {defined:?}"
-        );
-        assert!(
-            module
-                .header
-                .as_ref()
-                .is_some_and(|header| header.bound > undefined),
-            "the id bound must cover the number the undefined reference was given"
-        );
     }
 }
 
@@ -2311,203 +2115,6 @@ mod emitted_inline_tests {
             "all bodied function ids are selected independently of OpName"
         );
     }
-
-    fn blocks_function(id: Word, blocks: Vec<(Word, Vec<Instruction>)>) -> Function {
-        Function {
-            def: Some(Instruction::new(
-                Op::Function,
-                Some(2),
-                Some(id),
-                vec![
-                    Operand::FunctionControl(FunctionControl::NONE),
-                    Operand::IdRef(3),
-                ],
-            )),
-            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-            parameters: Vec::new(),
-            blocks: blocks
-                .into_iter()
-                .map(|(label, instructions)| Block {
-                    label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
-                    instructions,
-                })
-                .collect(),
-        }
-    }
-
-    fn named(id: Word, name: &str) -> Instruction {
-        Instruction::new(
-            Op::Name,
-            None,
-            None,
-            vec![Operand::IdRef(id), Operand::LiteralString(name.to_string())],
-        )
-    }
-
-    /// Every `OpPhi` parent label in `function`, paired with whether that label really is a
-    /// predecessor of the phi's own block.
-    fn phi_parents_are_predecessors(function: &Function) -> Vec<(Word, Word, bool)> {
-        let mut predecessors: HashMap<Word, HashSet<Word>> = HashMap::new();
-        for (from, successors) in crate::spirv_module::block_successors_by_label(&function.blocks) {
-            for to in successors {
-                predecessors.entry(to).or_default().insert(from);
-            }
-        }
-        let mut answers = Vec::new();
-        for block in &function.blocks {
-            let Some(here) = block.label.as_ref().and_then(|label| label.result_id) else {
-                continue;
-            };
-            let empty = HashSet::new();
-            let here_predecessors = predecessors.get(&here).unwrap_or(&empty);
-            for instruction in &block.instructions {
-                if instruction.class.opcode != Op::Phi {
-                    continue;
-                }
-                for parent in instruction.operands.iter().skip(1).step_by(2) {
-                    if let Operand::IdRef(parent) = parent {
-                        answers.push((here, *parent, here_predecessors.contains(parent)));
-                    }
-                }
-            }
-        }
-        answers
-    }
-
-    // A multi-block helper called from a loop LATCH. Splitting the latch at the call moves its back
-    // edge onto the continuation, so the loop header's OpPhi -- which precedes the latch in the block
-    // list -- has to be rewired too. Redirecting only the blocks that FOLLOW the split left that phi
-    // naming a block that no longer branches to it, and the relooper answered the malformed phi by
-    // demoting it to a Function variable stored once outside the loop: a loop-carried value that
-    // stops carrying. Measured over the local corpus, 16 of 14579 sources produced such a phi and 13
-    // of them changed bytes when this was fixed.
-    #[test]
-    fn a_header_phi_before_the_split_latch_follows_the_back_edge_to_the_continuation() {
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(100));
-        module.debug_names = vec![named(10, "main"), named(20, "helper")];
-        module.functions = vec![
-            blocks_function(
-                10,
-                vec![
-                    (
-                        11,
-                        vec![Instruction::new(
-                            Op::Branch,
-                            None,
-                            None,
-                            vec![Operand::IdRef(12)],
-                        )],
-                    ),
-                    (
-                        12,
-                        vec![
-                            Instruction::new(
-                                Op::Phi,
-                                Some(5),
-                                Some(30),
-                                vec![
-                                    Operand::IdRef(40),
-                                    Operand::IdRef(11),
-                                    Operand::IdRef(41),
-                                    Operand::IdRef(13),
-                                ],
-                            ),
-                            Instruction::new(
-                                Op::LoopMerge,
-                                None,
-                                None,
-                                vec![
-                                    Operand::IdRef(14),
-                                    Operand::IdRef(13),
-                                    Operand::LoopControl(spirv::LoopControl::NONE),
-                                ],
-                            ),
-                            Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(13)]),
-                        ],
-                    ),
-                    (
-                        13,
-                        vec![
-                            Instruction::new(
-                                Op::IAdd,
-                                Some(5),
-                                Some(41),
-                                vec![Operand::IdRef(30), Operand::IdRef(30)],
-                            ),
-                            Instruction::new(
-                                Op::FunctionCall,
-                                None,
-                                None,
-                                vec![Operand::IdRef(20)],
-                            ),
-                            Instruction::new(Op::Branch, None, None, vec![Operand::IdRef(12)]),
-                        ],
-                    ),
-                    (14, vec![Instruction::new(Op::Return, None, None, vec![])]),
-                ],
-            ),
-            blocks_function(
-                20,
-                vec![
-                    (
-                        21,
-                        vec![Instruction::new(
-                            Op::Branch,
-                            None,
-                            None,
-                            vec![Operand::IdRef(22)],
-                        )],
-                    ),
-                    (22, vec![Instruction::new(Op::Return, None, None, vec![])]),
-                ],
-            ),
-        ];
-
-        let (module, _) = inline_all_emitted_helpers(
-            module,
-            crate::emit_sidecar::EmitSidecar::default(),
-            Some("main"),
-        )
-        .expect("complete emitted closure");
-
-        let entry = &module.functions[0];
-        assert!(
-            entry
-                .blocks
-                .iter()
-                .flat_map(|block| &block.instructions)
-                .all(|instruction| instruction.class.opcode != Op::FunctionCall),
-            "the multi-block helper is spliced into the latch"
-        );
-        let stale = phi_parents_are_predecessors(entry)
-            .into_iter()
-            .filter(|(_, _, is_predecessor)| !is_predecessor)
-            .collect::<Vec<_>>();
-        assert!(
-            stale.is_empty(),
-            "every phi parent must be a real predecessor after the splice, got {stale:?}"
-        );
-        let header_parents = entry
-            .blocks
-            .iter()
-            .find(|block| block.label.as_ref().and_then(|label| label.result_id) == Some(12))
-            .expect("the loop header survives")
-            .instructions
-            .iter()
-            .find(|instruction| instruction.class.opcode == Op::Phi)
-            .expect("the loop-carried phi survives")
-            .operands
-            .iter()
-            .skip(1)
-            .step_by(2)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            !header_parents.contains(&Operand::IdRef(13)),
-            "the header phi must not keep naming the latch, which now branches into the callee:              {header_parents:?}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -2643,179 +2250,6 @@ mod phase_contract_tests {
         ctx
     }
 
-    /// A constant the module already declares is reused, not declared a second time.
-    ///
-    /// The three numeric-constant builders memoize by value, which stops a pass from asking twice --
-    /// but the native emitter has already declared most of what a pass then asks for, and a builder
-    /// that only memoizes never sees it. That left 5,113 redundant `OpConstant %float` over 3,071
-    /// corpus modules: two ids standing for one value, which is what an id-equality test elsewhere
-    /// silently gets wrong.
-    #[test]
-    fn a_synthesized_constant_reuses_the_one_the_module_already_declares() {
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(10));
-        module.types_global_values = vec![
-            Instruction::new(
-                Op::TypeFloat,
-                None,
-                Some(1),
-                vec![Operand::LiteralBit32(32)],
-            ),
-            Instruction::new(
-                Op::Constant,
-                Some(1),
-                Some(2),
-                vec![Operand::LiteralBit32(1.5f32.to_bits())],
-            ),
-            Instruction::new(
-                Op::TypeFloat,
-                None,
-                Some(3),
-                vec![Operand::LiteralBit32(16)],
-            ),
-            Instruction::new(
-                Op::Constant,
-                Some(3),
-                Some(4),
-                vec![Operand::LiteralBit32(
-                    crate::float16::f32_to_f16_bits(0.5) as u32
-                )],
-            ),
-            Instruction::new(
-                Op::TypeInt,
-                None,
-                Some(5),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-            ),
-            Instruction::new(
-                Op::Constant,
-                Some(5),
-                Some(6),
-                vec![Operand::LiteralBit32(7)],
-            ),
-        ];
-        let mut ctx = Ctx::new(module);
-        assert_eq!(ctx.const_float(1.5), 2, "float constant was declared twice");
-        assert_eq!(ctx.const_half(0.5), 4, "half constant was declared twice");
-        assert_eq!(ctx.const_int_of(5, 7), 6, "int constant was declared twice");
-        assert!(
-            ctx.new_globals
-                .iter()
-                .all(|inst| inst.class.opcode != Op::Constant),
-            "a constant was staged even though the module already declared it"
-        );
-    }
-
-    /// A composite constant is declared once per shape, whoever asks for it.
-    ///
-    /// Four builders minted a fresh `OpConstantComposite` per request and a fifth carried a
-    /// hand-rolled splat-only scan, so a vector every pass wants -- a zero splat, a lane-index
-    /// vector -- was declared once per ASK. That left 19,183 redundant `OpConstantComposite` over
-    /// 1,173 corpus modules. The scan has to see `types_global_values` as well as `new_globals`:
-    /// the composite a pass asks for is usually one the native emitter already declared.
-    #[test]
-    fn a_composite_constant_is_declared_once_however_many_callers_ask() {
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(10));
-        module.types_global_values = vec![
-            Instruction::new(
-                Op::TypeInt,
-                None,
-                Some(1),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(1)],
-            ),
-            Instruction::new(
-                Op::TypeVector,
-                None,
-                Some(2),
-                vec![Operand::IdRef(1), Operand::LiteralBit32(3)],
-            ),
-            Instruction::new(
-                Op::Constant,
-                Some(1),
-                Some(3),
-                vec![Operand::LiteralBit32(0)],
-            ),
-            Instruction::new(
-                Op::ConstantComposite,
-                Some(2),
-                Some(4),
-                vec![Operand::IdRef(3), Operand::IdRef(3), Operand::IdRef(3)],
-            ),
-        ];
-        let mut ctx = Ctx::new(module);
-
-        let splat = crate::passes::access::const_composite_splat(&mut ctx, 2, 3, 3);
-        assert_eq!(
-            splat, 4,
-            "the splat the module already declares was declared again"
-        );
-        assert_eq!(
-            ctx.const_composite(2, vec![3, 3, 3]),
-            4,
-            "a second caller with the same shape got a second id"
-        );
-
-        let mixed = ctx.const_int_of(1, 1);
-        let first = ctx.const_composite(2, vec![3, mixed, 3]);
-        assert_ne!(first, 4, "a different shape reused the zero splat");
-        assert_eq!(
-            ctx.const_composite(2, vec![3, mixed, 3]),
-            first,
-            "the new shape was declared twice"
-        );
-        assert_eq!(
-            ctx.new_globals
-                .iter()
-                .filter(|inst| inst.class.opcode == Op::ConstantComposite)
-                .count(),
-            1,
-            "more composites were staged than there are distinct shapes"
-        );
-    }
-
-    /// The dump names its file after the phase, and the bytes are the assembled module.
-    ///
-    /// The whole point of the dump is that `spirv-dis` can read it, so a name that collided across
-    /// phases -- or a payload that was not a module -- would leave the trace as uninformative as the
-    /// verdict string it exists to supplement.
-    #[test]
-    fn a_phase_dump_is_named_for_its_phase_and_holds_the_module() {
-        let ctx = ctx_with_staged_pointer_type();
-        let prefix = std::env::temp_dir().join(format!(
-            "m2v_phase_dump_test_{}_{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        write_phase_dump(&ctx, prefix.as_os_str(), 7, "air lowering start");
-        let path = prefix.with_file_name(format!(
-            "{}-07-air-lowering-start.spv",
-            prefix.file_name().unwrap().to_string_lossy()
-        ));
-        let bytes = std::fs::read(&path).expect("phase dump written");
-        let _ = std::fs::remove_file(&path);
-        assert_eq!(
-            bytes.get(..4),
-            Some(&0x0723_0203u32.to_le_bytes()[..]),
-            "dump must start with the SPIR-V magic number"
-        );
-        assert_eq!(
-            bytes.len(),
-            ctx.module.assemble().len() * 4,
-            "dump must be the whole assembled module"
-        );
-    }
-
-    /// An unwritable prefix must not change the translation, only report itself.
-    #[test]
-    fn a_phase_dump_that_cannot_be_written_is_not_an_error() {
-        let ctx = ctx_with_staged_pointer_type();
-        let prefix = std::env::temp_dir()
-            .join("m2v_phase_dump_missing_dir")
-            .join("x");
-        write_phase_dump(&ctx, prefix.as_os_str(), 0, "cleanup start");
-    }
-
     #[test]
     fn a_staged_global_counts_as_declared() {
         assert_eq!(
@@ -2926,29 +2360,6 @@ fn phase_contract_verdict(ctx: &Ctx) -> Vec<String> {
 /// the phase where a violation first appears and is never repaired is the one that introduced it,
 /// and the message is the one the finished module would have failed with. Without it, a contract
 /// failure reported at the end says nothing about which phase produced it.
-/// Write the module a phase is about to run on, as `<prefix>-<ordinal>-<phase>.spv`.
-///
-/// The ordinal keeps the pipeline order readable after a directory listing sorts the names, and the
-/// phase words are joined with `-` so the name stays a single shell-friendly token. Errors are
-/// reported and otherwise ignored: this is a diagnostic, and a translation must not change its
-/// result because a dump directory was not writable.
-fn write_phase_dump(ctx: &Ctx, prefix: &std::ffi::OsStr, ordinal: usize, phase: &str) {
-    let slug = phase
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect::<String>();
-    let mut path = prefix.to_os_string();
-    path.push(format!("-{ordinal:02}-{slug}.spv"));
-    let words = ctx.module.assemble();
-    let bytes = words
-        .iter()
-        .flat_map(|word| word.to_le_bytes())
-        .collect::<Vec<u8>>();
-    if let Err(err) = std::fs::write(&path, bytes) {
-        eprintln!("[phase-dump] {phase}: {err}");
-    }
-}
-
 fn report_phase_contract(ctx: &Ctx, phase: &str) {
     let verdicts = phase_contract_verdict(ctx);
     if verdicts.is_empty() {
@@ -3002,18 +2413,8 @@ pub(crate) fn transform_with_options_and_sidecar(
         return Err("kernel dispatch bounds are only valid for kernel stages".to_string());
     }
     let mut ctx = Ctx::with_options_and_sidecar(module, emit_sidecar, stage, options);
-    ctx.unsurfaced_embedded_resources = match stage {
-        Stage::Fragment => frag.map(|m| m.unsurfaced_embedded_resources.clone()),
-        Stage::Vertex => vert.map(|m| m.unsurfaced_embedded_resources.clone()),
-        Stage::Kernel => kern.map(|m| m.unsurfaced_embedded_resources.clone()),
-    }
-    .unwrap_or_default();
     let retry_debug = crate::env_vars::retry_debug();
     let pass_contract = crate::env_vars::pass_contract();
-    let phase_dump = crate::env_vars::phase_dump();
-    // A `Cell` rather than a plain counter: the macro that bumps it expands after the last phase
-    // too, and a plain `+= 1` there is an assignment nothing reads.
-    let phase_ordinal = std::cell::Cell::new(0usize);
     // A macro rather than a closure so it can read `ctx.module` at the point it is written: a closure
     // capturing `&ctx` would hold a borrow across the whole pipeline, which is exactly where the
     // phases need `&mut ctx`.
@@ -3025,10 +2426,6 @@ pub(crate) fn transform_with_options_and_sidecar(
             if pass_contract {
                 report_phase_contract(&ctx, $phase);
             }
-            if let Some(prefix) = phase_dump.as_deref() {
-                write_phase_dump(&ctx, prefix, phase_ordinal.get(), $phase);
-            }
-            phase_ordinal.set(phase_ordinal.get() + 1);
         };
     }
     let mut entry_idx = find_entry_index(&ctx.module, entry_name)
@@ -3042,6 +2439,7 @@ pub(crate) fn transform_with_options_and_sidecar(
         .ok_or_else(|| "entry vanished after helper cleanup".to_string())?;
     recover_inlined_local_pointer_fields(&mut ctx, entry_idx);
     compose_derived_access_chains(&mut ctx, entry_idx);
+    agx_cluster::lower_agx2_cluster_numbers(&mut ctx, entry_idx, &stage)?;
     neutralize_null_access_chains(&mut ctx, entry_idx);
 
     debug_phase!("interface start");
@@ -3078,22 +2476,6 @@ pub(crate) fn transform_with_options_and_sidecar(
     let air_lowering = lower_air_calls(&mut ctx, entry_idx);
     ctx.phase_value_types = None;
     air_lowering?;
-    // The staging array an aliased explicit imageblock lives in is undefined on entry and reaches
-    // no attachment on return; give it the render-target planes the alias says it IS. Runs after
-    // `lower_air_calls` because it lowers implicit-imageblock intrinsics of its own.
-    aliased_imageblock::lower_aliased_imageblock(
-        &mut ctx,
-        entry_idx,
-        &stage,
-        &kern
-            .and_then(|meta| {
-                meta.aliased_implicit_imageblock_params
-                    .first()
-                    .and_then(|param| meta.aliased_implicit_imageblock_planes.get(param))
-            })
-            .cloned()
-            .unwrap_or_default(),
-    )?;
     // AIR calls can materialize opaque handles after interface binding's earlier resource-wrapper
     // collapse (notably `air.get_null_texture_*`). Re-establish the same aggregate invariant for
     // those late values before any subsequent pass observes their former pointer-shaped fields.
@@ -3188,16 +2570,6 @@ pub(crate) fn transform_with_options_and_sidecar(
     }
     for function_idx in 0..ctx.module.functions.len() {
         rewrite_raw_byte_pointer_wide_stores(&mut ctx, function_idx);
-    }
-    // The three rewrites above reach a wide value's parts as `OpPtrAccessChain %view %k`. When the
-    // base is an invalid dynamic Block view, that offset has to be folded back into the view's own
-    // index before the subword rewrite can take the family -- and the rewrite has to run a second
-    // time, because the parts these produce did not exist when it first ran.
-    for function_idx in 0..ctx.module.functions.len() {
-        fold_block_view_element_offsets(&mut ctx, function_idx);
-    }
-    for function_idx in 0..ctx.module.functions.len() {
-        rewrite_dynamic_struct_index_subword_reinterpret(&mut ctx, function_idx)?;
     }
     decorate_ptr_access_chain_base_strides(&mut ctx);
     // Runs AFTER the stride decoration so the byte-buffer (PtrAccessChain) widen can read the base
@@ -3299,11 +2671,6 @@ pub(crate) fn transform_with_options_and_sidecar(
     // 2f) Drop blocks made unreachable by typed pruning and specialization. spirv-val tolerates
     //     them; SPIRV-Cross (MoltenVK) throws on them at pipeline creation. See `prune.rs`.
     prune_unreachable_blocks(&mut ctx.module);
-    // 2e) A subgroup instruction read exactly once, by an OpSelect in its own block, is forwarded
-    //     by SPIRV-Cross into an MSL ternary arm -- where only the lanes taking that arm execute
-    //     it, silently breaking Metal's requirement that a shuffle's source lane take part in the
-    //     call. Spill those results through a Function variable so the call stays a statement.
-    materialize_selected_subgroup_results(&mut ctx);
 
     resources::sink_loop_header_texture_array_loads(&mut ctx, entry_idx);
     // Every local-pointer marker consumer has run. These facts exist only across the emitter/pass
@@ -3338,13 +2705,12 @@ pub(crate) fn transform_with_options_and_sidecar(
     // sealing synthesized before global liveness runs.
     decorate_ptr_access_chain_base_strides(&mut ctx);
     ctx.module.types_global_values.append(&mut ctx.new_globals);
-    // `air.get_read_sampler()` and `air.get_null_texture_*()` each needed a real descriptor to type
-    // their result; where nothing ever consumed that value, retract the synthesis before liveness
-    // runs so the descriptor goes too.
-    stage_input::drop_unconsumed_placeholder_descriptor_loads(&mut ctx);
     // The closures above are the last of this boundary's instruction changes, and any of them can
     // delete a variable's last use. Re-establish global liveness against the finished bodies before
-    // the collection that would otherwise root a stranded variable at its own interface entry.
+    // the collection that would otherwise root a stranded variable at its own interface entry. That
+    // includes retracting handle loads nothing consumes -- an unused texture or sampler parameter,
+    // or a synthesized `air.get_read_sampler()` / `air.get_null_texture_*()` placeholder -- so the
+    // descriptor goes with them.
     module_cleanup::drop_unreferenced_global_variables(&mut ctx.module);
     module_cleanup::gc_dead_globals(&mut ctx);
     debug_phase!("complete");

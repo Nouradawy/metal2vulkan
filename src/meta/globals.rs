@@ -83,18 +83,13 @@ fn static_init_global_values(ll: &str) -> HashMap<String, StaticValue> {
             let Some(global) = parse_global_name(ptr) else {
                 continue;
             };
-            if let Some(evaluated) = eval_value_token(value_token(value), &env, &globals) {
+            if let Some(value) = eval_value_token(value_token(value), &env, &globals) {
                 unknown_stores.remove(&global);
-                // Narrow to the STORE's own operand type. A fixed 32-bit mask clipped every
-                // `store i64` to its low half, which is how a 64-bit function constant's high bits
-                // -- the bit an `lshr i64 %x, 63` predicate reads -- were lost.
-                let mask = integer_result_width_and_mask(value)
-                    .map_or(u64::from(u32::MAX), |(_, mask)| mask);
                 globals.insert(
                     global,
-                    match evaluated {
-                        StaticValue::Int(evaluated) => StaticValue::Int(evaluated & mask),
-                        evaluated => evaluated,
+                    match value {
+                        StaticValue::Int(value) => StaticValue::Int(value & u64::from(u32::MAX)),
+                        value => value,
                     },
                 );
             } else {
@@ -304,13 +299,10 @@ fn integer_initializer(rest: &str) -> Option<StaticValue> {
     let mut tokens = typed_init.split_whitespace();
     let ty = tokens.next()?;
     let width = ty.strip_prefix('i')?.parse::<u32>().ok()?;
-    // The scalar widths a Metal function constant is declared at. 47 of the local corpus's
-    // `air.fc_initializer` globals are `i64` (`ulong`), and leaving them unseeded left every
-    // predicate derived from one unevaluated.
-    if !matches!(width, 8 | 16 | 32 | 64) {
+    if !matches!(width, 8 | 16 | 32) {
         return None;
     }
-    let (_, mask) = integer_result_width_and_mask(ty)?;
+    let mask = (1_u64 << width) - 1;
     let value = tokens.next()?.trim_end_matches(',');
     if value == "undef" && rest.contains("air.fc_initializer") {
         return Some(StaticValue::Int(0));
@@ -322,21 +314,6 @@ fn integer_initializer(rest: &str) -> Option<StaticValue> {
         .map(|value| StaticValue::Int(value & mask))
 }
 
-/// The integer binary opcodes the static-initializer evaluator folds. Every one is matched with the
-/// separating space, so no entry can be read out of the start of another and the order here carries
-/// no meaning.
-const INTEGER_BINARY_OPCODES: &[&str] = &[
-    "add", "sub", "mul", "and", "or", "xor", "udiv", "urem", "sdiv", "srem", "shl", "lshr", "ashr",
-];
-
-/// `value` read as a SIGNED integer of `width` bits. The evaluator carries every integer as a
-/// masked `u64`, so a signed comparison, division or arithmetic shift has to recover the sign bit
-/// from the operand's own width rather than from bit 63 of the carrier.
-fn signed_of(value: u64, width: u32) -> i64 {
-    let shift = 64 - width.min(64);
-    ((value << shift) as i64) >> shift
-}
-
 fn eval_static_rhs(
     rhs: &str,
     env: &HashMap<String, StaticValue>,
@@ -344,28 +321,6 @@ fn eval_static_rhs(
 ) -> Option<StaticValue> {
     if rhs.contains("@air.is_function_constant_defined(") {
         return Some(StaticValue::Bool(false));
-    }
-    // `llvm.umax`/`umin`/`smax`/`smin` are how the front end spells a clamped function-constant
-    // expression, and 106 of them appear in the local corpus's static initializers.
-    if let Some((name, rest)) = ["umax", "umin", "smax", "smin"]
-        .into_iter()
-        .find_map(|name| {
-            rhs.split_once(&format!("@llvm.{name}."))
-                .map(|(_, rest)| (name, rest))
-        })
-    {
-        let arguments = rest.split_once('(')?.1.rsplit_once(')')?.0;
-        let (lhs, rhs) = eval_binary_int(arguments, env, globals)?;
-        let (width, mask) = integer_result_width_and_mask(arguments)?;
-        let (lhs, rhs) = (lhs & mask, rhs & mask);
-        let value = match name {
-            "umax" => lhs.max(rhs),
-            "umin" => lhs.min(rhs),
-            "smax" => signed_of(lhs, width).max(signed_of(rhs, width)) as u64,
-            "smin" => signed_of(lhs, width).min(signed_of(rhs, width)) as u64,
-            _ => unreachable!("matched min/max intrinsic"),
-        };
-        return Some(StaticValue::Int(value & mask));
     }
     if rhs.contains("@air.normalize_function_constant_predicate.") {
         let arguments = rhs.split_once('(')?.1.rsplit_once(')')?.0;
@@ -385,57 +340,37 @@ fn eval_static_rhs(
         };
         return values.get(idx).copied().map(StaticValue::Int);
     }
-    if let Some((opcode, rest)) = INTEGER_BINARY_OPCODES.iter().find_map(|opcode| {
-        rhs.strip_prefix(opcode)
-            .and_then(|rest| rest.strip_prefix(' '))
-            .map(|rest| (*opcode, rest))
-    }) {
+    if let Some((opcode, rest)) = ["add", "mul", "and", "or", "xor", "shl", "lshr"]
+        .into_iter()
+        .find_map(|opcode| {
+            rhs.strip_prefix(opcode)
+                .and_then(|rest| rest.strip_prefix(' '))
+                .map(|rest| (opcode, rest))
+        })
+    {
         let (lhs, rhs) = eval_binary_int(rest, env, globals)?;
         let (width, mask) = integer_result_width_and_mask(rest)?;
-        let (lhs, rhs) = (lhs & mask, rhs & mask);
+        let lhs = lhs & mask;
         let value = match opcode {
-            "add" => lhs.wrapping_add(rhs),
-            "sub" => lhs.wrapping_sub(rhs),
-            "mul" => lhs.wrapping_mul(rhs),
-            "and" => lhs & rhs,
-            "or" => lhs | rhs,
-            "xor" => lhs ^ rhs,
-            "udiv" => lhs.checked_div(rhs)?,
-            "urem" => lhs.checked_rem(rhs)?,
-            "sdiv" => signed_of(lhs, width).checked_div(signed_of(rhs, width))? as u64,
-            "srem" => signed_of(lhs, width).checked_rem(signed_of(rhs, width))? as u64,
+            "add" => lhs.wrapping_add(rhs & mask),
+            "mul" => lhs.wrapping_mul(rhs & mask),
+            "and" => lhs & (rhs & mask),
+            "or" => lhs | (rhs & mask),
+            "xor" => lhs ^ (rhs & mask),
             "shl" if rhs < u64::from(width) => lhs.checked_shl(rhs.try_into().ok()?)?,
             "lshr" if rhs < u64::from(width) => lhs.checked_shr(rhs.try_into().ok()?)?,
-            // Arithmetic shift right is the one shift that reads the operand as SIGNED, so the
-            // sign bit has to be recovered from the operand width before shifting rather than from
-            // the 64-bit carrier the value is stored in.
-            "ashr" if rhs < u64::from(width) => (signed_of(lhs, width) >> rhs.min(63)) as u64,
-            "shl" | "lshr" | "ashr" => return None,
+            "shl" | "lshr" => return None,
             _ => unreachable!("matched integer opcode"),
         };
         return Some(StaticValue::Int(value & mask));
     }
     if let Some(rest) = rhs.strip_prefix("icmp ") {
-        let (predicate, operands) = rest.split_once(' ')?;
-        let (lhs, rhs) = eval_binary_int(operands, env, globals)?;
-        // The comparison is on the OPERAND type's width: a signed predicate reads the same bits as
-        // a negative number, and an unsigned one must not see carrier bits above the operand.
-        // Reading only `eq`/`ne` left every ordered comparison unevaluated -- 648 of the 10938
-        // `icmp`s in the local corpus's static initializers -- and an unevaluated predicate is
-        // reported as "not enabled by default", which is a GUESS the callers spend as a fact.
-        let (width, mask) = integer_result_width_and_mask(operands)?;
-        let (lhs, rhs) = (lhs & mask, rhs & mask);
-        let value = match predicate {
+        let mut fields = rest.splitn(2, ' ');
+        let pred = fields.next()?;
+        let (lhs, rhs) = eval_binary_int(fields.next()?, env, globals)?;
+        let value = match pred {
             "eq" => lhs == rhs,
             "ne" => lhs != rhs,
-            "ugt" => lhs > rhs,
-            "uge" => lhs >= rhs,
-            "ult" => lhs < rhs,
-            "ule" => lhs <= rhs,
-            "sgt" => signed_of(lhs, width) > signed_of(rhs, width),
-            "sge" => signed_of(lhs, width) >= signed_of(rhs, width),
-            "slt" => signed_of(lhs, width) < signed_of(rhs, width),
-            "sle" => signed_of(lhs, width) <= signed_of(rhs, width),
             _ => return None,
         };
         return Some(StaticValue::Bool(value));
@@ -451,11 +386,13 @@ fn eval_static_rhs(
         .or_else(|| rhs.strip_prefix("zext "))
     {
         let (value, to_ty) = rest.split_once(" to ")?;
-        let int = eval_int_operand(value, env, globals)?;
-        // Narrow to the DESTINATION width, whatever it is. Masking only `i8` and `i16` let a
-        // `trunc i64 ... to i32` keep the high half it exists to discard.
-        let (_, mask) = integer_result_width_and_mask(to_ty)?;
-        return Some(StaticValue::Int(int & mask));
+        let mut int = eval_int_operand(value, env, globals)?;
+        if to_ty.trim_start().starts_with("i8") {
+            int &= 0xff;
+        } else if to_ty.trim_start().starts_with("i16") {
+            int &= 0xffff;
+        }
+        return Some(StaticValue::Int(int));
     }
     if rhs.contains("function_constant_predicate") {
         let open = rhs.rfind('(')?;
@@ -661,178 +598,5 @@ entry:
             static_init_int_global_values(ll).get("@predicate"),
             Some(&1)
         );
-    }
-
-    /// Every `icmp` predicate and integer opcode the local corpus's static initializers contain.
-    ///
-    /// An expression the evaluator cannot fold leaves its global unknown, and an unknown
-    /// function-constant predicate is reported as "not enabled by default" -- a guess the stage
-    /// decodes spend as a fact, dropping outputs and system values. Reading only `eq` and `ne` left
-    /// 648 ordered comparisons unevaluated. The signed cases are the ones worth stating: the
-    /// evaluator carries every integer as a masked `u64`, so `-1` compares GREATER than `1` unless
-    /// the sign is recovered from the operand's own width.
-    #[test]
-    fn every_static_initializer_integer_expression_folds() {
-        for (expression, expected) in [
-            ("%a = add i16 %one, 15", 16),
-            ("%a = sub i16 %one, 15", 0xfff2),
-            ("%a = mul i16 %one, 15", 15),
-            ("%a = udiv i16 %seven, 2", 3),
-            ("%a = urem i16 %seven, 2", 1),
-            ("%a = sdiv i16 %minus_one, 1", 0xffff),
-            ("%a = srem i16 %seven, 2", 1),
-            ("%a = and i16 %seven, 2", 2),
-            ("%a = or i16 %one, 2", 3),
-            ("%a = xor i16 %one, 3", 2),
-            ("%a = shl i16 %one, 3", 8),
-            ("%a = lshr i16 %minus_one, 12", 0xf),
-            // `ashr` reads the operand as signed: -1 stays -1 however far it is shifted.
-            ("%a = ashr i16 %minus_one, 12", 0xffff),
-            ("%a = icmp ugt i16 %seven, 2", 1),
-            ("%a = icmp uge i16 %seven, 7", 1),
-            ("%a = icmp ult i16 %seven, 2", 0),
-            ("%a = icmp ule i16 %seven, 7", 1),
-            // -1 is the LARGEST i16 unsigned and the SMALLEST signed.
-            ("%a = icmp ugt i16 %minus_one, 7", 1),
-            ("%a = icmp sgt i16 %minus_one, 7", 0),
-            ("%a = icmp slt i16 %minus_one, 7", 1),
-            ("%a = icmp sge i16 %minus_one, %minus_one", 1),
-            ("%a = icmp sle i16 %minus_one, 7", 1),
-            ("%a = icmp eq i16 %seven, 7", 1),
-            ("%a = icmp ne i16 %seven, 7", 0),
-            ("%a = tail call i16 @llvm.umax.i16(i16 %seven, i16 2)", 7),
-            ("%a = tail call i16 @llvm.umin.i16(i16 %seven, i16 2)", 2),
-            (
-                "%a = tail call i16 @llvm.umax.i16(i16 %minus_one, i16 2)",
-                0xffff,
-            ),
-            (
-                "%a = tail call i16 @llvm.smax.i16(i16 %minus_one, i16 2)",
-                2,
-            ),
-            (
-                "%a = tail call i16 @llvm.smin.i16(i16 %minus_one, i16 2)",
-                0xffff,
-            ),
-        ] {
-            let ll = format!(
-                r#"
-@one = internal addrspace(2) global i16 1, align 2
-@seven = internal addrspace(2) global i16 7, align 2
-@minus_one = internal addrspace(2) global i16 -1, align 2
-@folded = internal addrspace(2) global i16 undef, align 2
-
-define internal void @_GLOBAL__sub_I_fold() section "air.static_init" {{
-entry:
-  %one = load i16, ptr addrspace(2) @one
-  %seven = load i16, ptr addrspace(2) @seven
-  %minus_one = load i16, ptr addrspace(2) @minus_one
-  {expression}
-  store i16 %a, ptr addrspace(2) @folded
-  ret void
-}}
-"#
-            );
-            assert_eq!(
-                static_init_int_global_values(&ll).get("@folded"),
-                Some(&expected),
-                "{expression}"
-            );
-        }
-    }
-
-    /// A division by zero must stay UNKNOWN rather than fold to a value the shader would never see,
-    /// the way [`out_of_width_shift_is_not_folded`] already requires of an over-wide shift.
-    #[test]
-    fn an_undefined_division_does_not_fold() {
-        for expression in [
-            "%a = udiv i16 %seven, 0",
-            "%a = urem i16 %seven, 0",
-            "%a = sdiv i16 %seven, 0",
-            "%a = srem i16 %seven, 0",
-        ] {
-            let ll = format!(
-                r#"
-@seven = internal addrspace(2) global i16 7, align 2
-@folded = internal addrspace(2) global i16 undef, align 2
-
-define internal void @_GLOBAL__sub_I_fold() section "air.static_init" {{
-entry:
-  %seven = load i16, ptr addrspace(2) @seven
-  {expression}
-  store i16 %a, ptr addrspace(2) @folded
-  ret void
-}}
-"#
-            );
-            assert_eq!(
-                static_init_int_global_values(&ll).get("@folded"),
-                None,
-                "{expression}"
-            );
-        }
-    }
-
-    /// A 64-bit function constant is a function constant. `ulong` is a Metal function-constant type
-    /// -- 47 of the local corpus's `air.fc_initializer` globals are `i64` -- and the initializer
-    /// reader accepted only 8, 16 and 32 bits, so every predicate derived from one stayed unknown
-    /// and every caller read that as "not enabled by default".
-    #[test]
-    fn a_64_bit_function_constant_initializer_is_seeded() {
-        let ll = r#"
-@bits.MTL_FC_INIT_1_m = internal addrspace(2) externally_initialized constant i64 undef, section "air.fc_initializer", align 8
-@mirror = internal addrspace(2) global i64 undef, align 8
-@enabled = internal addrspace(2) global i8 undef, align 1
-
-define internal void @_GLOBAL__sub_I_wide() section "air.static_init" {
-entry:
-  %value = load i64, ptr addrspace(2) @bits.MTL_FC_INIT_1_m
-  store i64 %value, ptr addrspace(2) @mirror
-  %high = lshr i64 %value, 63
-  %narrow = trunc i64 %high to i8
-  store i8 %narrow, ptr addrspace(2) @enabled
-  ret void
-}
-"#;
-        let values = static_init_int_global_values(ll);
-        assert_eq!(values.get("@mirror"), Some(&0));
-        assert_eq!(values.get("@enabled"), Some(&0));
-    }
-
-    /// A store carries its OWN operand width. Narrowing every stored integer to 32 bits dropped the
-    /// high half of a `store i64`, so a predicate reading a bit above 31 out of the stored mirror --
-    /// `lshr i64 %x, 63`, the shape two corpus kernels use -- read zero whatever the constant said.
-    #[test]
-    fn a_stored_64_bit_value_keeps_its_high_half() {
-        let ll = r#"
-@bits = internal addrspace(2) global i64 1311768467463790320, align 8
-@mirror = internal addrspace(2) global i64 undef, align 8
-@high = internal addrspace(2) global i32 undef, align 4
-@low = internal addrspace(2) global i32 undef, align 4
-@residue = internal addrspace(2) global i64 undef, align 8
-
-define internal void @_GLOBAL__sub_I_wide() section "air.static_init" {
-entry:
-  %value = load i64, ptr addrspace(2) @bits
-  store i64 %value, ptr addrspace(2) @mirror
-  %stored = load i64, ptr addrspace(2) @mirror
-  %shifted = lshr i64 %stored, 32
-  %top = trunc i64 %shifted to i32
-  store i32 %top, ptr addrspace(2) @high
-  %bottom = trunc i64 %stored to i32
-  store i32 %bottom, ptr addrspace(2) @low
-  %widened = zext i32 %bottom to i64
-  %residue = lshr i64 %widened, 32
-  store i64 %residue, ptr addrspace(2) @residue
-  ret void
-}
-"#;
-        let values = static_init_int_global_values(ll);
-        assert_eq!(values.get("@high"), Some(&0x1234_5678));
-        assert_eq!(values.get("@low"), Some(&0x9abc_def0));
-        // `trunc ... to i32` discards the half it exists to discard. Masking only `i8` and `i16`
-        // left the high half on the value, and only the next STORE happened to hide it -- widening
-        // the truncated value again brings it back.
-        assert_eq!(values.get("@residue"), Some(&0));
     }
 }

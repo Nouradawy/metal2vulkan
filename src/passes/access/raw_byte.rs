@@ -2580,9 +2580,8 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_stores(ctx: &mut Ctx, ent
         pointer_ty: Word,
         byte_ty: Word,
         value: Word,
-        component_ty: Word,
-        component_bits: u32,
-        lanes: u32,
+        value_ty: Word,
+        value_bits: u32,
     }
     let mut plans = HashMap::<(usize, usize), Plan>::new();
     for (block_idx, block) in ctx.module.functions[entry_idx].blocks.iter().enumerate() {
@@ -2611,12 +2610,7 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_stores(ctx: &mut Ctx, ent
             let Some(value_ty) = value_types.get(value).copied() else {
                 continue;
             };
-            // The same shape the byte-pointer LOAD side reads: a 16/32/64-bit scalar or a vector of
-            // one. A vector is exactly `lanes` consecutive scalars at the same byte pointer, so
-            // declining it left the store side unable to write what the load side could read.
-            let Some((component_ty, lanes, component_bits)) =
-                raw_byte_pointer_load_shape(ctx, value_ty)
-            else {
+            let Some(value_bits @ (16 | 32 | 64)) = direct_scalar_width(ctx, value_ty) else {
                 continue;
             };
             plans.insert(
@@ -2626,9 +2620,8 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_stores(ctx: &mut Ctx, ent
                     pointer_ty,
                     byte_ty,
                     value: *value,
-                    component_ty,
-                    component_bits,
-                    lanes,
+                    value_ty,
+                    value_bits,
                 },
             );
         }
@@ -2648,78 +2641,62 @@ pub(in crate::passes) fn rewrite_raw_byte_pointer_wide_stores(ctx: &mut Ctx, ent
                 Op::TypeInt,
                 None,
                 vec![
-                    Operand::LiteralBit32(plan.component_bits),
+                    Operand::LiteralBit32(plan.value_bits),
                     Operand::LiteralBit32(0),
                 ],
             );
-            let lane_bytes = plan.component_bits / 8;
-            for lane in 0..plan.lanes {
-                let component = if plan.lanes == 1 {
-                    plan.value
+            let bits = if plan.value_ty == wide_int_ty {
+                plan.value
+            } else {
+                let result = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::Bitcast,
+                    Some(wide_int_ty),
+                    Some(result),
+                    vec![Operand::IdRef(plan.value)],
+                ));
+                result
+            };
+            for byte in 0..(plan.value_bits / 8) {
+                let shifted = if byte == 0 {
+                    bits
                 } else {
+                    let shift = ctx.const_int_of(wide_int_ty, i64::from(byte * 8));
                     let result = ctx.module.fresh_id();
                     rewritten.push(Instruction::new(
-                        Op::CompositeExtract,
-                        Some(plan.component_ty),
-                        Some(result),
-                        vec![Operand::IdRef(plan.value), Operand::LiteralBit32(lane)],
-                    ));
-                    result
-                };
-                let bits = if plan.component_ty == wide_int_ty {
-                    component
-                } else {
-                    let result = ctx.module.fresh_id();
-                    rewritten.push(Instruction::new(
-                        Op::Bitcast,
+                        Op::ShiftRightLogical,
                         Some(wide_int_ty),
                         Some(result),
-                        vec![Operand::IdRef(component)],
+                        vec![Operand::IdRef(bits), Operand::IdRef(shift)],
                     ));
                     result
                 };
-                for byte in 0..lane_bytes {
-                    let shifted = if byte == 0 {
-                        bits
-                    } else {
-                        let shift = ctx.const_int_of(wide_int_ty, i64::from(byte * 8));
-                        let result = ctx.module.fresh_id();
-                        rewritten.push(Instruction::new(
-                            Op::ShiftRightLogical,
-                            Some(wide_int_ty),
-                            Some(result),
-                            vec![Operand::IdRef(bits), Operand::IdRef(shift)],
-                        ));
-                        result
-                    };
-                    let byte_value = ctx.module.fresh_id();
+                let byte_value = ctx.module.fresh_id();
+                rewritten.push(Instruction::new(
+                    Op::UConvert,
+                    Some(plan.byte_ty),
+                    Some(byte_value),
+                    vec![Operand::IdRef(shifted)],
+                ));
+                let byte_pointer = if byte == 0 {
+                    plan.pointer
+                } else {
+                    let offset = ctx.const_uint(byte);
+                    let result = ctx.module.fresh_id();
                     rewritten.push(Instruction::new(
-                        Op::UConvert,
-                        Some(plan.byte_ty),
-                        Some(byte_value),
-                        vec![Operand::IdRef(shifted)],
+                        Op::PtrAccessChain,
+                        Some(plan.pointer_ty),
+                        Some(result),
+                        vec![Operand::IdRef(plan.pointer), Operand::IdRef(offset)],
                     ));
-                    let byte_offset = lane * lane_bytes + byte;
-                    let byte_pointer = if byte_offset == 0 {
-                        plan.pointer
-                    } else {
-                        let offset = ctx.const_uint(byte_offset);
-                        let result = ctx.module.fresh_id();
-                        rewritten.push(Instruction::new(
-                            Op::PtrAccessChain,
-                            Some(plan.pointer_ty),
-                            Some(result),
-                            vec![Operand::IdRef(plan.pointer), Operand::IdRef(offset)],
-                        ));
-                        result
-                    };
-                    rewritten.push(Instruction::new(
-                        Op::Store,
-                        None,
-                        None,
-                        vec![Operand::IdRef(byte_pointer), Operand::IdRef(byte_value)],
-                    ));
-                }
+                    result
+                };
+                rewritten.push(Instruction::new(
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(byte_pointer), Operand::IdRef(byte_value)],
+                ));
             }
         }
         ctx.module.functions[entry_idx].blocks[block_idx].instructions = rewritten;

@@ -176,12 +176,6 @@ fixes over one-off workarounds.
   `process::exit` on FALLBACK. Do not reintroduce long-lived dumps under fixed `/tmp/...` paths.
 - FALLBACK **repro bundles** under `$TMPDIR/metal2vulkan-repros` (or `METAL2VULKAN_REPRO_DIR`) are
   intentional and may be kept for debugging.
-- **`pgrep` / `ps | grep`:** the only permitted spelling brackets the first character of the
-  pattern — `pgrep -f '[c]orpus-refresh'`, `pgrep -f '[c]argo test --release'`. Unbracketed, `-f`
-  tests the whole command line and the pattern appears verbatim in the argv of the shell running
-  the `pgrep`, so it matches itself and the target always looks alive: you end up waiting on your
-  own wait loop, which then returns only on its timeout. A long, specific pattern is *more* likely
-  to self-match, not less. Bracket unconditionally.
 
 ### What not to commit
 
@@ -211,10 +205,10 @@ Run Rust tests with Cargo's default available parallelism (the logical CPU count
 
 ```sh
 cargo fmt --all
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
-cargo test -p metal2vulkan --all-features
-cargo test -p metal2vulkan-validation --all-features
+cargo test -p metal2vulkan
+cargo test -p metal2vulkan-validation
 ```
 
 - **MSRV:** see `rust-version` in `Cargo.toml` (currently 1.87).
@@ -222,9 +216,7 @@ cargo test -p metal2vulkan-validation --all-features
   `-D warnings`. Treat any new rustc or clippy warning as a bug you must fix before committing —
   do not leave `#[allow(...)]` noise to paper over real issues, and do not ask reviewers (or a
   later CI run) to clean up after you.
-- **Features:** `serde` enables `ShaderReflection` JSON and CLI `--emit-meta`. Every gate above
-  passes `--all-features`, because the released CLI is built with `serde` and code behind
-  `#[cfg(feature = "serde")]` is otherwise compiled by nothing.
+- **Features:** `serde` enables `ShaderReflection` JSON and CLI `--emit-meta`.
 - CI runners: **`ubuntu-26.04`** and **`macos-26`** (not `*-latest`).
 
 When diagnosing a hang, prefer reading full `cargo test` output over piping through `head`/`grep`

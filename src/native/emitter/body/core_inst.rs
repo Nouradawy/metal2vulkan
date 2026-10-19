@@ -49,15 +49,25 @@ impl Emitter {
                                 self.emit_binary_int_op_resolved(op, lhs, rhs, name, instructions)
                             }
                             BinaryKind::Float => {
-                                if let Some(mode) = inst.float_math_mode() {
-                                    return self.emit_float_op_granting(
+                                if inst.fast_math()
+                                    && self.try_emit_partitioned_fast_sum(
                                         op,
-                                        lhs,
-                                        rhs,
-                                        name,
-                                        mode,
+                                        &lhs,
+                                        &name,
                                         instructions,
-                                    );
+                                    )?
+                                {
+                                    return Ok(());
+                                }
+                                if inst.fast_math()
+                                    && self.try_emit_grouped_fast_sum(
+                                        op,
+                                        &lhs,
+                                        &name,
+                                        instructions,
+                                    )?
+                                {
+                                    return Ok(());
                                 }
                                 if inst.fast_math()
                                     && self.try_emit_fast_fma(
@@ -529,6 +539,193 @@ impl Emitter {
         Ok(true)
     }
 
+    fn try_emit_grouped_fast_sum(
+        &mut self,
+        op: Op,
+        lhs: &TypedValue,
+        name: &str,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if op != Op::FAdd {
+            return Ok(false);
+        }
+        let Some((positive, negative, materialize_leading_pair)) =
+            self.fast_grouped_sums.get(name).cloned()
+        else {
+            return Ok(false);
+        };
+        let result_ty = self.resolve_type(&lhs.ty)?;
+        if !is_float_type(&result_ty) || bfloat_lanes(&result_ty).is_some() {
+            return Ok(false);
+        }
+        let result_type = self.type_id(&result_ty)?;
+        let mut emit_group = |terms: Vec<(TypedValue, bool)>,
+                              materialize_leading_pair: bool,
+                              this: &mut Self|
+         -> Result<Word, String> {
+            let mut terms = terms.into_iter();
+            let (first, negate) = terms.next().ok_or("empty grouped fast sum")?;
+            let mut sum = this.value_id_in(&first.value, &first.ty, instructions)?;
+            if matches!(&first.value, LlValue::Local(name) if this.fast_grouped_sum_boundaries.contains(name))
+            {
+                sum = this.materialize_float_bits(sum, &result_ty, instructions)?;
+            }
+            if negate {
+                let negated = this.fresh();
+                instructions.push(Self::inst(
+                    Op::FNegate,
+                    Some(result_type),
+                    Some(negated),
+                    vec![Operand::IdRef(sum)],
+                ));
+                sum = negated;
+            }
+            for (index, (term, negate)) in terms.enumerate() {
+                let mut rhs = this.value_id_in(&term.value, &term.ty, instructions)?;
+                if matches!(&term.value, LlValue::Local(name) if this.fast_grouped_sum_boundaries.contains(name))
+                {
+                    rhs = this.materialize_float_bits(rhs, &result_ty, instructions)?;
+                }
+                if negate {
+                    let negated = this.fresh();
+                    instructions.push(Self::inst(
+                        Op::FNegate,
+                        Some(result_type),
+                        Some(negated),
+                        vec![Operand::IdRef(rhs)],
+                    ));
+                    rhs = negated;
+                }
+                let next = this.fresh();
+                instructions.push(Self::inst(
+                    Op::FAdd,
+                    Some(result_type),
+                    Some(next),
+                    vec![Operand::IdRef(sum), Operand::IdRef(rhs)],
+                ));
+                sum = next;
+                if materialize_leading_pair && index == 0 {
+                    sum = this.materialize_float_bits(sum, &result_ty, instructions)?;
+                }
+            }
+            Ok(sum)
+        };
+        let positive = emit_group(positive, materialize_leading_pair, self)?;
+        let negative = emit_group(negative, false, self)?;
+        let positive = self.materialize_float_bits(positive, &result_ty, instructions)?;
+        let negative = self.materialize_float_bits(negative, &result_ty, instructions)?;
+        let result = self.result_id(name, &result_ty)?;
+        instructions.push(Self::inst(
+            Op::FAdd,
+            Some(result_type),
+            Some(result),
+            vec![Operand::IdRef(positive), Operand::IdRef(negative)],
+        ));
+        Ok(true)
+    }
+
+    fn try_emit_partitioned_fast_sum(
+        &mut self,
+        op: Op,
+        lhs: &TypedValue,
+        name: &str,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if op != Op::FAdd {
+            return Ok(false);
+        }
+        let Some(groups) = self.fast_partitioned_sums.get(name).cloned() else {
+            return Ok(false);
+        };
+        let result_ty = self.resolve_type(&lhs.ty)?;
+        if !is_float_type(&result_ty) || bfloat_lanes(&result_ty).is_some() {
+            return Ok(false);
+        }
+        let result_type = self.type_id(&result_ty)?;
+        let mut group_values = Vec::with_capacity(groups.len());
+        for group in groups {
+            let mut terms = group.into_iter();
+            let first = terms.next().ok_or("empty partitioned fast sum")?;
+            let mut sum = self.value_id_in(&first.value, &first.ty, instructions)?;
+            for term in terms {
+                let rhs = self.value_id_in(&term.value, &term.ty, instructions)?;
+                let next = self.fresh();
+                instructions.push(Self::inst(
+                    Op::FAdd,
+                    Some(result_type),
+                    Some(next),
+                    vec![Operand::IdRef(sum), Operand::IdRef(rhs)],
+                ));
+                sum = self.materialize_float_bits(next, &result_ty, instructions)?;
+            }
+            group_values.push(self.materialize_float_bits(sum, &result_ty, instructions)?);
+        }
+        let mut groups = group_values.into_iter();
+        let mut sum = groups.next().ok_or("empty partitioned fast sum")?;
+        for rhs in groups {
+            let next = self.fresh();
+            instructions.push(Self::inst(
+                Op::FAdd,
+                Some(result_type),
+                Some(next),
+                vec![Operand::IdRef(sum), Operand::IdRef(rhs)],
+            ));
+            sum = next;
+        }
+        let result = self.result_id(name, &result_ty)?;
+        instructions.push(Self::inst(
+            Op::CopyObject,
+            Some(result_type),
+            Some(result),
+            vec![Operand::IdRef(sum)],
+        ));
+        Ok(true)
+    }
+
+    fn materialize_float_bits(
+        &mut self,
+        value: Word,
+        ty: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<Word, String> {
+        let bits_ty = match ty {
+            LlType::Float => LlType::Int(32),
+            LlType::Half => LlType::Int(16),
+            _ => return Ok(value),
+        };
+        let bits_type = self.type_id(&bits_ty)?;
+        let bits = self.fresh();
+        instructions.push(Self::inst(
+            Op::Bitcast,
+            Some(bits_type),
+            Some(bits),
+            vec![Operand::IdRef(value)],
+        ));
+        let reversed = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitReverse,
+            Some(bits_type),
+            Some(reversed),
+            vec![Operand::IdRef(bits)],
+        ));
+        let restored_bits = self.fresh();
+        instructions.push(Self::inst(
+            Op::BitReverse,
+            Some(bits_type),
+            Some(restored_bits),
+            vec![Operand::IdRef(reversed)],
+        ));
+        let result_type = self.type_id(ty)?;
+        let restored = self.fresh();
+        instructions.push(Self::inst(
+            Op::Bitcast,
+            Some(result_type),
+            Some(restored),
+            vec![Operand::IdRef(restored_bits)],
+        ));
+        Ok(restored)
+    }
+
     fn bind_inline_parameter(
         &mut self,
         name: &str,
@@ -573,33 +770,47 @@ impl Emitter {
                 return Ok(());
             }
         }
-        // Preserve a descriptor-backed raw buffer's byte cursor across helper inlining.  A non-zero
-        // GEP of a raw device buffer has a Private placeholder as its ordinary SSA value, while its
-        // real descriptor root and byte offset live in `raw_offsets`.  Binding the helper parameter
-        // to that placeholder silently turns helper writes into Private writes.  Root the inline
-        // substitution at the descriptor instead and carry the cursor onto the parameter; the
-        // callee's existing raw load/store lowering then reapplies the offset structurally.
+        // Preserve a raw buffer's byte cursor across helper inlining.  A GEP (or identity bitcast) of
+        // a raw buffer has a Private placeholder as its ordinary SSA value, while its real root and
+        // byte offset live in `raw_offsets`.  Binding the helper parameter to that placeholder
+        // silently turns helper loads into zero reads and helper writes into Private writes, in
+        // every address space.  The inlined parameter is an alias of its argument, so root the
+        // inline substitution at the raw root and carry the complete cursor onto the parameter; the
+        // callee's existing raw load/store lowering then reapplies the offset structurally (and an
+        // unmodelable cursor fails there visibly, exactly as a direct access through the argument).
         let inline_raw = match (&argument.value, &resolved_ty) {
-            (LlValue::Local(source), LlType::Ptr(addrspace)) => self
-                .raw_offsets
-                .get(source)
-                .cloned()
-                .filter(|raw| {
-                    !raw.unmodelable
-                        && ((self.is_raw_buffer_param(name) && matches!(raw.addrspace, 1 | 2))
-                            || (self.bda_device_pointers && raw.device_addr_base.is_some()))
-                })
-                .or_else(|| {
-                    (self.bda_device_pointers)
-                        .then(|| self.bda_direct_addresses.get(source).copied())
-                        .flatten()
-                        .map(|address| {
-                            let mut raw =
-                                RawBufferOffset::root(format!(".bda_inline_{address}"), *addrspace);
-                            raw.device_addr_base = Some(address);
-                            raw
-                        })
-                }),
+            (LlValue::Local(source), LlType::Ptr(addrspace)) => {
+                let source_raw = self
+                    .raw_offsets
+                    .get(source)
+                    .filter(|raw| raw.device_addr_base.is_none() || self.bda_device_pointers)
+                    .cloned();
+                // A direct BDA address has no raw root of its own; the parameter itself, whose
+                // value is substituted by that address, becomes the root.
+                let address_raw = (self.bda_device_pointers)
+                    .then(|| self.bda_direct_addresses.get(source).copied())
+                    .flatten()
+                    .map(|address| {
+                        let mut raw = RawBufferOffset::root(name.to_string(), *addrspace);
+                        raw.device_addr_base = Some(address);
+                        raw
+                    });
+                match (source_raw, address_raw) {
+                    // In the device-address model a directly addressed argument is bound by its
+                    // address, unless its raw offset is itself address-rooted or names the
+                    // descriptor of a raw device parameter.
+                    (Some(raw), Some(address))
+                        if raw.unmodelable
+                            || (raw.device_addr_base.is_none()
+                                && !(self.raw_buffer_params.contains(name)
+                                    && raw.addrspace == 1)) =>
+                    {
+                        Some(address)
+                    }
+                    (Some(raw), _) => Some(raw),
+                    (None, address) => address,
+                }
+            }
             _ => None,
         };
         let inline_raw_storage = inline_raw.as_ref().map(|raw| {
@@ -628,11 +839,7 @@ impl Emitter {
         let argument_id = if let Some(address) = bda_argument_address {
             address
         } else if let Some(raw) = inline_raw.as_ref() {
-            self.value_id_in(
-                &LlValue::Local(raw.root.clone()),
-                &argument.ty,
-                instructions,
-            )?
+            self.raw_root_value_id(raw)?
         } else {
             self.value_id_in(&argument.value, &argument.ty, instructions)?
         };
@@ -700,15 +907,12 @@ impl Emitter {
             if let Some(nullness) = nullness {
                 self.record_pointer_nullness(name.to_string(), nullness);
             }
-            if let Some(mut raw) = inline_raw
-                .filter(|raw| self.is_raw_buffer_param(name) || raw.device_addr_base.is_some())
-            {
-                raw.root = name.to_string();
+            if let Some(raw) = inline_raw {
                 self.raw_offsets.insert(name.to_string(), raw);
                 if let Some(storage) = inline_raw_storage {
                     self.pointer_storage.insert(name.to_string(), storage);
                 }
-            } else if self.is_raw_buffer_param(name) {
+            } else if self.raw_buffer_params.contains(name) {
                 self.raw_offsets.insert(
                     name.to_string(),
                     RawBufferOffset::root(name.to_string(), addrspace),
@@ -991,6 +1195,47 @@ impl Emitter {
         let result_type = self.type_id(&result_ty)?;
         let result = self.result_id(&name, &result_ty)?;
         let composite_id = self.value_id_in(&composite.value, &composite.ty, instructions)?;
+        // An extract that yields a nested aggregate carries the logical pointers that aggregate
+        // holds, re-rooted under the remaining path -- the mirror of `emit_insertvalue_typed`, which
+        // folds a nested aggregate's pointers into its container. Without this the payload slot is
+        // all that survives: a pointer reached through two levels (CoreImage's
+        // `Sampler_h { texture2d { ptr }, sampler { ptr }, .. }`, extracted field by field into a
+        // helper) resolves to the integer placeholder instead of its descriptor, and the image pass
+        // then substitutes its synthesized default sampler for the guest's own.
+        if !matches!(result_ty, LlType::Ptr(_)) {
+            if let LlValue::Local(composite_name) = &composite.value {
+                let nested = self
+                    .aggregate_pointer_values
+                    .get(composite_name)
+                    .map(|pointers| {
+                        pointers
+                            .iter()
+                            .filter_map(|(path, pointer)| {
+                                path.strip_prefix(indices)
+                                    .filter(|suffix| !suffix.is_empty())
+                                    .map(|suffix| (suffix.to_vec(), pointer.clone()))
+                            })
+                            .collect::<HashMap<_, _>>()
+                    })
+                    .unwrap_or_default();
+                if !nested.is_empty() {
+                    if !self.bda_device_pointers {
+                        for (path, pointer) in &nested {
+                            let source =
+                                self.value_id_in(&pointer.value, &pointer.ty, instructions)?;
+                            self.emit_sidecar.aggregate_pointer_values.push(
+                                crate::emit_sidecar::AggregatePointerValue {
+                                    aggregate: result,
+                                    source,
+                                    indices: path.clone(),
+                                },
+                            );
+                        }
+                    }
+                    self.aggregate_pointer_values.insert(name.clone(), nested);
+                }
+            }
+        }
         if self.bda_device_pointers {
             if let LlValue::Local(composite_name) = &composite.value {
                 if let Some(addresses) = self.bda_aggregate_addresses.get(composite_name).cloned() {
@@ -1408,38 +1653,6 @@ impl Emitter {
             self.pointer_pointees.insert(name, LlType::Int(8));
             return Ok(());
         }
-        // An integer that is a bound buffer's address plus a byte offset names a byte inside that
-        // buffer, and the round trip through `ptrtoint`/`inttoptr` is the only place its address was
-        // ever needed. Hand the pointer the offset rather than a placeholder: without this the
-        // pointer is unmodelled and every load through it reads zero, silently.
-        if let LlValue::Local(src_name) = &src.value {
-            if let Some(base) = self.symbolic_buffer_addresses.get(src_name).cloned() {
-                if base.addrspace == addrspace {
-                    // The raw word path indexes its root in WORDS: it emits `AccessChain(root, 0,
-                    // word)` typed `ptr uint`, which is only well typed when the root was declared
-                    // with `raw_buffer_block_type()`. A root the AIR metadata typed instead keeps
-                    // its own element type, and the same chain would be read back as a BYTE index
-                    // by `plan_raw_word_pointer_rewrite` and divided by four a second time. Refuse
-                    // rather than answer the wrong word.
-                    if !self.root_is_word_addressable(&base.root) {
-                        return Err(format!(
-                            "native emitter: buffer address round trip through `{name}` on the \
-                             untyped byte root `{}`",
-                            base.root
-                        ));
-                    }
-                    let storage = self.raw_access_storage(&base)?;
-                    // The placeholder still has to exist: it is this name's SSA value, and anything
-                    // that consumes the pointer itself rather than accessing through it needs one.
-                    // The raw entry installed after it is the ADDRESSING, and every emitter function
-                    // that reads both sets reads `raw_offsets` first.
-                    self.define_unmodeled_pointer_value(&name, addrspace, &LlType::Int(8))?;
-                    self.raw_offsets.insert(name.clone(), base);
-                    self.pointer_storage.insert(name.clone(), storage);
-                    return Ok(());
-                }
-            }
-        }
         // Logical SPIR-V cannot materialize an integer as an address. Preserve a valid SSA pointer so
         // function-constant-dead command-buffer paths translate without claiming active GPU-address
         // semantics.
@@ -1581,15 +1794,9 @@ impl Emitter {
                 ));
             }
         }
-        if let LlValue::Local(src_name) = &src.value {
-            if let Some(base) = self.symbolic_buffer_address_for_pointer(src_name) {
-                self.symbolic_buffer_addresses.insert(name.clone(), base);
-            }
-        }
         let _ = self.value_id(&src.value, &src.ty)?;
         // Logical SPIR-V has no portable pointer address value. Keep GPU-address arithmetic paths
-        // structurally valid without claiming physical pointer semantics. The ADDRESS this stands
-        // for is recorded above, so a round trip back to a pointer does not lose the buffer.
+        // structurally valid without claiming physical pointer semantics.
         let zero = self.const_null(&dst_ty)?;
         let result = self.result_id(&name, &dst_ty)?;
         instructions.push(Self::inst(
@@ -1747,21 +1954,8 @@ impl Emitter {
         if self.emit_vector_root_store(&ptr, &object, instructions)? {
             return Ok(());
         }
-        // An unmodeled pointer is a Private zero placeholder: it stands for an address the emitter
-        // could not model, and it addresses nothing. Dropping a store through one used to return
-        // `Ok(())`, which reports success for a module that has silently lost the write --
-        // `native_generic_callback_table_cursor_keeps_its_store` is a twenty-line AIR fixture whose
-        // emitted module contains no `OpStore` at all. Refuse instead, so the retry tiers get a
-        // chance at a representation and an unrepresentable module FALLBACKs rather than lying.
-        //
-        // Costs nothing: no source among the 14579 in the corpus reaches this line, and none even
-        // contains the shape that leads here (a device pointer loaded through a generic `ptr`).
-        if let LlValue::Local(name) = &ptr.value {
-            if self.unmodeled_pointers.contains(name) {
-                return Err(format!(
-                    "native emitter: store through {name}, an unmodeled pointer placeholder that                      addresses nothing; the write would be lost"
-                ));
-            }
+        if matches!(&ptr.value, LlValue::Local(name) if self.unmodeled_pointers.contains(name)) {
+            return Ok(());
         }
         if let Some(pointee) = self.pointer_pointee_for_value(&ptr.value)? {
             let pointee = self.resolve_type(&pointee)?;
@@ -1798,14 +1992,117 @@ impl Emitter {
                     }
                 }
             }
-            if self.emit_mismatched_store(
-                &object,
-                &ptr,
-                &object_ty,
-                &pointee,
-                align,
-                instructions,
-            )? {
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_i64_to_i32_pair_struct_store(&object, &ptr, &pointee, instructions)?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_aggregate_prefix_integer_reinterpret_store(
+                    &object,
+                    &ptr,
+                    &object_ty,
+                    &pointee,
+                    instructions,
+                )?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_first_vector_aggregate_reinterpret_store(
+                    &object,
+                    &ptr,
+                    &object_ty,
+                    &pointee,
+                    instructions,
+                )?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_first_scalar_aggregate_reinterpret_store(
+                    &object,
+                    &ptr,
+                    &object_ty,
+                    &pointee,
+                    instructions,
+                )?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_zero_scalar_to_aggregate_store(
+                    &object,
+                    &ptr,
+                    &object_ty,
+                    &pointee,
+                    instructions,
+                )?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_vector_as_scalar_array_store(&object, &ptr, &pointee, instructions)?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_vector_to_scalar_stores(&object, &ptr, &pointee, instructions)?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_workgroup_vector_chunk_stores(
+                    &object,
+                    &ptr,
+                    &object_ty,
+                    &pointee,
+                    instructions,
+                )?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_widening_vector_store(&object, &ptr, &pointee, instructions)?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_narrowing_vector_store(&object, &ptr, &pointee, instructions)?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_same_width_scalar_store(
+                    &object,
+                    &ptr,
+                    &object_ty,
+                    &pointee,
+                    instructions,
+                )?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_scalar_narrowing_store(
+                    &object,
+                    &ptr,
+                    &object_ty,
+                    &pointee,
+                    instructions,
+                )?
+            {
+                return Ok(());
+            }
+            if !types_compatible(&pointee, &object_ty)
+                && self.emit_same_width_vector_reinterpret_store(
+                    &object,
+                    &ptr,
+                    &object_ty,
+                    &pointee,
+                    instructions,
+                )?
+            {
                 return Ok(());
             }
         }
@@ -1902,10 +2199,10 @@ impl Emitter {
         if self.emit_llvm_usub_sat_call(&call, &name, instructions)? {
             return Ok(());
         }
-        if self.emit_air_saturating_add_sub_call(&call, &name, instructions)? {
+        if self.emit_air_unsigned_sat_call(&call, &name, instructions)? {
             return Ok(());
         }
-        if self.emit_air_halving_add_call(&call, &name, instructions)? {
+        if self.emit_air_unsigned_rhadd_call(&call, &name, instructions)? {
             return Ok(());
         }
         if self.emit_llvm_int_minmax_call(&call, &name, instructions)? {
@@ -1946,27 +2243,6 @@ impl Emitter {
     /// source typed value + destination-type TEXT. Driven straight off the `TirInst.bitcast()` carrier
     /// by the graph walk. The pointer
     /// copy-prop side-tables are keyed on `src.value`'s local name, so this needs no `inst.text`.
-    /// Carry the structural facts a same-address-space pointer `bitcast` aliases, for the arms of
-    /// [`Self::emit_bitcast_resolved`] whose side table already says what the pointer IS. Storage
-    /// class, nullness and pointee are properties of the address, and the address is unchanged by
-    /// an identity bitcast; `param_values` records that the alias is still a parameter's own
-    /// pointer. Written once because a missing propagation here is invisible until some later
-    /// consumer of the alias asks the question the dropped fact answered.
-    fn alias_pointer_facts(&mut self, src_name: &str, name: &str) {
-        if let Some(storage) = self.pointer_storage.get(src_name).copied() {
-            self.pointer_storage.insert(name.to_string(), storage);
-        }
-        if let Some(is_null) = self.pointer_nullness.get(src_name).copied() {
-            self.record_pointer_nullness(name.to_string(), is_null);
-        }
-        if let Some(pointee) = self.pointer_pointees.get(src_name).cloned() {
-            self.pointer_pointees.insert(name.to_string(), pointee);
-        }
-        if self.param_values.contains(src_name) {
-            self.param_values.insert(name.to_string());
-        }
-    }
-
     pub(in crate::native::emitter) fn emit_bitcast_resolved(
         &mut self,
         src: TypedValue,
@@ -1998,23 +2274,30 @@ impl Emitter {
                 }
                 if let Some(selected) = self.selected_load_pointers.get(src_name).cloned() {
                     self.selected_load_pointers.insert(name.clone(), selected);
-                    self.alias_pointer_facts(src_name, &name);
-                    return Ok(());
-                }
-                // The plain pointer merge, the fourth side table an alias has to carry. Without this
-                // arm the alias falls through to `value_id(%sel)` and dies with "unknown SSA value":
-                // a merge is deferred into `selected_pointers` and never materialized as a plain
-                // SPIR-V pointer, exactly as the store path at `emit_selected_pointer_direct_store`
-                // records. This is the result-side twin of 72d95483, which taught the merge-ARM walk
-                // to follow the same `bitcast ptr %p to ptr` the frontend spells a device-pointer
-                // cast with.
-                if let Some(selected) = self.selected_pointers.get(src_name).cloned() {
-                    self.selected_pointers.insert(name.clone(), selected);
-                    self.alias_pointer_facts(src_name, &name);
+                    if let Some(storage) = self.pointer_storage.get(src_name).copied() {
+                        self.pointer_storage.insert(name.clone(), storage);
+                    }
+                    if let Some(is_null) = self.pointer_nullness.get(src_name).copied() {
+                        self.record_pointer_nullness(name.clone(), is_null);
+                    }
+                    if let Some(pointee) = self.pointer_pointees.get(src_name).cloned() {
+                        self.pointer_pointees.insert(name.clone(), pointee);
+                    }
+                    if self.param_values.contains(src_name) {
+                        self.param_values.insert(name.clone());
+                    }
                     return Ok(());
                 }
                 if let Some(raw) = self.raw_offsets.get(src_name).cloned() {
-                    self.alias_pointer_facts(src_name, &name);
+                    if let Some(storage) = self.pointer_storage.get(src_name).copied() {
+                        self.pointer_storage.insert(name.clone(), storage);
+                    }
+                    if let Some(is_null) = self.pointer_nullness.get(src_name).copied() {
+                        self.record_pointer_nullness(name.clone(), is_null);
+                    }
+                    if let Some(pointee) = self.pointer_pointees.get(src_name).cloned() {
+                        self.pointer_pointees.insert(name.clone(), pointee);
+                    }
                     if !self.pointer_phi_values.is_empty() {
                         self.materialize_raw_byte_index(&name, &raw, true, instructions)?;
                         if self.raw_pointer_word_aligned(&raw) {
@@ -2041,6 +2324,9 @@ impl Emitter {
                         }
                     };
                     self.define_unmodeled_byte_pointer_value(&name, addrspace)?;
+                    if self.param_values.contains(src_name) {
+                        self.param_values.insert(name.clone());
+                    }
                     return Ok(());
                 }
             }
@@ -2125,63 +2411,9 @@ impl Emitter {
                      without a logical-pointer bitcast"
                 ));
             }
-            // Vulkan vectors carry at most four components, so `type_id` gives a wider LLVM vector
-            // an `OpTypeArray` -- and `OpBitcast` does not accept an aggregate operand or result.
-            // Reinterpret one lane at a time and rebuild the array, the same scalarization the
-            // elementwise integer ops already apply at this width.
-            (LlType::Vector(src_elem, src_lanes), LlType::Vector(dst_elem, dst_lanes))
-                if *src_lanes > 4 && src_lanes == dst_lanes =>
-            {
-                let src_elem_ty = self.resolve_type(src_elem)?;
-                let dst_elem_ty = self.resolve_type(dst_elem)?;
-                let src_elem_type = self.type_id(&src_elem_ty)?;
-                let dst_elem_type = self.type_id(&dst_elem_ty)?;
-                let lanes = *src_lanes;
-                let result_type = self.type_id(&dst_ty)?;
-                let result = self.result_id(&name, &dst_ty)?;
-                if src_elem_type == dst_elem_type {
-                    // Distinct AIR element types can share one storage type (bfloat and i16 do),
-                    // and then the whole array is already the destination value. `OpCopyObject`
-                    // accepts an aggregate, so name the no-op as the copy it is.
-                    instructions.push(Self::inst(
-                        Op::CopyObject,
-                        Some(result_type),
-                        Some(result),
-                        vec![Operand::IdRef(src_id)],
-                    ));
-                    result
-                } else {
-                    let mut values = Vec::with_capacity(lanes as usize);
-                    for lane in 0..lanes {
-                        let component = self.fresh();
-                        instructions.push(Self::inst(
-                            Op::CompositeExtract,
-                            Some(src_elem_type),
-                            Some(component),
-                            vec![Operand::IdRef(src_id), Operand::LiteralBit32(lane)],
-                        ));
-                        let cast = self.fresh();
-                        instructions.push(Self::inst(
-                            Op::Bitcast,
-                            Some(dst_elem_type),
-                            Some(cast),
-                            vec![Operand::IdRef(component)],
-                        ));
-                        values.push(Operand::IdRef(cast));
-                    }
-                    instructions.push(Self::inst(
-                        Op::CompositeConstruct,
-                        Some(result_type),
-                        Some(result),
-                        values,
-                    ));
-                    result
-                }
-            }
             _ => {
-                // Distinct AIR types can share one storage type (notably bfloat and i16). An
-                // OpBitcast whose source and result types are identical is valid SPIR-V but says
-                // nothing -- name the no-op as the copy it is.
+                // Distinct AIR types can share one storage type (notably bfloat and i16). SPIR-V
+                // forbids OpBitcast when the constructed source and result types are identical.
                 let source_type = self.type_id(&src_ty)?;
                 let result_type = self.type_id(&dst_ty)?;
                 let result = self.result_id(&name, &dst_ty)?;
@@ -2289,14 +2521,7 @@ impl Emitter {
                 // intentionally left undefined — a device pointer is only ever used AS a pointer
                 // (GEP/store/deref), all routed through `raw_offsets`, never as a plain value.
                 if self.bda_device_pointers && !self.opaque_resource_pointers.contains(&name) {
-                    // `constant` (`addrspace(2)`) is a read-only DEVICE allocation, not a separate
-                    // physical space: a `constant T*` stored in a buffer is the same 64-bit GPU
-                    // address a `device T*` is. Reading only `addrspace(1)` here left every
-                    // constant-space nested pointer on the `Private` placeholder, and every load
-                    // through it folded to zero -- `scn_osd_synchronize_coarse_positions` indexed
-                    // its output array with `0 * 3` where Metal indexes it with the value it just
-                    // read, so all four sources of that family wrote element 0 from every thread.
-                    if let LlType::Ptr(1 | 2) = result_ty {
+                    if let LlType::Ptr(1) = result_ty {
                         let addr = self.result_id(&bda_address_name(&name), &LlType::Int(64))?;
                         self.emit_raw_load(addr, &LlType::Int(64), &raw, load.align, instructions)?;
                         self.bda_address_values.insert(addr);
@@ -2625,7 +2850,7 @@ impl Emitter {
                     )? {
                         return Ok(());
                     }
-                    if self.emit_scalar_slots_to_wider_load(
+                    if self.emit_scalar_to_wider_vector_load(
                         result,
                         &pointee,
                         &result_ty,

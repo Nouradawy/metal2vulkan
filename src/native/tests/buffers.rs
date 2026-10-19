@@ -103,52 +103,6 @@ done:
 }
 
 #[test]
-fn native_whole_object_copy_into_a_device_buffer_is_a_store_not_a_copy_memory() {
-    // SPIRV-Cross's write analysis does not count `OpCopyMemory`, so a `StorageBuffer` block written
-    // only that way comes out `const device _N&` in MSL and the assignment into it does not compile;
-    // MoltenVK then answers "create compute pipeline: Initialization of an object has failed".
-    // `spirv-val` is happy either way, which is why it survived -- so assert the shape here.
-    let ll = r#"
-source_filename = "case.metal"
-
-%struct.Pair = type { float, float }
-
-define void @copy_into_device(ptr addrspace(1) noundef captures(none) "air-buffer-no-alias" %0) {
-  %2 = alloca %struct.Pair, align 4
-  %3 = getelementptr inbounds %struct.Pair, ptr addrspace(1) %0, i64 1
-  call void @llvm.memcpy.p1.p0.i64(ptr addrspace(1) %3, ptr %2, i64 8, i1 false)
-  ret void
-}
-
-declare void @llvm.memcpy.p1.p0.i64(ptr addrspace(1), ptr, i64, i1)
-
-attributes #0 = { nounwind }
-
-!air.kernel = !{!0}
-!0 = !{ptr @copy_into_device, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Pair", !"air.arg_name", !"pairs"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_native_device_copy_store_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    assert!(!asm.contains("OpCopyMemory"), "{asm}");
-    assert!(asm.contains("OpStore"), "{asm}");
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-}
-
-#[test]
 fn native_kernel_reinterprets_metadata_ulong_field_as_uint2() {
     let ll = r#"
 source_filename = "case.metal"
@@ -528,20 +482,8 @@ exit:
     let _ = std::fs::remove_dir_all(tmp);
 }
 
-/// The same loss as `native_generic_callback_table_cursor_is_refused_not_silently_emptied`, reached
-/// through an aggregate instead of a bitcast chain: `%table` is loaded as a generic `ptr` out of an
-/// `%ArrayRef` field, so the device pointer read through it is an unmodeled placeholder and the
-/// store lands nowhere.
-///
-/// This asserted that no `OpConstantNull` of a pointer type reached the module -- true of the old
-/// emptied module, and still asserted by `native_bda_pointer_phi_merges_buffer_root_with_child_
-/// device_address` on a shape the emitter can represent. `native_device_buffer_array_reinterprets_
-/// aggregate_prefix`, four tests below, is the closest working analog of this one: the same slot
-/// GEP and the same `store i32 7` through the loaded device pointer, but with `%table` reaching the
-/// entry parameter through `insertvalue`/`extractvalue` rather than through a load, which keeps it
-/// device-addressed and keeps the store.
 #[test]
-fn native_device_buffer_array_through_a_generic_state_pointer_is_refused() {
+fn native_device_buffer_array_lowers_null_logical_pointer_aggregate_fields() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 %ArrayRef = type { ptr, i64 }
@@ -577,17 +519,24 @@ entry:
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let error = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
-        .err()
-        .unwrap_or_else(|| {
-            panic!(
-                "the store through the placeholder cannot be emitted, so this must not translate"
-            )
-        });
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let module = load_bytes(&spv).expect("load translated module");
+    let pointer_types = module
+        .types_global_values
+        .iter()
+        .filter_map(|inst| (inst.class.opcode == Op::TypePointer).then_some(inst.result_id?))
+        .collect::<HashSet<_>>();
     assert!(
-        error.contains("addresses nothing"),
-        "the refusal must name the placeholder that swallowed the store: {error}"
+        !module.types_global_values.iter().any(|inst| {
+            inst.class.opcode == Op::ConstantNull
+                && inst
+                    .result_type
+                    .is_some_and(|ty| pointer_types.contains(&ty))
+        }),
+        "{}",
+        disassemble(&spv).unwrap()
     );
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     let _ = std::fs::remove_dir_all(tmp);
 }
 
@@ -646,22 +595,8 @@ entry:
     let _ = std::fs::remove_dir_all(tmp);
 }
 
-/// A generic callback cursor over device-pointer elements needs physical addresses, and the
-/// emitter does not have them: `%table` is a `ptr` in the generic address space, so the
-/// device-address arm (which keys on `addrspace(1)`) declines it and everything reached through it
-/// becomes an unmodeled Private placeholder.
-///
-/// This asserted `PhysicalStorageBuffer64` and validated the result, which the emitted module did
-/// satisfy -- while containing no `OpStore` at all, because the store through the placeholder was
-/// dropped and reported as success.  See
-/// `native_generic_callback_table_cursor_keeps_its_store` just below for what a real fix restores.
-/// Until then the translation is refused, so the cosmetics of a module that cannot do its job are
-/// no longer what this pins.
-///
-/// `requires_device_address_model` is read off the parsed AIR and is unaffected by any of that, so
-/// it stays: this fixture is still the one that says this shape needs physical addresses.
 #[test]
-fn native_generic_callback_table_cursor_is_refused_not_silently_emptied() {
+fn native_device_address_model_follows_generic_callback_table_cursor() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 @next_buffer = internal addrspace(2) global i32 1
@@ -699,82 +634,11 @@ entry:
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let error = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
-        .err()
-        .unwrap_or_else(|| {
-            panic!(
-                "the store through the placeholder cannot be emitted, so this must not translate"
-            )
-        });
-    assert!(
-        error.contains("addresses nothing"),
-        "the refusal must name the placeholder that swallowed the store: {error}"
-    );
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-/// The store in the fixture above must survive into the emitted module. It does not, and since
-/// `2d4a7a0` the emitter refuses the module rather than emitting one without it -- so this states
-/// what a real fix delivers, which is neither of those.
-///
-/// The loss: `%table` is loaded as a `ptr` in the generic address space, so the device-address arm
-/// (which keys on `addrspace(1)`) declines it, and the slot pointer and the buffer pointer reached
-/// through it are both unmodeled Private placeholders. Before the refusal the emitted module kept
-/// the address arithmetic and the `OpConvertUToPtr`, and its tail was an `OpLoad` and an `OpIEqual`
-/// feeding nothing -- the store had turned into a check.
-///
-/// Ignored rather than deleted, because it states a contract no other test can: its siblings assert
-/// storage classes, pointer types and validity, none of which notices a missing write. Un-ignore it
-/// when the device-address path accepts a generic-address-space cursor; `cargo test -- --ignored`
-/// is what shows the gap in the meantime.
-///
-/// Not urgent, and the measurement says so: no source among the 14579 in the corpus contains this
-/// shape -- neither a `getelementptr` over `ptr addrspace(1)` elements from a generic base nor a
-/// `load ptr addrspace(1)` through one.
-#[test]
-#[ignore = "known defect: the device-address store is refused, not kept; see the doc comment"]
-fn native_generic_callback_table_cursor_keeps_its_store() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-@next_buffer = internal addrspace(2) global i32 1
-
-define void @k(ptr %buffers) {
-entry:
-  call void @callback(ptr %buffers)
-  ret void
-}
-
-define internal void @callback(ptr %state) {
-entry:
-  %alias = bitcast ptr %state to ptr
-  %table = load ptr, ptr %alias, align 8
-  %slot = getelementptr inbounds ptr addrspace(1), ptr %table, i64 1
-  %slot_alias = bitcast ptr %slot to ptr
-  %buffer = load ptr addrspace(1), ptr %slot_alias, align 8
-  store i32 7, ptr addrspace(1) %buffer, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, ptr addrspace(2) @next_buffer, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_name", !"array_ref<void>", !"air.arg_name", !"buffers"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_native_callback_table_cursor_store_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
-        .unwrap_or_else(|error| panic!("the translation is refused rather than emitted: {error}"));
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
+    assert!(asm.contains("PhysicalStorageBuffer64"), "{asm}");
+    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     let _ = std::fs::remove_dir_all(tmp);
-    assert!(
-        asm.contains("OpStore"),
-        "the AIR stores 7 through the device pointer it loads from the table, so the module must \
-         contain a store; it contains none:\n{asm}"
-    );
 }
 
 #[test]
@@ -2550,12 +2414,6 @@ declare void @llvm.memcpy.p1.p0.i64(ptr addrspace(1), ptr, i64, i1)
     }
 }
 
-/// The source struct spells its padding out as `[8 x i8]`/`[3 x i8]`, so it measures exactly the
-/// 32 bytes AIR declares and `gep_source_should_override` takes it verbatim: the GEP's own ordinal 6
-/// already addresses byte 28, and no remap onto AIR's five-member view is needed. Ordinal remapping
-/// stays live for source structs whose recomputed extent differs from the declared one -- what this
-/// case pins is that a padded struct that agrees byte-for-byte is not one of them, and that the
-/// record stride stays 32 either way.
 #[test]
 fn native_record_array_metadata_gep_remaps_padding_fields() {
     let ll = r#"
@@ -2596,29 +2454,11 @@ entry:
         !ir.entry_param_requires_raw_layout(Some("main"), 0),
         "equal-extent source structs must retain ordinal remapping"
     );
-    let kern_meta = meta::parse_air_kernel_meta(ll);
-    let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
-        ll,
-        kern_meta.as_ref(),
-        Some("main"),
-        kern_meta.as_ref().map(|meta| &meta.buffer_layouts),
-    )
-    .expect("emit with AIR layout sidecar");
-    assert!(
-        emitted
-            .sidecar
-            .air_struct_offsets
-            .values()
-            .any(|offsets| offsets == &[0, 4, 8, 16, 24, 25, 28]),
-        "the tail sits at byte 28 behind pads at 8 and 25: {:?}",
-        emitted.sidecar.air_struct_offsets
-    );
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(
-        asm.contains("ArrayStride 32"),
-        "the `i64 %idx64` record index strides by the declared 32 bytes: {asm}"
-    );
+    let uint_ty = uint32_type_id(&asm);
+    assert!(asm.contains(&format!("OpConstant  {uint_ty}  4")), "{asm}");
+    assert!(!asm.contains(&format!("OpConstant  {uint_ty}  6")), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -3766,6 +3606,306 @@ entry:
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// The set of 32-bit words of the raw `{ uint[] }` descriptor at `binding` that the translated
+/// module addresses, by constant-folding every access-chain word index rooted at that variable.
+/// Panics if any access has a non-constant index or if any load was replaced by a copy of a null
+/// constant (the silent-zero symptom of a raw pointer whose cursor was lost).
+fn raw_descriptor_words(spv: &[u8], binding: u32) -> std::collections::BTreeSet<u32> {
+    fn fold(id: Word, definitions: &HashMap<Word, &Instruction>) -> Option<u32> {
+        let instruction = definitions.get(&id)?;
+        let operand = |index: usize| match instruction.operands.get(index) {
+            Some(Operand::IdRef(id)) => fold(*id, definitions),
+            _ => None,
+        };
+        match instruction.class.opcode {
+            Op::Constant => match instruction.operands.first()? {
+                Operand::LiteralBit32(value) => Some(*value),
+                Operand::LiteralBit64(value) => u32::try_from(*value).ok(),
+                _ => None,
+            },
+            Op::ConstantNull | Op::ConstantFalse => Some(0),
+            Op::ConstantTrue => Some(1),
+            Op::IAdd => Some(operand(0)?.wrapping_add(operand(1)?)),
+            Op::IMul => Some(operand(0)?.wrapping_mul(operand(1)?)),
+            Op::UDiv => operand(0)?.checked_div(operand(1)?),
+            Op::ShiftRightLogical => operand(0)?.checked_shr(operand(1)?),
+            Op::IEqual => Some(u32::from(operand(0)? == operand(1)?)),
+            Op::Select => {
+                if operand(0)? != 0 {
+                    operand(1)
+                } else {
+                    operand(2)
+                }
+            }
+            Op::CopyObject | Op::Bitcast | Op::UConvert | Op::SConvert => operand(0),
+            _ => None,
+        }
+    }
+
+    let module = load_bytes(spv).expect("load translated SPIR-V");
+    let asm = disassemble(spv).expect("disassemble");
+    let variables = module
+        .annotations
+        .iter()
+        .filter(|instruction| instruction.class.opcode == Op::Decorate)
+        .filter_map(|instruction| match instruction.operands.as_slice() {
+            [Operand::IdRef(target), Operand::Decoration(Decoration::Binding), Operand::LiteralBit32(bound)]
+                if *bound == binding =>
+            {
+                Some(*target)
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        variables.len(),
+        1,
+        "one descriptor at binding {binding}:\n{asm}"
+    );
+    let body = module
+        .functions
+        .iter()
+        .flat_map(|function| function.all_inst_iter())
+        .collect::<Vec<_>>();
+    let definitions = module
+        .types_global_values
+        .iter()
+        .chain(body.iter().copied())
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+        .collect::<HashMap<_, _>>();
+    assert!(
+        !body.iter().any(|instruction| {
+            instruction.class.opcode == Op::CopyObject
+                && matches!(
+                    instruction.operands.first(),
+                    Some(Operand::IdRef(source))
+                        if definitions
+                            .get(source)
+                            .is_some_and(|definition| definition.class.opcode == Op::ConstantNull)
+                )
+        }),
+        "a buffer load was replaced by a null constant:\n{asm}"
+    );
+    body.iter()
+        .filter(|instruction| {
+            matches!(
+                instruction.class.opcode,
+                Op::AccessChain | Op::InBoundsAccessChain
+            ) && matches!(
+                instruction.operands.first(),
+                Some(Operand::IdRef(base)) if variables.contains(base)
+            )
+        })
+        .map(|instruction| {
+            let Some(Operand::IdRef(index)) = instruction.operands.last() else {
+                panic!("access chain without an index:\n{asm}");
+            };
+            fold(*index, &definitions)
+                .unwrap_or_else(|| panic!("non-constant word index %{index}:\n{asm}"))
+        })
+        .collect()
+}
+
+/// A one-block helper is spliced into its caller before emission. Its pointer parameter bound to
+/// a GEP of a constant (`addrspace(2)`) raw buffer used to be bound to the GEP's Private
+/// placeholder, so every load through it became `OpCopyObject %uint <null>`. The spliced
+/// parameter must alias the argument: descriptor root plus the GEP's byte cursor.
+#[test]
+fn native_inline_constant_buffer_gep_argument_reads_offset_words() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define internal fastcc <4 x float> @callee(ptr addrspace(2) noundef readonly %p) unnamed_addr #1 {
+  %a = getelementptr inbounds <4 x float>, ptr addrspace(2) %p, i64 1
+  %v = load <4 x float>, ptr addrspace(2) %a, align 16
+  ret <4 x float> %v
+}
+
+define <4 x float> @repro(<4 x float> %pos, ptr addrspace(2) noundef readonly "air-buffer-no-alias" %buf) {
+  %q = getelementptr inbounds <4 x float>, ptr addrspace(2) %buf, i64 7
+  %r0 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %buf)
+  %r1 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %q)
+  %s = fadd fast <4 x float> %r0, %r1
+  ret <4 x float> %s
+}
+
+attributes #1 = { noinline nounwind }
+
+!air.fragment = !{!0}
+!0 = !{ptr @repro, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"pos", !"air.arg_unused"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"colorP"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_inline_constant_buffer_gep_arg_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    // `@callee(%buf)` reads float4 #1 (words 4..7); `@callee(%buf + 7 float4)` reads #8 (32..35).
+    assert_eq!(
+        raw_descriptor_words(&spv, 4),
+        std::collections::BTreeSet::from([4, 5, 6, 7, 32, 33, 34, 35])
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A multi-block helper stays an emitted `OpFunctionCall` until the post-emission inliner runs,
+/// so a GEP argument's byte cursor has to cross a real call boundary. Each call site passes the
+/// descriptor root plus its own cursor, so distinct offsets into one constant buffer coexist.
+#[test]
+fn native_helper_call_constant_buffer_gep_arguments_pass_byte_cursors() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define internal fastcc <4 x float> @callee(ptr addrspace(2) noundef readonly %p, i1 %c) unnamed_addr #1 {
+entry:
+  br i1 %c, label %then, label %else
+then:
+  %a = getelementptr inbounds <4 x float>, ptr addrspace(2) %p, i64 1
+  %v = load <4 x float>, ptr addrspace(2) %a, align 16
+  br label %done
+else:
+  %w = load <4 x float>, ptr addrspace(2) %p, align 16
+  br label %done
+done:
+  %r = phi <4 x float> [ %v, %then ], [ %w, %else ]
+  ret <4 x float> %r
+}
+
+define <4 x float> @repro(<4 x float> %pos, ptr addrspace(2) noundef readonly "air-buffer-no-alias" %buf) {
+  %x = extractelement <4 x float> %pos, i64 0
+  %c = fcmp fast ogt float %x, 1.000000e+01
+  %q = getelementptr inbounds <4 x float>, ptr addrspace(2) %buf, i64 7
+  %q2 = getelementptr inbounds <4 x float>, ptr addrspace(2) %buf, i64 14
+  %r0 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %buf, i1 %c)
+  %r1 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %q, i1 %c)
+  %r2 = call fastcc <4 x float> @callee(ptr addrspace(2) noundef %q2, i1 %c)
+  %s0 = fadd fast <4 x float> %r0, %r1
+  %s = fadd fast <4 x float> %s0, %r2
+  ret <4 x float> %s
+}
+
+attributes #1 = { noinline nounwind }
+
+!air.fragment = !{!0}
+!0 = !{ptr @repro, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!3 = !{!4, !5}
+!4 = !{i32 0, !"air.position", !"air.center", !"air.no_perspective", !"air.arg_type_name", !"float4", !"air.arg_name", !"pos"}
+!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"colorP"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_helper_call_constant_buffer_gep_args_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
+    // Each call reads float4 #0 and #1 relative to its cursor of 0, 7, or 14 float4s.
+    let expected = [0u32, 7, 14]
+        .into_iter()
+        .flat_map(|base| (base * 4)..(base * 4 + 8))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(raw_descriptor_words(&spv, 4), expected);
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A cursor-carrying helper parameter forwarded through a further GEP to another emitted helper
+/// composes both offsets, and one raw device-buffer helper may be called with distinct constant
+/// cursors (formerly `conflicting constant byte offsets`). The helpers are defined before the
+/// kernel, so the callee signature cannot depend on callers having been emitted first. The mixed
+/// `i32`/`float` stores make the buffer raw.
+#[test]
+fn native_nested_helper_calls_compose_device_buffer_byte_cursors() {
+    let ll = r#"
+target triple = "air64-apple-macosx15.0.0"
+
+define internal fastcc void @outer(ptr addrspace(1) %p, i32 %v) unnamed_addr #1 {
+entry:
+  %skip = icmp eq i32 %v, 0
+  br i1 %skip, label %done, label %work
+work:
+  %q = getelementptr inbounds i8, ptr addrspace(1) %p, i64 8
+  tail call fastcc void @inner(ptr addrspace(1) %q, i32 %v)
+  br label %done
+done:
+  store i32 %v, ptr addrspace(1) %p, align 4
+  ret void
+}
+
+define internal fastcc void @inner(ptr addrspace(1) %d, i32 %v) unnamed_addr #1 {
+entry:
+  %hi = icmp ugt i32 %v, 7
+  br i1 %hi, label %high, label %low
+high:
+  %d1 = getelementptr inbounds i8, ptr addrspace(1) %d, i64 4
+  %f = uitofp i32 %v to float
+  store float %f, ptr addrspace(1) %d1, align 4
+  br label %done
+low:
+  store i32 %v, ptr addrspace(1) %d, align 4
+  br label %done
+done:
+  ret void
+}
+
+define void @k(ptr addrspace(1) %out, i32 %tid) {
+entry:
+  %a = getelementptr inbounds i8, ptr addrspace(1) %out, i64 16
+  %b = getelementptr inbounds i8, ptr addrspace(1) %out, i64 48
+  tail call fastcc void @outer(ptr addrspace(1) %a, i32 %tid)
+  tail call fastcc void @outer(ptr addrspace(1) %b, i32 %tid)
+  ret void
+}
+
+attributes #1 = { noinline nounwind }
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
+!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_nested_helper_device_buffer_cursors_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    // `@outer(out + 16 B)` stores word 4 and `@inner(out + 24 B)` word 6 or 7; likewise 12, 14, 15.
+    assert_eq!(
+        raw_descriptor_words(&spv, 0),
+        std::collections::BTreeSet::from([4, 6, 7, 12, 14, 15])
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn native_indirect_helper_gep_drops_signed_zero_record_index() {
     let ll = r#"
@@ -3983,10 +4123,8 @@ entry:
 fn native_selected_buffer_pointer_gep_store_replays_values_per_arm() {
     // The selected GEP has one concrete access chain per buffer. A direct pointer `OpSelect` before
     // the store is illegal when those chains root in distinct StorageBuffer bindings, even though
-    // their pointee types agree. Each arm therefore gets its own store, GUARDED by the arm being
-    // the selected one. Writing both arms unconditionally -- reading the unselected arm and storing
-    // the same value back -- is not equivalent: that write-back races an invocation that did select
-    // that arm, so this asserts there is no load of the destination at all.
+    // their pointee types agree. The store must stay in the value domain: load both values, select
+    // the selected/new value per arm, then store through each original arm.
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 define void @k(i32 %gid, ptr addrspace(1) %a, ptr addrspace(1) %b) {
@@ -4027,46 +4165,15 @@ entry:
                     .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
         })
         .count();
-    let body = module
+    let value_selects = module
         .functions
         .iter()
         .flat_map(|function| &function.blocks)
         .flat_map(|block| &block.instructions)
-        .collect::<Vec<_>>();
-    let stores = body
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::Store)
-        .collect::<Vec<_>>();
+        .filter(|inst| inst.class.opcode == Op::Select)
+        .count();
     assert_eq!(pointer_selects, 0, "{asm}");
-    assert_eq!(stores.len(), 2, "one store per candidate buffer: {asm}");
-    let store_targets = stores
-        .iter()
-        .filter_map(|inst| inst.operands.first().cloned())
-        .collect::<std::collections::HashSet<_>>();
-    assert!(
-        !body.iter().any(|inst| inst.class.opcode == Op::Load
-            && inst
-                .operands
-                .first()
-                .is_some_and(|ptr| store_targets.contains(ptr))),
-        "a guarded store has nothing to read back: {asm}"
-    );
-    assert_eq!(
-        body.iter()
-            .filter(|inst| inst.class.opcode == Op::BranchConditional)
-            .count(),
-        2,
-        "each arm's store is guarded by that arm being selected: {asm}"
-    );
-    let stored_values = stores
-        .iter()
-        .filter_map(|inst| inst.operands.get(1).cloned())
-        .collect::<std::collections::HashSet<_>>();
-    assert_eq!(
-        stored_values.len(),
-        1,
-        "both arms store the SAME new value, never a per-arm merge of it: {asm}"
-    );
+    assert!(value_selects >= 2, "{asm}");
     assert!(
         !crate::native::construct_interface_cross_binding_pointer_values_module(&mut module),
         "interface/finalization ownership must leave no value-replayable pointer closure"
@@ -4669,6 +4776,7 @@ entry:
         &tmp,
         passes::TransformOptions {
             kernel_local_size: [256, 2, 1],
+            simd_cluster32: false,
             ..passes::TransformOptions::default()
         },
     )
@@ -5702,101 +5810,6 @@ entry:
     );
 }
 
-/// The other half of the pair above: what the emitter conservatively REQUESTS, finalization drops
-/// when the finished module has no type that needs it.
-///
-/// `function_type_capabilities` requests `Int8` for every opaque-pointer return, because that return
-/// MIGHT materialize the emitter's byte-pointer fallback. When it does not -- the helper is inlined,
-/// or the pointer gets a concrete pointee -- the request outlives its reason. That is not a bug in
-/// the prediction; a prediction that runs before emission has to over-approximate, which is exactly
-/// why `drop_unused_int64_capability` existed for `Int64`. It is a bug that the drop covered only
-/// one of the five widths: **656 of the 14,579 corpus sources shipped a width capability with no
-/// type of that width -- 591 `Int8`, 32 `Float16`, 29 `Int16`** -- and each one is a Vulkan device
-/// feature (`shaderInt8`, `shaderFloat16`, `shaderInt16`) demanded of every consumer for nothing.
-#[test]
-fn a_width_capability_no_type_needs_does_not_survive_finalization() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @k(ptr addrspace(1) %out, i32 %gid) {
-entry:
-  %slot = alloca i32, align 4
-  %same = call ptr @identity(ptr %slot)
-  store i32 7, ptr %same, align 4
-  %v = load i32, ptr %same, align 4
-  %i = zext i32 %gid to i64
-  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
-  store i32 %v, ptr addrspace(1) %o, align 4
-  ret void
-}
-
-define internal ptr @identity(ptr %pointer) {
-entry:
-  ret ptr %pointer
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
-!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_unused_width_capability_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    let module = load_bytes(&spv).expect("load native spv");
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    let scalar_widths: Vec<(Op, u32)> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| matches!(inst.class.opcode, Op::TypeInt | Op::TypeFloat))
-        .filter_map(|inst| match inst.operands.first() {
-            Some(&Operand::LiteralBit32(width)) => Some((inst.class.opcode, width)),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        !scalar_widths.contains(&(Op::TypeInt, 8)),
-        "the fixture has no 8-bit type, saw {scalar_widths:?}"
-    );
-
-    // Every width capability the module declares is demanded by a type it still has -- the same
-    // table `native::scalar_width_capability` gives the owned check to demand it the other way.
-    let unbacked: Vec<Capability> = module
-        .capabilities
-        .iter()
-        .filter_map(|inst| match inst.operands.first() {
-            Some(&Operand::Capability(capability)) => Some(capability),
-            _ => None,
-        })
-        .filter(|capability| {
-            !scalar_widths.iter().any(|&(opcode, width)| {
-                crate::native::scalar_width_capability(opcode, width) == Some(*capability)
-            })
-        })
-        .filter(|capability| {
-            matches!(
-                capability,
-                Capability::Int8
-                    | Capability::Int16
-                    | Capability::Int64
-                    | Capability::Float16
-                    | Capability::Float64
-            )
-        })
-        .collect();
-    assert!(
-        unbacked.is_empty(),
-        "no width capability outlives the type that asked for it, saw {unbacked:?}"
-    );
-}
-
 #[test]
 fn native_internal_pointer_param_eq_null_uses_callsite_nonnullness() {
     let ll = r#"
@@ -5971,14 +5984,14 @@ fn native_unmodeled_gep_to_pointer_field_uses_byte_placeholder() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 %Header = type { i64, ptr addrspace(2) }
-define i32 @pointer_field(i64 %addr) {
+define void @pointer_field(i64 %addr) {
 entry:
   %base = inttoptr i64 %addr to ptr addrspace(2)
   %field = getelementptr inbounds %Header, ptr addrspace(2) %base, i64 0, i32 1
   %p = load ptr addrspace(2), ptr addrspace(2) %field
   %elt = getelementptr inbounds i32, ptr addrspace(2) %p, i64 0
-  %v = load i32, ptr addrspace(2) %elt
-  ret i32 %v
+  store i32 1, ptr addrspace(2) %elt
+  ret void
 }
 "#;
     let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
@@ -7760,11 +7773,6 @@ entry:
   ret void
 }
 
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_native_local_aggregate_multi_view_{}",
@@ -7844,12 +7852,6 @@ entry:
   store i32 %w, ptr addrspace(1) %out, align 4
   ret void
 }
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_native_global_byte_view_{}",
@@ -7895,12 +7897,6 @@ define internal fastcc i32 @helper(ptr noundef %0) {
   %word = load i32, ptr %hi, align 4
   ret i32 %word
 }
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_native_local_aggregate_callee_view_{}",
@@ -8393,154 +8389,6 @@ entry:
     let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
     assert!(asm.contains("OpBitcast"), "{asm}");
     assert!(!asm.contains("does not match Object"), "{asm}");
-}
-
-// The equal-width reinterpret STORE must accept every pointee/object pair the equal-width
-// reinterpret LOAD accepts, or a module cannot write back what it just read. `*(device
-// ushort2*)&buf[i]` reads as `load <2 x i16>` from a `uint` pointee and writes as `store
-// <2 x i16>` into it; the load arm took any equal-width pair, but the store arm only took
-// vector->vector (and scalar->anything), so the write fell through to a plain `OpStore` and the
-// owned-module contract rejected the module: "owned Store violates its pointer-pointee and
-// value-type contract ... points at %N (TypeInt 32 0), but the stored value is ... TypeVector".
-#[test]
-fn a_subword_vector_stores_back_through_the_word_pointer_it_loaded_from() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @subword_roundtrip(ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %in, ptr addrspace(1) noundef captures(none) "air-buffer-no-alias" %out, i32 %gid) {
-entry:
-  %i = zext i32 %gid to i64
-  %pin = getelementptr inbounds i32, ptr addrspace(1) %in, i64 %i
-  %v = load <2 x i16>, ptr addrspace(1) %pin, align 4
-  %w = shufflevector <2 x i16> %v, <2 x i16> poison, <2 x i32> <i32 1, i32 0>
-  %pout = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
-  store <2 x i16> %w, ptr addrspace(1) %pout, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @subword_roundtrip, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"in"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
-!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-"#;
-    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    let module = load_bytes(&spv).expect("load native spv");
-    // Both directions are the same two instructions in mirror image: the load bitcasts the word it
-    // loaded UP to the lane vector, the store bitcasts the lane vector DOWN to the word it stores.
-    let bitcasts = module
-        .functions
-        .iter()
-        .flat_map(|function| &function.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter(|instruction| instruction.class.opcode == Op::Bitcast)
-        .count();
-    assert_eq!(bitcasts, 2, "{asm}");
-    // No lane-by-lane rebuild on either side: an equal-width reinterpret is a pure bit cast.
-    assert!(!asm.contains("OpCompositeConstruct"), "{asm}");
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_subword_roundtrip_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-// The three equal-width reinterpret arms below all used to gate on a type NAME or a lane COUNT
-// where the only thing that decides an equal-width reinterpret is the WIDTH. Each pair's other
-// direction already accepted the shape, so a module could write a view it could not read back, or
-// read one it could not write.
-
-// A `<4 x float>` stored through a `[4 x i32]` local. `emit_scalar_array_as_vector_load` already
-// read this view back lane-for-lane with an `OpBitcast` per lane when the element types were
-// incompatible but equal in width; `emit_vector_as_scalar_array_store` demanded
-// `types_compatible` and fell through to a plain `OpStore` of a vector into an array pointee.
-#[test]
-fn a_vector_stores_into_a_same_width_scalar_array_view() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @vec_into_word_array(<4 x float> %v) {
-entry:
-  %a = alloca [4 x i32], align 16
-  store <4 x float> %v, ptr %a, align 16
-  %p = getelementptr inbounds [4 x i32], ptr %a, i64 0, i64 2
-  %w = load i32, ptr %p, align 4
-  ret void
-}
-"#;
-    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
-    // One bitcast per lane, then the array is rebuilt and stored whole.
-    assert_eq!(asm.matches("OpBitcast").count(), 4, "{asm}");
-    assert!(asm.contains("OpCompositeConstruct"), "{asm}");
-    assert!(!asm.contains("violates its pointer-pointee"), "{asm}");
-}
-
-// A `[4 x float]` local read back as `<4 x i32>`. `emit_vector_to_scalar_stores` already wrote this
-// view lane-for-lane through sibling slot pointers with an `OpBitcast` per lane;
-// `emit_scalar_to_vector_load` demanded `types_compatible(pointee, elem)` and the load fell all the
-// way through to "reinterpret load bit width mismatch Float (32) vs Vector(Int(32), 4) (128)".
-#[test]
-fn a_vector_loads_from_same_width_scalar_slots() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @word_vector_from_float_slots(float %f) {
-entry:
-  %b = alloca [4 x float], align 16
-  %s0 = getelementptr inbounds [4 x float], ptr %b, i64 0, i64 0
-  store float %f, ptr %s0, align 16
-  %v = load <4 x i32>, ptr %s0, align 16
-  %e = extractelement <4 x i32> %v, i32 2
-  ret void
-}
-"#;
-    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
-    // Four slot loads in the SLOT type, each bitcast to the result element, then reassembled.
-    assert_eq!(asm.matches("OpBitcast").count(), 4, "{asm}");
-    assert!(asm.contains("OpCompositeConstruct"), "{asm}");
-    assert!(
-        !asm.contains("reinterpret load bit width mismatch"),
-        "{asm}"
-    );
-}
-
-// A struct whose leading member is `<4 x half>`, read as `<2 x float>` -- equal TOTAL width, half
-// the lanes. `emit_first_vector_aggregate_reinterpret_store` already gated on total width alone
-// (its own doc names `<2 x float>` into a `<4 x half>` slot); the load's bitcast branch also
-// required `n == m`, so the read direction refused the write direction's own example.
-#[test]
-fn a_leading_vector_member_loads_at_a_different_lane_count() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%struct.HalfLead = type { <4 x half>, i32 }
-
-define void @half4_head_as_float2(<4 x half> %h) {
-entry:
-  %s = alloca %struct.HalfLead, align 16
-  %hp = getelementptr inbounds %struct.HalfLead, ptr %s, i64 0, i32 0
-  store <4 x half> %h, ptr %hp, align 8
-  %f = load <2 x float>, ptr %s, align 8
-  %e = extractelement <2 x float> %f, i32 1
-  ret void
-}
-"#;
-    let asm = disassemble(&emit_vulkan_spirv(ll).expect("native emit")).expect("disassemble");
-    // One whole-vector bitcast, not a lane-by-lane rebuild: the lane split is irrelevant to a
-    // same-width vector reinterpret.
-    assert!(asm.contains("OpBitcast"), "{asm}");
-    assert!(!asm.contains("OpCompositeConstruct"), "{asm}");
-    assert!(!asm.contains("non-bitcastable pointee"), "{asm}");
 }
 
 #[test]
@@ -9762,60 +9610,7 @@ entry:
     assert!(pointer_selects.is_empty(), "{asm}");
     assert!(!asm.contains("OpFunctionCall"), "{asm}");
     assert!(asm.matches("OpLoad").count() >= 2, "{asm}");
-    // The AIR condition here is the literal `i1 true`, so the replayed value select has one
-    // possible outcome and `collapse_constant_selects` resolves it to the arm the literal names:
-    // the store takes the DEFAULT config's load, not a runtime choice between the two. The replay
-    // itself -- a pointer select becoming a value select -- is covered with a genuinely runtime
-    // condition by `native_selected_pointer_forwards_mixed_storage_arms` above.
-    let module = load_bytes(&spv).expect("load native spv");
-    let id_named = |name: &str| {
-        module
-            .debug_names
-            .iter()
-            .filter(|instruction| instruction.class.opcode == Op::Name)
-            .find(|instruction| {
-                matches!(instruction.operands.get(1), Some(Operand::LiteralString(n)) if n == name)
-            })
-            .and_then(|instruction| match instruction.operands.first() {
-                Some(Operand::IdRef(id)) => Some(*id),
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("no id named {name}: {asm}"))
-    };
-    let body = module
-        .functions
-        .iter()
-        .flat_map(|function| &function.blocks)
-        .flat_map(|block| &block.instructions)
-        .collect::<Vec<_>>();
-    let derived_from = |root: Word| {
-        body.iter()
-            .find(|instruction| {
-                matches!(
-                    instruction.class.opcode,
-                    Op::AccessChain | Op::InBoundsAccessChain
-                ) && instruction.operands.first() == Some(&Operand::IdRef(root))
-            })
-            .and_then(|chain| chain.result_id)
-            .and_then(|chain| {
-                body.iter().find(|instruction| {
-                    instruction.class.opcode == Op::Load
-                        && instruction.operands.first() == Some(&Operand::IdRef(chain))
-                })
-            })
-            .and_then(|load| load.result_id)
-    };
-    let stored = body
-        .iter()
-        .find(|instruction| instruction.class.opcode == Op::Store)
-        .and_then(|store| store.operands.get(1))
-        .cloned()
-        .expect("the entry stores its result");
-    assert_eq!(
-        Some(stored),
-        derived_from(id_named("default_config")).map(Operand::IdRef),
-        "the `i1 true` arm is the default config's own load: {asm}"
-    );
+    assert!(asm.contains("OpSelect"), "{asm}");
     let _ = std::fs::remove_dir_all(tmp);
 }
 
@@ -9941,134 +9736,19 @@ entry:
                     .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
         })
         .count();
-    let body = module
+    let value_select_types = module
         .functions
         .iter()
         .flat_map(|function| &function.blocks)
         .flat_map(|block| &block.instructions)
+        .filter(|instruction| instruction.class.opcode == Op::Select)
+        .map(|instruction| instruction.result_type)
         .collect::<Vec<_>>();
-    // Both AIR conditions are literals (`select i1 true` then `select i1 false`), so every store
-    // guard folds and only the arm the literals name survives. The other two candidate buffers are
-    // not written AT ALL: a store guarded by the arm being selected has nothing to write back, and
-    // writing them back would race an invocation that did select them.
     assert_eq!(pointer_selects, 0, "{asm}");
-    let stores = body
-        .iter()
-        .filter(|instruction| instruction.class.opcode == Op::Store)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        stores.len(),
-        1,
-        "only the selected buffer is written: {asm}"
-    );
-    let (Some(Operand::IdRef(target)), Some(Operand::IdRef(value))) =
-        (stores[0].operands.first(), stores[0].operands.get(1))
-    else {
-        panic!("a store takes two ids: {asm}");
-    };
-    assert_eq!(
-        module
-            .types_global_values
-            .iter()
-            .find(|i| i.result_id == Some(*value))
-            .and_then(|i| i.result_type),
-        Some(float_type),
-        "the one write stores the float constant: {asm}"
-    );
-    // `select i1 true, a, b` is `a`, and `select i1 false, c, that` is `a` again -- binding 0.
-    let root = body
-        .iter()
-        .find(|instruction| instruction.result_id == Some(*target))
-        .and_then(|instruction| match instruction.operands.first() {
-            Some(Operand::IdRef(base)) => Some(*base),
-            _ => None,
-        })
-        .expect("the store target is an access chain");
-    let binding = module
-        .annotations
-        .iter()
-        .find(|i| {
-            i.class.opcode == Op::Decorate
-                && i.operands.first() == Some(&Operand::IdRef(root))
-                && matches!(i.operands.get(1), Some(Operand::Decoration(d)) if *d == Decoration::Binding)
-        })
-        .and_then(|i| match i.operands.get(2) {
-            Some(Operand::LiteralBit32(binding)) => Some(*binding),
-            _ => None,
-        });
-    assert_eq!(binding, Some(0), "the literals select buffer `a`: {asm}");
+    assert_eq!(value_select_types, vec![Some(float_type); 3], "{asm}");
+    assert_eq!(asm.matches("OpStore").count(), 3, "{asm}");
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_nested_selected_store_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-// A cross-descriptor pointer phi indexed at a CONSTANT element index. Logical SPIR-V has no
-// pointer value that can be either descriptor, so the merge becomes a PhysicalStorageBuffer64
-// device address -- and every index off it has to be taken from that ADDRESS, whether the index is
-// dynamic or constant. Retyping the chain in place instead leaves an `OpAccessChain` descending
-// into a merged pointer whose pointee is a byte, which is not a composite, and the owned-module
-// contract rejects it: "index 0 descends into %N (TypeInt 8 0), which is not a composite type".
-#[test]
-fn a_merged_pointer_at_a_constant_index_is_addressed_not_descended() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @merged_constant_index(ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %a, ptr addrspace(1) noundef readonly captures(none) "air-buffer-no-alias" %b, ptr addrspace(1) noundef captures(none) "air-buffer-no-alias" %out, i32 %gid) {
-entry:
-  %lo = icmp ult i32 %gid, 4
-  br i1 %lo, label %take_a, label %take_b
-
-take_a:
-  br label %merge
-
-take_b:
-  br label %merge
-
-merge:
-  %p = phi ptr addrspace(1) [ %a, %take_a ], [ %b, %take_b ]
-  %e1 = getelementptr inbounds i32, ptr addrspace(1) %p, i64 1
-  %v1 = load i32, ptr addrspace(1) %e1, align 4
-  %i = zext i32 %gid to i64
-  %o0 = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
-  store i32 %v1, ptr addrspace(1) %o0, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @merged_constant_index, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5, !6}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"a"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"b"}
-!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
-!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-"#;
-    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    let module = load_bytes(&spv).expect("load native spv");
-    // The constant index is applied to a PHYSICAL pointer taken from the merged address, so it is
-    // an OpPtrAccessChain (which steps the pointer) and never an access chain into the pointee.
-    let physical_steps = module
-        .functions
-        .iter()
-        .flat_map(|function| &function.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter(|instruction| instruction.class.opcode == Op::PtrAccessChain)
-        .count();
-    assert!(physical_steps >= 1, "{asm}");
-    assert!(asm.contains("OpConvertPtrToU"), "{asm}");
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_merged_constant_index_{}",
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
@@ -10118,52 +9798,19 @@ merge:
     let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("primary translate");
     let asm = disassemble(&spv).expect("disassemble");
     let mut module = load_bytes(&spv).expect("load native spv");
-    // Leafwise means one independent chain per bound buffer, and that is what to assert. The merge
-    // used to leave three POINTER phis, one per buffer; `lower_storage_buffer_pointer_phis` now
-    // carries each one's element index instead, so the count to check is three INDEX phis and no
-    // pointer phi at all -- and, more to the point, three stores whose access chains are rooted at
-    // three DIFFERENT variables. A merge that had unified the buffers would show one root here.
-    let phis = module
+    let pointer_phis = module
         .functions
         .iter()
         .flat_map(|function| &function.blocks)
         .flat_map(|block| &block.instructions)
-        .filter(|instruction| instruction.class.opcode == Op::Phi)
-        .collect::<Vec<_>>();
-    let pointer_phis = phis
-        .iter()
         .filter(|instruction| {
-            instruction
-                .result_type
-                .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
+            instruction.class.opcode == Op::Phi
+                && instruction
+                    .result_type
+                    .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
         })
         .count();
-    assert_eq!(pointer_phis, 0, "{asm}");
-    assert_eq!(phis.len(), 3, "{asm}");
-    let store_roots = module
-        .functions
-        .iter()
-        .flat_map(|function| &function.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter(|instruction| instruction.class.opcode == Op::Store)
-        .filter_map(|instruction| match instruction.operands.first() {
-            Some(Operand::IdRef(pointer)) => Some(*pointer),
-            _ => None,
-        })
-        .filter_map(|pointer| {
-            module
-                .functions
-                .iter()
-                .flat_map(|function| &function.blocks)
-                .flat_map(|block| &block.instructions)
-                .find(|instruction| instruction.result_id == Some(pointer))
-                .and_then(|chain| match chain.operands.first() {
-                    Some(Operand::IdRef(root)) => Some(*root),
-                    _ => None,
-                })
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(store_roots.len(), 3, "{asm}");
+    assert_eq!(pointer_phis, 3, "{asm}");
     assert_eq!(
         crate::native::construct_interface_cross_binding_pointer_merges_module(
             &mut module,
@@ -10185,84 +9832,6 @@ merge:
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
     let _ = std::fs::remove_dir_all(tmp);
-}
-
-/// A pointer walked through a loop is carried as its element INDEX, not as a pointer.
-///
-/// `w++` on a `device const float*` is a `StorageBuffer` pointer `OpPhi` with an
-/// `OpPtrAccessChain` on the back edge. That is valid SPIR-V under
-/// `VariablePointersStorageBuffer` and `spirv-val` accepts it, but SPIRV-Cross's MSL backend has to
-/// declare the phi as a `device float*` variable and initializes it from the entry access chain
-/// with the LVALUE instead of its address -- `const device float* _x = _buf._m0[0u];` -- which does
-/// not compile, so MoltenVK refuses the pipeline. Four corpus modules failed exactly that way.
-#[test]
-fn native_walked_storage_buffer_pointer_becomes_an_index_phi() {
-    // The shape is the corpus one: two nested loops, the inner phi seeded from the outer phi, the
-    // load through the inner phi, and one `getelementptr +1` feeding both back edges.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @walk(ptr addrspace(2) %src, ptr addrspace(1) %dst, i32 %gid) {
-entry:
-  br label %outer
-
-outer:
-  %oi = phi i32 [ 0, %entry ], [ %oi_next, %latch ]
-  %p_outer = phi ptr addrspace(2) [ %src, %entry ], [ %p_step, %latch ]
-  %acc_outer = phi float [ 0.000000e+00, %entry ], [ %acc_inner, %latch ]
-  br label %inner
-
-inner:
-  %ii = phi i32 [ 0, %outer ], [ %ii_next, %inner ]
-  %p_inner = phi ptr addrspace(2) [ %p_outer, %outer ], [ %p_step, %inner ]
-  %acc_in = phi float [ %acc_outer, %outer ], [ %acc_next, %inner ]
-  %v = load float, ptr addrspace(2) %p_inner, align 4
-  %acc_next = fadd float %acc_in, %v
-  %p_step = getelementptr inbounds float, ptr addrspace(2) %p_inner, i64 1
-  %ii_next = add i32 %ii, 1
-  %done_in = icmp sge i32 %ii_next, 4
-  br i1 %done_in, label %latch, label %inner
-
-latch:
-  %acc_inner = phi float [ %acc_next, %inner ]
-  %oi_next = add i32 %oi, 1
-  %done_out = icmp sge i32 %oi_next, 2
-  br i1 %done_out, label %exit, label %outer
-
-exit:
-  store float %acc_inner, ptr addrspace(1) %dst, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @walk, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"src"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"dst"}
-!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-"#;
-    let spv = crate::translate_native_no_retry(ll, Stage::Kernel).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    let module = load_bytes(&spv).expect("load spv");
-    let pointer_phis = module
-        .functions
-        .iter()
-        .flat_map(|function| &function.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter(|instruction| instruction.class.opcode == Op::Phi)
-        .filter(|instruction| {
-            instruction
-                .result_type
-                .is_some_and(|ty| pointer_type_storage_class(&module, ty).is_some())
-        })
-        .count();
-    assert_eq!(pointer_phis, 0, "{asm}");
-    // Nothing merges pointers any more, so the capability that made drivers take the
-    // variable-pointer path goes with it.
-    assert!(!asm.contains("VariablePointersStorageBuffer"), "{asm}");
-    // The walk survives as address arithmetic through the buffer's own access chain.
-    assert!(asm.contains("OpAccessChain"), "{asm}");
 }
 
 #[test]
@@ -11625,152 +11194,6 @@ merge:
 }
 
 #[test]
-fn native_raw_pointer_phi_admits_a_null_arm() {
-    // A raw device cursor MERGED with `null`. The index phi took an arm only from `raw_offsets` or
-    // from a forward GEP, so the `null` edge fell through to the unmodeled path and the merged
-    // cursor -- with every pointer downstream of it -- became a `Private` zero placeholder: the
-    // shader's own guarded load then answered `OpConstantNull` with no refusal anywhere. The null
-    // edge is never dereferenced, so the index it contributes is unobservable; the nullness phi
-    // keeps `p == nullptr` answerable, which is the question the shader actually asks.
-    let ll = include_str!("../../../validation/fixtures/public/kernel_nullable_branch_cursor.ll");
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_native_null_arm_raw_phi_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let out = crate::translate_native_no_retry(ll, Stage::Kernel).expect("no-retry translate");
-    let asm = disassemble(&out).expect("disassemble");
-    let module = load_bytes(&out).expect("load translated module");
-    let src = module
-        .annotations
-        .iter()
-        .find_map(|instruction| match instruction.operands.as_slice() {
-            [
-                Operand::IdRef(id),
-                Operand::Decoration(Decoration::Binding),
-                Operand::LiteralBit32(0),
-            ] => Some(*id),
-            _ => None,
-        })
-        .expect("src buffer binding");
-    let body = module
-        .functions
-        .iter()
-        .flat_map(|function| function.blocks.iter())
-        .flat_map(|block| block.instructions.iter())
-        .collect::<Vec<_>>();
-    // The guarded `(*p).x` must read the four words of the float4 FROM the buffer, at the merged
-    // index -- not from a constant. Before the fix there were exactly two chains on binding 0,
-    // both for the `bytes[3]` byte view, and the vector load was an `OpCopyObject` of a null.
-    let src_chains = body
-        .iter()
-        .filter(|instruction| {
-            instruction.class.opcode == Op::InBoundsAccessChain
-                && matches!(instruction.operands.first(), Some(Operand::IdRef(base)) if *base == src)
-        })
-        .count();
-    assert!(
-        src_chains >= 5,
-        "expected the merged cursor's load addressed on the buffer, found {src_chains} chains:\n{asm}"
-    );
-    // The merge itself must be an integer index phi, never a pointer-typed OpPhi against the raw
-    // block declaration, and the nullness the shader compares against must still be a phi too.
-    let integer_types = module
-        .types_global_values
-        .iter()
-        .filter(|instruction| instruction.class.opcode == Op::TypeInt)
-        .filter_map(|instruction| instruction.result_id)
-        .collect::<HashSet<_>>();
-    let bool_types = module
-        .types_global_values
-        .iter()
-        .filter(|instruction| instruction.class.opcode == Op::TypeBool)
-        .filter_map(|instruction| instruction.result_id)
-        .collect::<HashSet<_>>();
-    let phis = body
-        .iter()
-        .filter(|instruction| instruction.class.opcode == Op::Phi)
-        .collect::<Vec<_>>();
-    assert!(
-        phis.iter().any(|instruction| instruction
-            .result_type
-            .is_some_and(|ty| integer_types.contains(&ty))),
-        "expected an integer index phi for the merged cursor:\n{asm}"
-    );
-    assert!(
-        phis.iter().any(|instruction| instruction
-            .result_type
-            .is_some_and(|ty| bool_types.contains(&ty))),
-        "expected the nullness phi the null comparison reads:\n{asm}"
-    );
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
-    }
-}
-
-#[test]
-fn native_nested_loop_raw_induction_cycle_stays_raw() {
-    // The same raw single-root induction, but walked by a NESTED loop, so the pointer is a CYCLE
-    // of phis: the outer header's carried pointer is advanced by the inner loop, so its backedge
-    // arm is a GEP off the INNER header's phi, whose own entry arm is the outer phi. No arm of
-    // either phi is a GEP off that phi, so the one-phi test in `raw_only_induction_phi` left the
-    // whole cycle on `Private` placeholders — and a phi merging a placeholder with a real
-    // `StorageBuffer` pointer has no common type, so this did not merely read the weights as zero,
-    // it failed to construct ("owned OpPhi incoming type does not match", then
-    // "non-spillable-demote"). The fixture is the device evidence for the same shape.
-    let ll = include_str!(
-        "../../../validation/fixtures/public/kernel_nested_loop_constant_weight_walk.ll"
-    );
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_native_nested_induction_cycle_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let out = crate::translate_native_no_retry(ll, Stage::Kernel).expect("no-retry translate");
-    let asm = disassemble(&out).expect("disassemble");
-    let module = load_bytes(&out).expect("load translated module");
-    let weights = module
-        .annotations
-        .iter()
-        .find_map(|instruction| match instruction.operands.as_slice() {
-            [
-                Operand::IdRef(id),
-                Operand::Decoration(Decoration::Binding),
-                Operand::LiteralBit32(0),
-            ] => Some(*id),
-            _ => None,
-        })
-        .expect("weights buffer binding");
-    // The four words of the `<4 x float>` weight must be addressed ON the weights buffer. Before
-    // the fix the cycle was `Private` placeholders and the load folded to `OpConstantNull`.
-    let weight_chains = module
-        .functions
-        .iter()
-        .flat_map(|function| function.blocks.iter())
-        .flat_map(|block| block.instructions.iter())
-        .filter(|instruction| {
-            instruction.class.opcode == Op::InBoundsAccessChain
-                && matches!(instruction.operands.first(), Some(Operand::IdRef(base)) if *base == weights)
-        })
-        .count();
-    assert!(
-        weight_chains >= 4,
-        "expected the weight load addressed on the buffer, found {weight_chains} chains:\n{asm}"
-    );
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&out, &tmp).expect("spirv-val");
-    }
-}
-
-#[test]
 fn native_select_fed_pointer_induction_is_constructed_in_the_index_domain() {
     let ll = r#"
 define void @select_fed_pointer_induction(ptr addrspace(1) noundef writeonly "air-buffer-no-alias" %out, ptr addrspace(1) noundef readonly "air-buffer-no-alias" %src, <3 x i32> %gid) local_unnamed_addr #0 {
@@ -12149,7 +11572,7 @@ fn native_uchar3_struct_preserves_authoritative_air_offsets() {
             .sidecar
             .air_struct_offsets
             .values()
-            .any(|offsets| offsets == &[0, 1, 2, 3, 4, 8, 9, 10]),
+            .any(|offsets| offsets == &[0, 1, 2, 3, 4, 8, 9]),
         "{:?}",
         emitted.sidecar.air_struct_offsets
     );
@@ -12379,179 +11802,6 @@ fn native_opaque_struct_member_keeps_the_declared_offsets() {
     );
 }
 
-/// `re::BreakthroughPlanarInstanceData`, reduced: a `char` at 180 and a `ushort` at 182 leave one
-/// byte of hole, and LLVM spells that hole as a bare `i8` rather than a `[1 x i8]`. Eighteen corpus
-/// modules carry this struct and every one of them reported the whole buffer as a shape mismatch.
-const BARE_BYTE_PAD_LL: &str = r#"
-target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-n8:16:32"
-target triple = "air64-apple-macosx10.15.0"
-
-%struct.Inst = type <{ float, i8, i8, i16 }>
-
-define void @k(ptr addrspace(2) noalias readonly dereferenceable(8) %inst, ptr addrspace(1) %out) {
-entry:
-  %p = getelementptr inbounds %struct.Inst, ptr addrspace(2) %inst, i64 0, i32 3
-  %v = load i16, ptr addrspace(2) %p, align 2
-  %w = zext i16 %v to i32
-  store i32 %w, ptr addrspace(1) %out, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.struct_type_info", !5, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Inst", !"air.arg_name", !"inst"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
-!5 = !{i32 0, i32 4, i32 0, !"float", !"width", i32 4, i32 1, i32 0, !"char", !"cullMode", i32 6, i32 2, i32 0, !"ushort", !"clippingOffset"}
-"#;
-
-/// `resize_nearest2x2_forward`, reduced: the kernel hands `&params.division` -- a member at byte
-/// 8 of a `constant` buffer -- to a two-block helper, which is too much control flow for the
-/// ordinary leaf inliner, so the helper is emitted as its own function and the argument is the
-/// Private placeholder that stands in for a raw member pointer.
-const CONSTANT_MEMBER_HELPER_LL: &str = r#"
-target datalayout = "e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-n8:16:32"
-target triple = "air64-apple-macosx10.15.0"
-
-%struct.Division = type { i32, i32 }
-%struct.Params = type { i32, i32, %struct.Division }
-
-define void @k(ptr addrspace(2) noalias readonly dereferenceable(16) %params, ptr addrspace(1) %out) {
-entry:
-  %division = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 2
-  %quotient = tail call fastcc i32 @divide(ptr addrspace(2) %division)
-  store i32 %quotient, ptr addrspace(1) %out, align 4
-  ret void
-}
-
-define internal fastcc i32 @divide(ptr addrspace(2) readonly %p) {
-entry:
-  %shift.ptr = getelementptr inbounds %struct.Division, ptr addrspace(2) %p, i64 0, i32 1
-  %shift = load i32, ptr addrspace(2) %shift.ptr, align 4
-  %positive = icmp sgt i32 %shift, 0
-  br i1 %positive, label %shifted, label %plain
-
-shifted:
-  %shifted.value = shl i32 1, %shift
-  br label %join
-
-plain:
-  %divisor.ptr = getelementptr inbounds %struct.Division, ptr addrspace(2) %p, i64 0, i32 0
-  %divisor = load i32, ptr addrspace(2) %divisor.ptr, align 4
-  br label %join
-
-join:
-  %result = phi i32 [ %shifted.value, %shifted ], [ %divisor, %plain ]
-  ret i32 %result
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint*", !"air.arg_name", !"out"}
-"#;
-
-#[test]
-fn native_constant_member_pointer_reaches_a_helper_as_a_cursor() {
-    let kern = meta::parse_air_kernel_meta(CONSTANT_MEMBER_HELPER_LL);
-    let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
-        CONSTANT_MEMBER_HELPER_LL,
-        kern.as_ref(),
-        Some("k"),
-        kern.as_ref().map(|meta| &meta.buffer_layouts),
-    )
-    .expect("emit the constant-member helper call");
-    let bytes = passes::transform(
-        emitted.module,
-        Stage::Kernel,
-        None,
-        None,
-        kern.as_ref(),
-        Some("k"),
-    )
-    .expect("interface transform")
-    .assemble()
-    .iter()
-    .flat_map(|word| word.to_le_bytes())
-    .collect::<Vec<_>>();
-    let asm = disassemble(&bytes).expect("disassemble");
-
-    let nulls = asm
-        .lines()
-        .filter_map(|line| {
-            line.split_once(" = OpConstantNull ")
-                .map(|(result, _)| result.trim().to_string())
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        !asm.lines().any(|line| {
-            nulls
-                .iter()
-                .any(|null| line.contains(" = OpCopyObject ") && line.trim_end().ends_with(null))
-        }),
-        "the helper's reads must reach the constant buffer, not a null placeholder:\n{asm}"
-    );
-
-    // Both helper reads must be access chains into the params descriptor at the words the member
-    // pointer selects: byte 8 (`divisor`) is word 2 and byte 12 (`shift`) is word 3.
-    let constants = asm
-        .lines()
-        .filter_map(|line| {
-            let (result, rest) = line.split_once(" = OpConstant ")?;
-            let value = rest.split_whitespace().nth(1)?.parse::<u32>().ok()?;
-            Some((value, result.trim().to_string()))
-        })
-        .collect::<HashMap<_, _>>();
-    let params = asm
-        .lines()
-        .find(|line| line.contains("Binding 0"))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .expect("params binding")
-        .to_string();
-    for word in [2u32, 3] {
-        let index = constants.get(&word).expect("word index constant");
-        assert!(
-            asm.lines().any(|line| {
-                line.contains("AccessChain")
-                    && line.contains(&params)
-                    && line.trim_end().ends_with(index)
-            }),
-            "no access chain reaches params word {word}:\n{asm}"
-        );
-    }
-}
-
-#[test]
-fn native_single_byte_pad_between_members_keeps_the_declared_offsets() {
-    let kern = meta::parse_air_kernel_meta(BARE_BYTE_PAD_LL);
-    let emitted = crate::native::emit_vulkan_spirv_with_sidecar(
-        BARE_BYTE_PAD_LL,
-        kern.as_ref(),
-        Some("k"),
-        kern.as_ref().map(|meta| &meta.buffer_layouts),
-    )
-    .expect("emit with AIR layout sidecar");
-
-    assert_ne!(
-        emitted.sidecar.air_struct_layout_mappings[0].status,
-        crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedShapeMismatch,
-        "the bare i8 at offset 5 is the hole between `char` at 4 and `ushort` at 6, not a member \
-         AIR failed to declare"
-    );
-    assert!(
-        emitted
-            .sidecar
-            .air_struct_offsets
-            .values()
-            .any(|offsets| offsets == &[0, 4, 5, 6]),
-        "{:?}",
-        emitted.sidecar.air_struct_offsets
-    );
-}
-
 #[test]
 fn native_opaque_struct_member_of_the_wrong_size_is_still_a_mismatch() {
     // Size is the only claim an unmodelled member makes, so it is the only claim that can fail --
@@ -12647,1326 +11897,5 @@ fn native_typed_buffer_with_wrong_member_shapes_stays_a_mismatch() {
     assert_eq!(
         emitted.sidecar.air_struct_layout_mappings[0].status,
         crate::emit_sidecar::AirStructLayoutMappingStatus::EmittedShapeMismatch
-    );
-}
-
-#[test]
-fn native_raw_struct_member_offsets_match_the_declared_air_layout() {
-    // Metal spells a constant-buffer struct PACKED, with the padding between members written out as
-    // explicit `[N x i8]` arrays. Tight packing is therefore the layout, and an array's alignment is
-    // its element's -- an `[11 x i8]` pad declared at offset 5 must stay at 5. Floor array alignment
-    // at four instead and the pad moves to 8, the 16-aligned member behind it moves from 16 to 32,
-    // and the trailing `float` this kernel reads moves from 208 to 224: the wrong four bytes, and
-    // past the whole 224-byte object `air.buffer_size` declares. Handing the inner array to a helper
-    // is what puts this buffer on the byte-addressed path, where the layout rule under test decides
-    // the offsets; the reflected footprint is where the answer is observable.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-%struct.Params = type <{ i32, i8, [11 x i8], [12 x <4 x float>], float, [12 x i8] }>
-
-define void @k(ptr addrspace(1) %out, ptr addrspace(2) %params) {
-entry:
-  %arr = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 3
-  %m = call fastcc float @sum(ptr addrspace(2) %arr)
-  %tail = getelementptr inbounds %struct.Params, ptr addrspace(2) %params, i64 0, i32 4
-  %value = load float, ptr addrspace(2) %tail, align 4
-  %r = fadd float %value, %m
-  store float %r, ptr addrspace(1) %out, align 4
-  ret void
-}
-
-define internal fastcc float @sum(ptr addrspace(2) %p) {
-entry:
-  %g = getelementptr inbounds [12 x <4 x float>], ptr addrspace(2) %p, i64 0, i64 1, i64 2
-  %v = load float, ptr addrspace(2) %g, align 4
-  ret float %v
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
-!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 224, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 224, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_raw_struct_member_offsets_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let (_spv, reflection) = crate::translate_sanitized_native_reflected(
-        ll,
-        crate::passes::Stage::Kernel,
-        &tmp,
-        crate::passes::TransformOptions::default(),
-    )
-    .expect("translate declared-offset struct");
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    let params = reflection
-        .binding_at(crate::reflect::ResourceKind::Buffer, 1)
-        .expect("params binding");
-    assert_eq!(
-        params.extent,
-        Some(crate::reflect::BufferExtent::Object { bytes: 224 }),
-        "AIR declares one 224-byte object"
-    );
-    let footprint = params.footprint.as_ref().expect("params footprint");
-    assert!(
-        !footprint.has_unbounded_access,
-        "every access has a constant offset: {footprint:?}"
-    );
-    assert_eq!(
-        footprint.static_ranges,
-        vec![
-            // The helper's `[12 x <4 x float>][1][2]`: 16 for the pad-terminated member start,
-            // 16 for the element, 8 for the lane -- which only reaches the buffer at all if the
-            // aggregate-member pointer carries its byte cursor into the inlined helper.
-            crate::reflect::BufferByteRange {
-                offset: 40,
-                size: 4
-            },
-            // And the tail float behind an unpadded `[11 x i8]`, inside the declared object.
-            crate::reflect::BufferByteRange {
-                offset: 208,
-                size: 4
-            },
-        ],
-        "both reads land where AIR's own offsets put them"
-    );
-}
-
-#[test]
-fn native_constant_buffer_member_pointer_survives_helper_inlining() {
-    // A pointer to an aggregate MEMBER of a buffer has a Private placeholder for its ordinary SSA
-    // value; its real descriptor root and byte offset live in the raw cursor beside it. Inlining a
-    // helper that takes such a pointer must carry that cursor onto the helper's parameter, or every
-    // load the helper does reads the placeholder and folds to zero -- silently, with a module that
-    // still validates. Metal's `constant` address space is as descriptor-backed as `device` is, and
-    // being read-only it cannot even turn a helper write into a Private one.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-%struct.P = type <{ i32, [12 x i8], [4 x <4 x float>] }>
-
-define void @k(ptr addrspace(1) %out, ptr addrspace(2) %params) {
-entry:
-  %c = getelementptr inbounds %struct.P, ptr addrspace(2) %params, i64 0, i32 0
-  %n = load i32, ptr addrspace(2) %c, align 4
-  %m = getelementptr inbounds %struct.P, ptr addrspace(2) %params, i64 0, i32 2
-  %v = call fastcc float @lane(ptr addrspace(2) %m)
-  %w = uitofp i32 %n to float
-  %r = fadd float %v, %w
-  store float %r, ptr addrspace(1) %out, align 4
-  ret void
-}
-
-define internal fastcc float @lane(ptr addrspace(2) %p) {
-entry:
-  %g = getelementptr inbounds [4 x <4 x float>], ptr addrspace(2) %p, i64 0, i64 2, i64 1
-  %v = load float, ptr addrspace(2) %g, align 4
-  ret float %v
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
-!4 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 80, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 80, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"P", !"air.arg_name", !"params"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_constant_member_helper_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let (spv, reflection) = crate::translate_sanitized_native_reflected(
-        ll,
-        crate::passes::Stage::Kernel,
-        &tmp,
-        crate::passes::TransformOptions::default(),
-    )
-    .expect("translate constant member pointer");
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    let footprint = reflection
-        .binding_at(crate::reflect::ResourceKind::Buffer, 1)
-        .and_then(|binding| binding.footprint.as_ref())
-        .expect("params footprint");
-    assert_eq!(
-        footprint.static_ranges,
-        vec![
-            crate::reflect::BufferByteRange { offset: 0, size: 4 },
-            crate::reflect::BufferByteRange {
-                offset: 52,
-                size: 4
-            },
-        ],
-        "the helper reads matrix column 2 lane 1 through the descriptor, not a zero placeholder"
-    );
-
-    // And the value the entry stores really is that load: no OpConstantNull reaches it.
-    let module = crate::spirv_module::load_bytes(&spv).expect("load spv");
-    let nulls = module
-        .types_global_values
-        .iter()
-        .filter(|instruction| instruction.class.opcode == Op::ConstantNull)
-        .filter_map(|instruction| instruction.result_id)
-        .collect::<HashSet<_>>();
-    for function in &module.functions {
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                assert!(
-                    !instruction
-                        .operands
-                        .iter()
-                        .any(|operand| matches!(operand, Operand::IdRef(id) if nulls.contains(id))),
-                    "no executable instruction consumes a null placeholder: {instruction:?}"
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn native_packed_half3_member_does_not_fabricate_an_overlap() {
-    // `LineState` declares `packed_half3 colorVelocity` at 16 and `half widthMultiplier` at 22 --
-    // six bytes then two, adjacent and non-overlapping, which is what Metal lays out. Flooring an
-    // array's alignment at four rounded the packed_half3's block up to eight, so it ran to 24 and
-    // swallowed the half at 22. Overlapping members are what push a buffer to the raw word view, so
-    // the fabricated union cost every member its type: the two-byte load became a four-byte read of
-    // the word at 20 with the half shifted out of it. Nothing in AIR describes a union here.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-%struct.LineState = type { <2 x float>, <4 x half>, [3 x half], half, <2 x half> }
-
-define void @k(ptr addrspace(1) %states, ptr addrspace(1) %out) {
-entry:
-  %w = getelementptr inbounds %struct.LineState, ptr addrspace(1) %states, i64 0, i32 3
-  %value = load half, ptr addrspace(1) %w, align 2
-  store half %value, ptr addrspace(1) %out, align 2
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5}
-!3 = !{i32 0, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 32, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"LineState", !"air.arg_name", !"states"}
-!4 = !{i32 0, i32 8, i32 0, !"float2", !"endOffset", i32 8, i32 8, i32 0, !"half4", !"color", i32 16, i32 6, i32 0, !"packed_half3", !"colorVelocity", i32 22, i32 2, i32 0, !"half", !"widthMultiplier", i32 24, i32 4, i32 0, !"half2", !"endVelocity"}
-!5 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 2, !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half*", !"air.arg_name", !"out"}
-"#;
-    let kern = meta::parse_air_kernel_meta(ll);
-    let module = crate::native::ir::LlModule::parse_with_stage_meta(ll, kern.as_ref(), Some("k"))
-        .expect("parse typed IR");
-    assert!(
-        !module.air_metadata_requires_byte_view(
-            kern.as_ref()
-                .and_then(|meta| meta.buffer_layouts.get(&0))
-                .expect("LineState layout")
-        ),
-        "adjacent members are not a union"
-    );
-
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_packed_half3_overlap_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let (_spv, reflection) = crate::translate_sanitized_native_reflected(
-        ll,
-        crate::passes::Stage::Kernel,
-        &tmp,
-        crate::passes::TransformOptions::default(),
-    )
-    .expect("translate adjacent packed_half3 struct");
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    let states = reflection
-        .binding_at(crate::reflect::ResourceKind::Buffer, 0)
-        .expect("states binding");
-    let footprint = states.footprint.as_ref().expect("states footprint");
-    assert_eq!(
-        footprint.static_ranges,
-        vec![crate::reflect::BufferByteRange {
-            offset: 22,
-            size: 2
-        }],
-        "the half is read as a half at 22, not as the word at 20"
-    );
-}
-
-/// A scalar reinterpret-load through a byte view the emitter could not re-type. The device pointer
-/// reaches the helper inside a local struct field, so it is only a Private byte placeholder while
-/// the helper is emitted (`local_pointer_fields` is empty across the function boundary), and both
-/// byte-assembly paths that take a real pointer decline: `emit_private_scalar_load_from_byte_pointer`
-/// wants a root whose pointee is already the scalar, and `emit_scalar_load_from_byte_pointer` cannot
-/// `OpPtrAccessChain` a Private alias. The wider-result assembly in `emit_scalar_slots_to_wider_load`
-/// works off gep provenance instead and has no such restriction, but it used to accept only a VECTOR
-/// result -- so the sibling `<3 x float>` loads of this shape translated and the plain `float` did
-/// not. Ten corpus sources failed on exactly that asymmetry.
-#[test]
-fn a_scalar_float_assembles_from_a_byte_view_the_way_a_vector_does() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%struct.attach = type { ptr addrspace(1) }
-
-define void @k(ptr addrspace(1) %buf, ptr addrspace(1) %out, i32 %n) {
-entry:
-  %slot = alloca %struct.attach, align 8
-  %f = getelementptr inbounds %struct.attach, ptr %slot, i64 0, i32 0
-  store ptr addrspace(1) %buf, ptr %f, align 8
-  call fastcc void @helper(ptr %slot, ptr addrspace(1) %out, i32 %n)
-  ret void
-}
-
-define internal fastcc void @helper(ptr %a, ptr addrspace(1) %out, i32 %n) {
-  %f = getelementptr inbounds %struct.attach, ptr %a, i64 0, i32 0
-  %p = load ptr addrspace(1), ptr %f, align 8
-  %o = sext i32 %n to i64
-  %base = getelementptr inbounds i8, ptr addrspace(1) %p, i64 %o
-  %b = getelementptr inbounds i8, ptr addrspace(1) %base, i64 12
-  %c = bitcast ptr addrspace(1) %b to ptr addrspace(1)
-  %v = load float, ptr addrspace(1) %c, align 4
-  store float %v, ptr addrspace(1) %out, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"char", !"air.arg_name", !"buf"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
-!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"n"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_scalar_byte_view_load_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    let module = load_bytes(&spv).expect("load native spv");
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    // The four bytes come out of the bound storage buffer, not out of the Private placeholder the
-    // helper started from: a Private read would silently return scratch where Metal reads the buffer.
-    let private_pointer_types: HashSet<Word> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| {
-            inst.class.opcode == Op::TypePointer
-                && inst.operands.first() == Some(&Operand::StorageClass(StorageClass::Private))
-        })
-        .filter_map(|inst| inst.result_id)
-        .collect();
-    let loads: Vec<&Instruction> = module
-        .functions
-        .iter()
-        .flat_map(|func| &func.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter(|inst| inst.class.opcode == Op::Load)
-        .collect();
-    assert!(
-        !loads.iter().any(|inst| inst
-            .result_type
-            .is_some_and(|ty| private_pointer_types.contains(&ty))),
-        "no value is loaded out of a Private placeholder"
-    );
-
-    let byte_types: HashSet<Word> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| {
-            inst.class.opcode == Op::TypeInt
-                && inst.operands.first() == Some(&Operand::LiteralBit32(8))
-        })
-        .filter_map(|inst| inst.result_id)
-        .collect();
-    let byte_loads = loads
-        .iter()
-        .filter(|inst| inst.result_type.is_some_and(|ty| byte_types.contains(&ty)))
-        .count();
-    assert!(
-        byte_loads >= 4,
-        "the float is assembled from at least its four bytes, saw {byte_loads}"
-    );
-}
-
-/// The zero-offset member of a local aggregate spelled as `bitcast ptr %a to ptr` rather than as
-/// `getelementptr %S, ptr %a, i64 0, i32 0`. LLVM emits whichever it likes and the two name the same
-/// byte, but only the GEP arrives carrying the field's own pointee, so only the GEP spelling used to
-/// reach the emitter's device-address branch. The bitcast spelling fell through to a Private
-/// placeholder, and no later pass can repair that one: the field store recorded the pointer as its
-/// 64-bit address, and `recover_inlined_local_pointer_fields` declines to forward an integer into a
-/// pointer-typed load. The module was refused with "owned AtomicCompareExchange pointer ... has the
-/// non-atomic storage class Private"; twelve corpus sources failed exactly there.
-///
-/// The integer atomic is over a FLOAT device slot, which is what selects the physical-address model
-/// in the first place. `kernel_device_address_field_atomic` is the same lowering reached through the
-/// GEP spelling, and its authored cases Match on Metal and MoltenVK.
-#[test]
-fn a_device_address_field_reached_by_bitcast_atomics_like_one_reached_by_gep() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%struct.cache = type { ptr addrspace(1), ptr addrspace(1) }
-
-define void @k(ptr addrspace(1) %slots, ptr addrspace(1) %aux, ptr addrspace(1) %out, i32 %gid) {
-entry:
-  %c = alloca %struct.cache, align 8
-  %f0 = getelementptr inbounds %struct.cache, ptr %c, i64 0, i32 0
-  store ptr addrspace(1) %slots, ptr %f0, align 8
-  %f1 = getelementptr inbounds %struct.cache, ptr %c, i64 0, i32 1
-  store ptr addrspace(1) %aux, ptr %f1, align 8
-  %r = call fastcc i32 @helper(ptr %c, i32 %gid)
-  %o = zext i32 %gid to i64
-  %op = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %o
-  store i32 %r, ptr addrspace(1) %op, align 4
-  ret void
-}
-
-define internal fastcc i32 @helper(ptr %a, i32 %i) {
-  %e = alloca i32, align 4
-  %b = bitcast ptr %a to ptr
-  %p = load ptr addrspace(1), ptr %b, align 8
-  store i32 0, ptr %e, align 4
-  %idx = zext i32 %i to i64
-  %slot = getelementptr inbounds float, ptr addrspace(1) %p, i64 %idx
-  %new = add i32 %i, 100
-  %old = call i32 @air.atomic.global.cmpxchg.weak.i32(ptr addrspace(1) %slot, ptr %e, i32 %new, i32 0, i32 0, i32 2, i1 true)
-  ret i32 %old
-}
-
-declare i32 @air.atomic.global.cmpxchg.weak.i32(ptr addrspace(1), ptr, i32, i32, i32, i32, i1)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5, !6}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"slots"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"aux"}
-!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
-!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_bitcast_field_atomic_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    let module = load_bytes(&spv).expect("load native spv");
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    let pointer_storage: HashMap<Word, StorageClass> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypePointer)
-        .filter_map(|inst| match (inst.result_id, inst.operands.first()) {
-            (Some(id), Some(Operand::StorageClass(storage))) => Some((id, *storage)),
-            _ => None,
-        })
-        .collect();
-    let value_types: HashMap<Word, Word> = module
-        .functions
-        .iter()
-        .flat_map(|func| &func.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
-        .collect();
-
-    let atomics: Vec<&Instruction> = module
-        .functions
-        .iter()
-        .flat_map(|func| &func.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter(|inst| inst.class.opcode == Op::AtomicCompareExchange)
-        .collect();
-    assert_eq!(atomics.len(), 1, "one compare-exchange survives");
-    let Some(Operand::IdRef(pointer)) = atomics[0].operands.first() else {
-        panic!("compare-exchange has no pointer operand");
-    };
-    let storage = value_types
-        .get(pointer)
-        .and_then(|ty| pointer_storage.get(ty))
-        .copied();
-    assert_eq!(
-        storage,
-        Some(StorageClass::PhysicalStorageBuffer),
-        "the atomic runs on the device address the field held, not on a Private placeholder"
-    );
-}
-
-/// A pointer merge whose two arms are DIFFERENTLY declared device buffers, where one arm is spelled
-/// as `bitcast ptr %p to ptr` rather than as the parameter itself. The merged GEP's element type is
-/// the only statement of what the merge's index means, and the select-arm walk in
-/// `infer_pointer_pointees` used to stop at the identity bitcast — so only the un-aliased arm was
-/// typed from the GEP and the aliased arm kept its `air.arg_type_name` width. The two arms then read
-/// the same index through element types of different widths: one lane's worth of bytes apart.
-///
-/// `kernel_merge_buffers_of_two_element_widths` is the authored case for the same lowering; before
-/// this it returned 3909091331 where Metal returns 1001, and it Matches on Metal and MoltenVK now.
-#[test]
-fn both_arms_of_a_merge_take_the_element_type_the_merged_gep_names() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @k(ptr addrspace(1) %bytes, ptr addrspace(1) %words, ptr addrspace(1) %out, i32 %gid) {
-entry:
-  %c = icmp eq i32 %gid, 0
-  %alias = bitcast ptr addrspace(1) %bytes to ptr addrspace(1)
-  %sel = select i1 %c, ptr addrspace(1) %alias, ptr addrspace(1) %words
-  %i = zext i32 %gid to i64
-  %p = getelementptr inbounds i32, ptr addrspace(1) %sel, i64 %i
-  %v = load i32, ptr addrspace(1) %p, align 4
-  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
-  store i32 %v, ptr addrspace(1) %o, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5, !6}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"bytes"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"words"}
-!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
-!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_merge_arm_element_type_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    let module = load_bytes(&spv).expect("load native spv");
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    // Every StorageBuffer runtime array is a 32-bit array: the `uchar`-declared arm took the merged
-    // GEP's element type like its sibling did, so neither arm needs a byte view.
-    let int_widths: HashMap<Word, u32> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypeInt)
-        .filter_map(|inst| match inst.operands.first() {
-            Some(&Operand::LiteralBit32(bits)) => Some((inst.result_id?, bits)),
-            _ => None,
-        })
-        .collect();
-    let runtime_array_widths: Vec<u32> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypeRuntimeArray)
-        .filter_map(|inst| match inst.operands.first() {
-            Some(&Operand::IdRef(elem)) => int_widths.get(&elem).copied(),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        !runtime_array_widths.is_empty() && runtime_array_widths.iter().all(|&bits| bits == 32),
-        "both merged arms are 32-bit runtime arrays, saw {runtime_array_widths:?}"
-    );
-
-    // One load per arm at the SAME index, selected in the value domain -- not a byte reassembly.
-    let body: Vec<&Instruction> = module
-        .functions
-        .iter()
-        .flat_map(|func| &func.blocks)
-        .flat_map(|block| &block.instructions)
-        .collect();
-    let index_of = |id: Word| -> Option<Word> {
-        body.iter()
-            .find(|inst| inst.result_id == Some(id))
-            .filter(|inst| matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain))
-            .and_then(|inst| match inst.operands.last() {
-                Some(&Operand::IdRef(index)) => Some(index),
-                _ => None,
-            })
-    };
-    let selects: Vec<&&Instruction> = body
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::Select)
-        .filter(|inst| inst.result_type.and_then(|ty| int_widths.get(&ty)) == Some(&32))
-        .collect();
-    assert_eq!(selects.len(), 1, "the merge is one value-domain select");
-    let arm_indices: Vec<Option<Word>> = selects[0].operands[1..]
-        .iter()
-        .filter_map(|operand| match operand {
-            Operand::IdRef(id) => Some(*id),
-            _ => None,
-        })
-        .map(|id| {
-            body.iter()
-                .find(|inst| inst.result_id == Some(id))
-                .filter(|inst| inst.class.opcode == Op::Load)
-                .and_then(|inst| match inst.operands.first() {
-                    Some(&Operand::IdRef(ptr)) => index_of(ptr),
-                    _ => None,
-                })
-        })
-        .collect();
-    assert!(
-        arm_indices[0].is_some() && arm_indices[0] == arm_indices[1],
-        "both arms load at the same index, saw {arm_indices:?}"
-    );
-}
-
-/// The result side of the same alias: `bitcast ptr %sel to ptr` on a pointer MERGE.
-///
-/// A merge is deferred into the `selected_pointers` side table and never materialized as a plain
-/// SPIR-V pointer, because Logical addressing cannot select between two descriptors. The identity
-/// bitcast the frontend spells a device-pointer cast with therefore has nothing to take the id of,
-/// and before the alias learned to carry the merge it fell through to `value_id(%sel)` and failed
-/// the whole translation with "native emitter: unknown SSA value %sel" -- a legal Metal program
-/// refused with an internal message. Its siblings `selected_access_trees`, `selected_load_pointers`
-/// and `raw_offsets` were each already carried; this one arm was missing.
-#[test]
-fn an_identity_bitcast_of_a_pointer_merge_keeps_the_merge() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @k(ptr addrspace(1) %a, ptr addrspace(1) %b, ptr addrspace(1) %out, i32 %gid) {
-entry:
-  %c = icmp eq i32 %gid, 0
-  %sel = select i1 %c, ptr addrspace(1) %a, ptr addrspace(1) %b
-  %alias = bitcast ptr addrspace(1) %sel to ptr addrspace(1)
-  %i = zext i32 %gid to i64
-  %p = getelementptr inbounds i32, ptr addrspace(1) %alias, i64 %i
-  %v = load i32, ptr addrspace(1) %p, align 4
-  %o = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %i
-  store i32 %v, ptr addrspace(1) %o, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5, !6}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"a"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"b"}
-!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 2, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
-!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"gid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_merge_alias_bitcast_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    let module = load_bytes(&spv).expect("load native spv");
-    let _ = std::fs::remove_dir_all(&tmp);
-
-    let body: Vec<&Instruction> = module
-        .functions
-        .iter()
-        .flat_map(|func| &func.blocks)
-        .flat_map(|block| &block.instructions)
-        .collect();
-
-    // The merge survives the alias as a value-domain select between one load per arm, each rooted
-    // in its OWN descriptor variable -- not as a pointer select, which Logical SPIR-V forbids.
-    let pointer_types: HashSet<Word> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypePointer)
-        .filter_map(|inst| inst.result_id)
-        .collect();
-    assert!(
-        !body.iter().any(|inst| inst.class.opcode == Op::Select
-            && inst
-                .result_type
-                .is_some_and(|ty| pointer_types.contains(&ty))),
-        "no pointer select survives"
-    );
-    let root_of = |mut id: Word| -> Option<Word> {
-        loop {
-            let def = body.iter().find(|inst| inst.result_id == Some(id));
-            match def {
-                Some(inst)
-                    if matches!(
-                        inst.class.opcode,
-                        Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain
-                    ) =>
-                {
-                    match inst.operands.first() {
-                        Some(&Operand::IdRef(base)) => id = base,
-                        _ => return None,
-                    }
-                }
-                _ => return Some(id),
-            }
-        }
-    };
-    let selects: Vec<&&Instruction> = body
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::Select)
-        .collect();
-    assert_eq!(selects.len(), 1, "the merge is one value-domain select");
-    let arm_roots: Vec<Option<Word>> = selects[0].operands[1..]
-        .iter()
-        .filter_map(|operand| match operand {
-            Operand::IdRef(id) => Some(*id),
-            _ => None,
-        })
-        .map(|id| {
-            body.iter()
-                .find(|inst| inst.result_id == Some(id))
-                .filter(|inst| inst.class.opcode == Op::Load)
-                .and_then(|inst| match inst.operands.first() {
-                    Some(&Operand::IdRef(ptr)) => root_of(ptr),
-                    _ => None,
-                })
-        })
-        .collect();
-    assert!(
-        arm_roots.iter().all(Option::is_some) && arm_roots[0] != arm_roots[1],
-        "each arm loads from its own descriptor root, saw {arm_roots:?}"
-    );
-}
-
-/// A loop-carried device-address phi whose backedge arm GEPs off a pointer LOADED inside the loop.
-///
-/// The header phi is emitted before the body, so the arm is a forward reference and
-/// `bda_phi_address_id` has to RESERVE the loaded pointer's address. It reserved the wrong id: the
-/// load's own SSA result, which the ordinary pointer lowering defines as something that is not an
-/// address at all -- in the corpus a 32-bit word index and a nullness bool, here a
-/// `TypePointer StorageBuffer` -- and then fed it to an `OpIAdd` typed `ulong`. The address of a
-/// loaded device pointer is `bda_address_name(name)`, the id `emit_load_resolved` loads the eight
-/// address bytes into; the pointer's own result id is deliberately left undefined there.
-///
-/// Reach: 2 of the 14,579 corpus sources go ERROR -> OK (`ac13158c948a80db`, `18e8916b5c851a42`,
-/// both BVH traversal kernels), with no other status or reflection change.
-#[test]
-fn native_loop_carried_device_address_phi_reserves_the_loaded_address() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @k(ptr addrspace(1) %out, ptr addrspace(1) %root, i32 %tid) {
-entry:
-  %slot = zext i32 %tid to i64
-  br label %loop
-
-loop:
-  %cur = phi ptr addrspace(1) [ %root, %entry ], [ %next, %body ]
-  %i = phi i32 [ 0, %entry ], [ %i1, %body ]
-  %done = icmp sge i32 %i, 4
-  br i1 %done, label %exit, label %body
-
-body:
-  %child = load ptr addrspace(1), ptr addrspace(1) %cur, align 8
-  %next = getelementptr inbounds i32, ptr addrspace(1) %child, i64 2
-  %i1 = add i32 %i, 1
-  br label %loop
-
-exit:
-  %v = load i32, ptr addrspace(1) %cur, align 4
-  %op = getelementptr inbounds i32, ptr addrspace(1) %out, i64 %slot
-  store i32 %v, ptr addrspace(1) %op, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"uint*", !"air.arg_name", !"root"}
-!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_loop_carried_device_address_phi_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-
-    // Result type and operand ids of every defining instruction, keyed by result id, plus the
-    // declaration of every type id (our disassembler prints type OPERANDS as ids, not names).
-    let mut defs: HashMap<String, (String, String, Vec<String>)> = HashMap::new();
-    let mut type_decl: HashMap<String, String> = HashMap::new();
-    for line in asm.lines() {
-        let words: Vec<&str> = line.split_whitespace().collect();
-        let [result, "=", opcode, rest @ ..] = words.as_slice() else {
-            continue;
-        };
-        if opcode.starts_with("OpType") {
-            type_decl.insert(result.to_string(), format!("{opcode} {}", rest.join(" ")));
-            continue;
-        }
-        let [ty, operands @ ..] = rest else {
-            continue;
-        };
-        let operands = operands
-            .iter()
-            .filter(|word| word.starts_with('%'))
-            .map(|word| word.to_string())
-            .collect();
-        defs.insert(
-            result.to_string(),
-            (opcode.to_string(), ty.to_string(), operands),
-        );
-    }
-    let address_type = type_decl
-        .iter()
-        .find(|(_, decl)| decl.as_str() == "OpTypeInt 64 0")
-        .map(|(id, _)| id.clone())
-        .expect("a 64-bit integer type");
-
-    // The loop-carried address is a 64-bit phi with two incoming values; the entry arm is the
-    // buffer root and the backedge arm is the offset child address.
-    let backedge = defs
-        .values()
-        .find(|(opcode, ty, operands)| {
-            opcode == "OpPhi" && *ty == address_type && operands.len() == 4
-        })
-        .map(|(_, _, operands)| operands[2].clone())
-        .expect("a 64-bit loop-carried address phi");
-
-    // Everything the backedge address is built from must itself be address-typed arithmetic
-    // bottoming out in the 64-bit load of the child address. A 32-bit word, a bool, or a pointer id
-    // reaching this cone is the bug.
-    let mut pending = vec![backedge];
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut loaded_address = false;
-    while let Some(id) = pending.pop() {
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        let Some((opcode, ty, operands)) = defs.get(&id) else {
-            continue; // a constant, a type, or a label
-        };
-        let declared = type_decl.get(ty).cloned().unwrap_or_default();
-        assert!(
-            !declared.starts_with("OpTypePointer") && declared != "OpTypeBool",
-            "the loop-carried address cone reached {id} = {opcode} typed {declared}, \
-             which is not an address"
-        );
-        if opcode == "OpLoad" {
-            assert_eq!(
-                declared, "OpTypeInt 64 0",
-                "the child address must be loaded 64 bits wide, saw {id} = OpLoad {declared}"
-            );
-            loaded_address = true;
-            continue;
-        }
-        if opcode == "OpPhi" {
-            continue;
-        }
-        pending.extend(operands.iter().cloned());
-    }
-    assert!(
-        loaded_address,
-        "the backedge address must derive from a 64-bit load of the child address"
-    );
-}
-
-#[test]
-fn native_pointee_typed_reinterpret_cast_takes_the_byte_view_path() {
-    // `(device ushort *)((device uchar *)a + 4)` off a `device uint *`. The Metal frontend spells
-    // the two reinterprets as pointee-typed bitcasts, and reading them as non-identities kept the
-    // module off the byte-view path: the ushort GEP inherited the BASE's uint stride, so
-    // `shorts[g]` addressed byte 4 + 4*g instead of 4 + 2*g and loaded four bytes where two were
-    // meant. Both spellings of one kernel have to translate to one module.
-    let typed = r#"
-source_filename = "case.metal"
-
-define void @k(i32 addrspace(1)* nocapture readonly "air-buffer-no-alias" %0, i32 addrspace(1)* nocapture writeonly "air-buffer-no-alias" %1, i32 %2) {
-  %4 = bitcast i32 addrspace(1)* %0 to i8 addrspace(1)*
-  %5 = getelementptr inbounds i32, i32 addrspace(1)* %0, i64 1
-  %6 = bitcast i32 addrspace(1)* %5 to i16 addrspace(1)*
-  %7 = zext i32 %2 to i64
-  %8 = getelementptr inbounds i8, i8 addrspace(1)* %4, i64 %7
-  %9 = load i8, i8 addrspace(1)* %8, align 1
-  %10 = zext i8 %9 to i32
-  %11 = getelementptr inbounds i16, i16 addrspace(1)* %6, i64 %7
-  %12 = load i16, i16 addrspace(1)* %11, align 2
-  %13 = zext i16 %12 to i32
-  %14 = add nuw nsw i32 %13, %10
-  %15 = getelementptr inbounds i32, i32 addrspace(1)* %1, i64 %7
-  store i32 %14, i32 addrspace(1)* %15, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{void (i32 addrspace(1)*, i32 addrspace(1)*, i32)* @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"a"}
-!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"o"}
-!5 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"g"}
-"#;
-    let opaque = typed
-        .replace("i32 addrspace(1)*", "ptr addrspace(1)")
-        .replace("i8 addrspace(1)*", "ptr addrspace(1)")
-        .replace("i16 addrspace(1)*", "ptr addrspace(1)")
-        .replace("(ptr addrspace(1), ptr addrspace(1), i32)*", "");
-
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_native_pointee_typed_reinterpret_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let from_typed =
-        crate::translate_sanitized_native(typed, Stage::Kernel, &tmp).expect("typed pointers");
-    let from_opaque =
-        crate::translate_sanitized_native(&opaque, Stage::Kernel, &tmp).expect("opaque pointers");
-    assert_eq!(from_typed, from_opaque);
-
-    let asm = disassemble(&from_typed).expect("disassemble");
-    // Both narrow reads are assembled out of the uint the buffer is modelled as: divide the byte
-    // offset by four, load the word, pick the byte or halfword out of it.
-    assert_eq!(asm.matches("OpUDiv").count(), 2, "{asm}");
-    assert_eq!(asm.matches("OpVectorExtractDynamic").count(), 2, "{asm}");
-    // The wrong lowering reached the halfword through the base's uint element stride instead.
-    assert!(!asm.contains("OpPtrAccessChain"), "{asm}");
-    // ... and aliased binding 0 with a second, uchar-typed variable on the same slot.
-    assert_eq!(asm.matches("Binding 0").count(), 1, "{asm}");
-}
-
-#[test]
-fn a_constant_space_pointer_loaded_from_a_buffer_is_a_device_address() {
-    // Metal's `constant` space is a read-only DEVICE allocation, not a separate physical space, so
-    // a `constant int*` stored in a buffer is the same 64-bit GPU address a `device int*` is. The
-    // load path admitted only `addrspace(1)` results as addresses, so a constant-space nested
-    // pointer stayed on its `Private` zero placeholder and every read through it folded to a
-    // constant zero -- here, the index the shader then writes with.
-    let ll = r#"
-%struct.inputs = type { ptr addrspace(1), ptr addrspace(2) }
-
-define void @constant_nested_pointer(ptr addrspace(1) readonly align 8 captures(none) "air-buffer-no-alias" %0, i32 %1) {
-entry:
-  %2 = getelementptr inbounds %struct.inputs, ptr addrspace(1) %0, i64 0, i32 1
-  %3 = load ptr addrspace(2), ptr addrspace(1) %2, align 8
-  %4 = zext i32 %1 to i64
-  %5 = getelementptr inbounds i32, ptr addrspace(2) %3, i64 %4
-  %6 = load i32, ptr addrspace(2) %5, align 4
-  %7 = getelementptr inbounds %struct.inputs, ptr addrspace(1) %0, i64 0, i32 0
-  %8 = load ptr addrspace(1), ptr addrspace(1) %7, align 8
-  %9 = zext i32 %6 to i64
-  %10 = getelementptr inbounds i32, ptr addrspace(1) %8, i64 %9
-  store i32 %6, ptr addrspace(1) %10, align 4
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @constant_nested_pointer, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"inputs", !"air.arg_name", !"in"}
-!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
-"#;
-    let spv = emit_vulkan_spirv(ll).expect("the nested-pointer module must emit");
-    let module = load_bytes(&spv).expect("load spv");
-    let pointer_storage = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypePointer)
-        .filter_map(|inst| match inst.operands.first() {
-            Some(Operand::StorageClass(class)) => Some((inst.result_id?, *class)),
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    let value_types = module
-        .all_inst_iter()
-        .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
-        .collect::<HashMap<_, _>>();
-    let physical_loads = module
-        .all_inst_iter()
-        .filter(|inst| inst.class.opcode == Op::Load)
-        .filter(|inst| match inst.operands.first() {
-            Some(Operand::IdRef(pointer)) => {
-                value_types
-                    .get(pointer)
-                    .and_then(|ty| pointer_storage.get(ty))
-                    == Some(&StorageClass::PhysicalStorageBuffer)
-            }
-            _ => false,
-        })
-        .count();
-    assert!(
-        physical_loads > 0,
-        "the read through the constant-space pointer must be an address load"
-    );
-    // The tell that it was not one: the folded zero. Every `OpConstantNull` the old lowering left
-    // behind was consumed as the loaded value, so no function may reference one at all here.
-    let nulls = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::ConstantNull)
-        .filter_map(|inst| inst.result_id)
-        .collect::<HashSet<_>>();
-    for function in &module.functions {
-        for inst in function.all_inst_iter() {
-            for operand in &inst.operands {
-                if let Operand::IdRef(id) = operand {
-                    assert!(
-                        !nulls.contains(id),
-                        "a null stands in for the value the shader read: {inst:?}"
-                    );
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn a_byte_blob_memcpy_between_a_cursor_and_a_local_reaches_the_buffer() {
-    // The staging-blob shape: `[12 x i8]` local, an `llvm.memcpy` from a device struct field into
-    // it and another back out. Both pointers name ONE `i8` -- the copy spans more than either
-    // pointer's object -- so both whole-object decompositions declined and the call fell through to
-    // `drop_unmodeled_memcpy`, which discards it. Neither copy happened: valid SPIR-V, `spirv-val`
-    // PASS, and a device buffer Metal reads and rewrites left untouched.
-    let ll = r#"
-%struct.Row = type { i32, [12 x i8], [12 x i8] }
-
-define void @byte_run_copy(ptr addrspace(1) captures(none) "air-buffer-no-alias" %out, i32 %tid) {
-entry:
-  %blob = alloca [12 x i8], align 4
-  %p = getelementptr inbounds [12 x i8], ptr %blob, i64 0, i64 0
-  %byte = getelementptr inbounds i8, ptr addrspace(1) %out, i64 4
-  %seed = load i8, ptr addrspace(1) %byte, align 1
-  %idx = zext i32 %tid to i64
-  %row = getelementptr inbounds %struct.Row, ptr addrspace(1) %out, i64 %idx
-  %srcp = getelementptr inbounds i8, ptr addrspace(1) %row, i64 4
-  call void @llvm.memcpy.p0.p1.i64(ptr noundef nonnull align 4 %p, ptr addrspace(1) noundef align 4 %srcp, i64 12, i1 false)
-  store i8 %seed, ptr %p, align 4
-  %dstp = getelementptr inbounds i8, ptr addrspace(1) %row, i64 20
-  call void @llvm.memcpy.p1.p0.i64(ptr addrspace(1) noundef align 4 %dstp, ptr noundef nonnull align 4 %p, i64 12, i1 false)
-  ret void
-}
-
-declare void @llvm.memcpy.p1.p0.i64(ptr addrspace(1) noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg)
-declare void @llvm.memcpy.p0.p1.i64(ptr noalias writeonly captures(none), ptr addrspace(1) noalias readonly captures(none), i64, i1 immarg)
-
-!air.kernel = !{!0}
-!0 = !{ptr @byte_run_copy, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"out"}
-!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
-"#;
-    let spv = emit_vulkan_spirv(ll).expect("the blob-copy module must emit");
-    let module = load_bytes(&spv).expect("load spv");
-    let pointer_storage = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypePointer)
-        .filter_map(|inst| match inst.operands.first() {
-            Some(Operand::StorageClass(class)) => Some((inst.result_id?, *class)),
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    let value_types = module
-        .all_inst_iter()
-        .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
-        .collect::<HashMap<_, _>>();
-    let buffer_class = module
-        .all_inst_iter()
-        .filter(|inst| matches!(inst.class.opcode, Op::Variable | Op::FunctionParameter))
-        .filter_map(|inst| pointer_storage.get(&inst.result_type?).copied())
-        .find(|class| !matches!(class, StorageClass::Private | StorageClass::Function))
-        .expect("the entry declares a descriptor-backed buffer");
-    let mut buffer_stores = 0;
-    let mut local_stores = 0;
-    for inst in module
-        .all_inst_iter()
-        .filter(|inst| inst.class.opcode == Op::Store)
-    {
-        let Some(Operand::IdRef(pointer)) = inst.operands.first() else {
-            continue;
-        };
-        match value_types
-            .get(pointer)
-            .and_then(|ty| pointer_storage.get(ty))
-        {
-            Some(class) if *class == buffer_class => buffer_stores += 1,
-            Some(StorageClass::Function) => local_stores += 1,
-            other => panic!("a copied byte landed in {other:?}"),
-        }
-    }
-    // Twelve bytes out of the buffer and into the local, one seed byte over the top of them, then
-    // the same twelve back as three whole words -- four `i8` lanes are assembled into each, because
-    // a subword store into a device buffer is an atomic read-modify-write loop and this copy does
-    // not need one.
-    assert_eq!(
-        (buffer_stores, local_stores),
-        (3, 13),
-        "both directions of the blob copy must reach their destination"
-    );
-}
-
-#[test]
-fn a_struct_memcpy_through_a_dynamic_cursor_reaches_the_buffer() {
-    // `llvm.memcpy` into a device buffer at a dynamically indexed cursor. The buffer is modeled
-    // RAW, so the destination has no SPIR-V pointer value -- it is a `Private` zero placeholder
-    // with the real root and offset in `raw_offsets`. `emit_typed_to_raw_memcpy` decomposes the
-    // source aggregate into 32-bit words and stores them through the cursor, but it used to
-    // require the words to cover every byte of the copy. A `{ [4 x <3 x float>] }` is 64 bytes of
-    // which only 48 are data: each `<3 x float>` is 16-byte strided, so four words are padding the
-    // walk never produces. The decomposition declined, `emit_typed_memcpy` then copied the whole
-    // object into the placeholder, and the buffer got nothing -- valid SPIR-V, `spirv-val` PASS,
-    // and 64 bytes Metal writes silently missing.
-    let ll = r#"
-%struct.matrix = type { [4 x <3 x float>] }
-
-define void @memcpy_dynamic_cursor(ptr addrspace(1) captures(none) "air-buffer-no-alias" %out, i32 %tid) {
-entry:
-  %local = alloca %struct.matrix, align 16
-  %byte = getelementptr inbounds i8, ptr addrspace(1) %out, i64 4
-  %seed = load i8, ptr addrspace(1) %byte, align 1
-  %f = uitofp i8 %seed to float
-  %v = insertelement <3 x float> <float 1.000000e+00, float 2.000000e+00, float poison>, float %f, i64 2
-  %r0 = getelementptr inbounds %struct.matrix, ptr %local, i64 0, i32 0, i64 0
-  store <3 x float> %v, ptr %r0, align 16
-  %r1 = getelementptr inbounds %struct.matrix, ptr %local, i64 0, i32 0, i64 1
-  store <3 x float> %v, ptr %r1, align 16
-  %r2 = getelementptr inbounds %struct.matrix, ptr %local, i64 0, i32 0, i64 2
-  store <3 x float> %v, ptr %r2, align 16
-  %r3 = getelementptr inbounds %struct.matrix, ptr %local, i64 0, i32 0, i64 3
-  store <3 x float> %v, ptr %r3, align 16
-  %idx = zext i32 %tid to i64
-  %dst = getelementptr inbounds %struct.matrix, ptr addrspace(1) %out, i64 %idx
-  call void @llvm.memcpy.p1.p0.i64(ptr addrspace(1) noundef align 16 %dst, ptr noundef nonnull align 16 %local, i64 64, i1 false)
-  ret void
-}
-
-declare void @llvm.memcpy.p1.p0.i64(ptr addrspace(1) noalias writeonly captures(none), ptr noalias readonly captures(none), i64, i1 immarg)
-
-!air.kernel = !{!0}
-!0 = !{ptr @memcpy_dynamic_cursor, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 64, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"matrix", !"air.arg_name", !"out"}
-!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
-"#;
-    let spv = emit_vulkan_spirv(ll).expect("the memcpy module must emit");
-    let module = load_bytes(&spv).expect("load spv");
-    assert!(
-        !module
-            .all_inst_iter()
-            .any(|inst| inst.class.opcode == Op::CopyMemory),
-        "a whole-object copy has nowhere to land: the destination is a byte cursor"
-    );
-    let pointer_storage = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypePointer)
-        .filter_map(|inst| match inst.operands.first() {
-            Some(Operand::StorageClass(class)) => Some((inst.result_id?, *class)),
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    let value_types = module
-        .all_inst_iter()
-        .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
-        .collect::<HashMap<_, _>>();
-    let buffer_class = module
-        .all_inst_iter()
-        .filter(|inst| matches!(inst.class.opcode, Op::Variable | Op::FunctionParameter))
-        .filter_map(|inst| pointer_storage.get(&inst.result_type?).copied())
-        .find(|class| !matches!(class, StorageClass::Private | StorageClass::Function))
-        .expect("the entry declares a descriptor-backed buffer");
-    let store_classes = module
-        .all_inst_iter()
-        .filter(|inst| inst.class.opcode == Op::Store)
-        .filter_map(|inst| match inst.operands.first() {
-            Some(Operand::IdRef(pointer)) => {
-                pointer_storage.get(value_types.get(pointer)?).copied()
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert!(
-        !store_classes.contains(&StorageClass::Private),
-        "no word of the copy may land in the placeholder that stands in for the cursor"
-    );
-    let buffer_stores = store_classes
-        .iter()
-        .filter(|class| **class == buffer_class)
-        .count();
-    // 48 of the 64 bytes are data: four `<3 x float>` rows, three words each. The remaining four
-    // words are the source layout's inter-member padding, which `llvm.memcpy` of an aggregate
-    // leaves undefined -- and which the shader's own member-by-member stores never write either.
-    assert_eq!(
-        buffer_stores, 12,
-        "every data word of the copy must reach the buffer"
-    );
-}
-
-#[test]
-fn a_dynamic_raw_cursor_reaches_the_buffer_by_splicing_the_call_away() {
-    // A device buffer the emitter models RAW has a `Private` zero placeholder as the ordinary SSA
-    // value of any non-zero GEP of it; the real root and byte offset live in emitter state, not in
-    // a SPIR-V value. `raw_device_call_arg_id` carries that cursor onto a helper parameter only for
-    // a CONSTANT offset -- one cursor per (callee, parameter) is all it can record -- so a
-    // dynamically indexed cursor used to fall through to the placeholder. The emitted-graph inliner
-    // then substituted the placeholder faithfully and all four of the helper's stores landed in a
-    // one-element `Private` scratch variable: a dispatch that writes nothing where Metal writes the
-    // buffer, and valid SPIR-V, so nothing downstream noticed.
-    let ll = r#"
-define void @dyn_cursor_helper(ptr addrspace(1) %out, i32 %tid) {
-entry:
-  %byte = getelementptr inbounds i8, ptr addrspace(1) %out, i64 4
-  %seed = load i32, ptr addrspace(1) %byte, align 4
-  %idx = zext i32 %tid to i64
-  %cursor = getelementptr inbounds <4 x float>, ptr addrspace(1) %out, i64 %idx
-  tail call fastcc void @store_helper(ptr addrspace(1) %cursor, i32 %seed)
-  ret void
-}
-
-define internal fastcc void @store_helper(ptr addrspace(1) %p, i32 %k) {
-entry:
-  %c = icmp ugt i32 %k, 0
-  br i1 %c, label %do, label %done
-
-do:
-  store <4 x float> <float 1.000000e+00, float 2.000000e+00, float 3.000000e+00, float 4.000000e+00>, ptr addrspace(1) %p, align 16
-  br label %done
-
-done:
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @dyn_cursor_helper, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
-!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
-"#;
-    // Emission refuses the call, and the AIR-text retry splices the helper into its caller so
-    // there is no boundary left for the cursor to cross. All four component stores must then land
-    // on the descriptor-backed buffer at the dynamic cursor.
-    let spv = emit_vulkan_spirv(ll).expect("the spliced module must emit");
-    let module = load_bytes(&spv).expect("load spv");
-    assert!(
-        !module
-            .all_inst_iter()
-            .any(|inst| inst.class.opcode == Op::FunctionCall),
-        "the refused call must be spliced away, not emitted"
-    );
-    let pointer_storage = module
-        .types_global_values
-        .iter()
-        .filter(|inst| inst.class.opcode == Op::TypePointer)
-        .filter_map(|inst| match inst.operands.first() {
-            Some(Operand::StorageClass(class)) => Some((inst.result_id?, *class)),
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    let value_types = module
-        .all_inst_iter()
-        .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
-        .collect::<HashMap<_, _>>();
-    let store_classes = module
-        .all_inst_iter()
-        .filter(|inst| inst.class.opcode == Op::Store)
-        .filter_map(|inst| match inst.operands.first() {
-            Some(Operand::IdRef(pointer)) => {
-                Some(pointer_storage.get(value_types.get(pointer)?).copied()?)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    // The native emitter names the descriptor class it built the interface with; interface
-    // construction settles on `StorageBuffer` later. Assert against the entry's own buffer
-    // variable so this reads the same fact from either side of that seam.
-    let buffer_class = module
-        .all_inst_iter()
-        .filter(|inst| matches!(inst.class.opcode, Op::Variable | Op::FunctionParameter))
-        .filter_map(|inst| pointer_storage.get(&inst.result_type?).copied())
-        .find(|class| !matches!(class, StorageClass::Private | StorageClass::Function))
-        .expect("the entry declares a descriptor-backed buffer");
-    assert_eq!(
-        store_classes,
-        vec![buffer_class; 4],
-        "every component of the helper's store must reach the buffer, not Private scratch"
-    );
-
-    // The refusal survives for a call the text inliner cannot remove: an externally linked helper
-    // is not a splice candidate, so there is still no representation that reaches the buffer.
-    let external_helper = ll.replace(
-        "define internal fastcc void @store_helper",
-        "define fastcc void @store_helper",
-    );
-    let error = emit_vulkan_spirv(&external_helper)
-        .expect_err("a cursor into an unspliceable helper must not emit a module");
-    assert!(
-        error.contains("byte cursor cannot cross the call"),
-        "refusal must name the cursor, got: {error}"
-    );
-
-    // The refusal is narrow: the same placeholder handed to a helper that never dereferences it is
-    // not a loss, and that module still emits with its own store reaching the buffer.
-    let unused = r#"
-define void @dyn_cursor_unused(ptr addrspace(1) %out, i32 %tid) {
-entry:
-  %byte = getelementptr inbounds i8, ptr addrspace(1) %out, i64 4
-  %seed = load i32, ptr addrspace(1) %byte, align 4
-  %idx = zext i32 %tid to i64
-  %cursor = getelementptr inbounds <4 x float>, ptr addrspace(1) %out, i64 %idx
-  %flag = tail call fastcc i32 @classify(ptr addrspace(1) %cursor, i32 %seed)
-  %wide = insertelement <4 x i32> undef, i32 %flag, i64 0
-  %bits = bitcast <4 x i32> %wide to <4 x float>
-  store <4 x float> %bits, ptr addrspace(1) %out, align 16
-  ret void
-}
-
-define internal fastcc i32 @classify(ptr addrspace(1) %p, i32 %k) {
-entry:
-  %c = icmp ugt i32 %k, 0
-  br i1 %c, label %yes, label %no
-
-yes:
-  %isnull = icmp eq ptr addrspace(1) %p, null
-  %v = zext i1 %isnull to i32
-  ret i32 %v
-
-no:
-  ret i32 7
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @dyn_cursor_unused, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
-!4 = !{i32 1, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint", !"air.arg_name", !"tid"}
-"#;
-    let spv = emit_vulkan_spirv(unused).expect("an undereferenced placeholder must still emit");
-    let module = load_bytes(&spv).expect("load spv");
-    let private_pointers = module
-        .types_global_values
-        .iter()
-        .filter(|inst| {
-            inst.class.opcode == Op::TypePointer
-                && inst.operands.first() == Some(&Operand::StorageClass(StorageClass::Private))
-        })
-        .filter_map(|inst| inst.result_id)
-        .collect::<HashSet<_>>();
-    let value_types = module
-        .all_inst_iter()
-        .filter_map(|inst| Some((inst.result_id?, inst.result_type?)))
-        .collect::<HashMap<_, _>>();
-    let stores = module
-        .all_inst_iter()
-        .filter(|inst| inst.class.opcode == Op::Store)
-        .filter_map(|inst| match inst.operands.first() {
-            Some(Operand::IdRef(pointer)) => Some(*pointer),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(stores.len(), 4, "the entry's own vector store must survive");
-    assert!(
-        stores.iter().all(|pointer| !value_types
-            .get(pointer)
-            .is_some_and(|ty| private_pointers.contains(ty))),
-        "no store may land in Private scratch when the placeholder is never dereferenced"
     );
 }

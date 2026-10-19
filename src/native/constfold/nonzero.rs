@@ -179,7 +179,7 @@ pub(in crate::native) fn nonzero_self_minus_one_guards(
 
 /// Unsigned comparison kind for [`ucmp_fold`].
 #[derive(Clone, Copy)]
-pub(in crate::native) enum Cmp {
+pub(in crate::native) enum UCmp {
     Lt,
     Gt,
     Le,
@@ -191,13 +191,13 @@ pub(in crate::native) enum Cmp {
 /// of the other (even Bottom): `x < 0` and `0 > x` are always false; `0 <= x` and `x >= 0` are always
 /// true. Values are interpreted unsigned (widths <= 64; the lattice stores width-masked non-negative
 /// integers).
-pub(in crate::native) fn ucmp_fold(x: Option<Lat>, y: Option<Lat>, kind: Cmp) -> Option<Lat> {
+pub(in crate::native) fn ucmp_fold(x: Option<Lat>, y: Option<Lat>, kind: UCmp) -> Option<Lat> {
     let is_zero = |v: Option<Lat>| matches!(v, Some(Lat::Const(0)));
     match kind {
-        Cmp::Lt if is_zero(y) => return Some(Lat::Const(0)), // x < 0 = false
-        Cmp::Gt if is_zero(x) => return Some(Lat::Const(0)), // 0 > y = false
-        Cmp::Le if is_zero(x) => return Some(Lat::Const(1)), // 0 <= y = true
-        Cmp::Ge if is_zero(y) => return Some(Lat::Const(1)), // x >= 0 = true
+        UCmp::Lt if is_zero(y) => return Some(Lat::Const(0)), // x < 0 = false
+        UCmp::Gt if is_zero(x) => return Some(Lat::Const(0)), // 0 > y = false
+        UCmp::Le if is_zero(x) => return Some(Lat::Const(1)), // 0 <= y = true
+        UCmp::Ge if is_zero(y) => return Some(Lat::Const(1)), // x >= 0 = true
         _ => {}
     }
     match (x, y) {
@@ -205,10 +205,10 @@ pub(in crate::native) fn ucmp_fold(x: Option<Lat>, y: Option<Lat>, kind: Cmp) ->
         (Some(Lat::Const(a)), Some(Lat::Const(b))) => {
             let (a, b) = (a as u128, b as u128);
             let r = match kind {
-                Cmp::Lt => a < b,
-                Cmp::Gt => a > b,
-                Cmp::Le => a <= b,
-                Cmp::Ge => a >= b,
+                UCmp::Lt => a < b,
+                UCmp::Gt => a > b,
+                UCmp::Le => a <= b,
+                UCmp::Ge => a >= b,
             };
             Some(Lat::Const(r as i128))
         }
@@ -216,43 +216,9 @@ pub(in crate::native) fn ucmp_fold(x: Option<Lat>, y: Option<Lat>, kind: Cmp) ->
     }
 }
 
-/// Fold a SIGNED integer comparison over lattice operands. The lattice stores an integer in its
-/// type's UNSIGNED representation -- `module_scalar_constants` zero-extends the literal and
-/// `IAdd`/`IMul`/`ISub` mask back to the width -- so `-1 : i32` is held as `0xFFFFFFFF` and the bits
-/// must be sign-extended from `width` before they mean anything signed. That is why this cannot
-/// share `ucmp_fold`'s body, and why an unknown or implausible width refuses to fold rather than
-/// guessing 128 and reading every negative operand as a large positive one.
-///
-/// There is no zero-operand shortcut here. `x >= 0` is a tautology for UNSIGNED `x` only; signed,
-/// both `x >= 0` and `x < 0` depend on the value, so a one-constant operand proves nothing.
-pub(in crate::native) fn scmp_fold(
-    x: Option<Lat>,
-    y: Option<Lat>,
-    width: Option<u32>,
-    kind: Cmp,
-) -> Option<Lat> {
-    match (x, y) {
-        (Some(Lat::Bottom), _) | (_, Some(Lat::Bottom)) => Some(Lat::Bottom),
-        (Some(Lat::Const(a)), Some(Lat::Const(b))) => {
-            let width = width.filter(|w| (1..=128).contains(w))?;
-            let shift = 128 - width;
-            let sign_extend = |v: i128| (v << shift) >> shift;
-            let (a, b) = (sign_extend(a), sign_extend(b));
-            let result = match kind {
-                Cmp::Lt => a < b,
-                Cmp::Gt => a > b,
-                Cmp::Le => a <= b,
-                Cmp::Ge => a >= b,
-            };
-            Some(Lat::Const(result as i128))
-        }
-        _ => None,
-    }
-}
-
 /// A value in the constant lattice. Absent-from-the-map = TOP (optimistically undefined). This is
 /// the classic SCCP lattice: TOP -> Const -> Bottom, monotone downward, so the fixpoint terminates.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::native) enum Lat {
     Const(i128),
     Bottom,
@@ -266,84 +232,5 @@ pub(in crate::native) fn meet(a: Option<Lat>, b: Option<Lat>) -> Option<Lat> {
         (Some(Lat::Const(x)), Some(Lat::Const(y))) => {
             Some(if x == y { Lat::Const(x) } else { Lat::Bottom })
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The lattice holds an integer in its type's UNSIGNED representation, so the WIDTH decides
-    /// what a signed comparison means: `0 < 65534` is true read as 32-bit and false read as 16-bit,
-    /// where 65534 is -2. Getting this wrong would fold a real branch to the opposite arm, so the
-    /// width is not optional -- an absent or implausible one refuses instead of guessing.
-    #[test]
-    fn signed_comparison_reads_the_operands_at_their_own_width() {
-        let c = |v: i128| Some(Lat::Const(v));
-        assert_eq!(
-            scmp_fold(c(0), c(65534), Some(32), Cmp::Lt),
-            Some(Lat::Const(1)),
-            "at 32 bits 65534 is 65534"
-        );
-        assert_eq!(
-            scmp_fold(c(0), c(65534), Some(16), Cmp::Lt),
-            Some(Lat::Const(0)),
-            "at 16 bits 65534 is -2"
-        );
-        assert_eq!(
-            scmp_fold(c(0), c(65534), Some(16), Cmp::Gt),
-            Some(Lat::Const(1)),
-            "and 0 > -2"
-        );
-        // 0xFFFFFFFF is -1 at 32 bits and 4294967295 at 64.
-        assert_eq!(
-            scmp_fold(c(0xFFFF_FFFF), c(0), Some(32), Cmp::Lt),
-            Some(Lat::Const(1))
-        );
-        assert_eq!(
-            scmp_fold(c(0xFFFF_FFFF), c(0), Some(64), Cmp::Lt),
-            Some(Lat::Const(0))
-        );
-        // The signed minimum compares below everything else at its width.
-        assert_eq!(
-            scmp_fold(c(0x8000_0000), c(0x7FFF_FFFF), Some(32), Cmp::Lt),
-            Some(Lat::Const(1))
-        );
-        assert_eq!(
-            scmp_fold(c(7), c(7), Some(32), Cmp::Le),
-            Some(Lat::Const(1))
-        );
-        assert_eq!(
-            scmp_fold(c(7), c(7), Some(32), Cmp::Ge),
-            Some(Lat::Const(1))
-        );
-    }
-
-    /// Unlike `ucmp_fold` there is no zero shortcut: `x >= 0` is a tautology only for an UNSIGNED
-    /// `x`. A lattice value that is still TOP or a width the caller could not determine both leave
-    /// the comparison unresolved rather than assuming one.
-    #[test]
-    fn signed_comparison_refuses_what_it_cannot_prove() {
-        let c = |v: i128| Some(Lat::Const(v));
-        assert_eq!(
-            scmp_fold(None, c(0), Some(32), Cmp::Ge),
-            None,
-            "x >= 0 is not a signed tautology"
-        );
-        assert_eq!(scmp_fold(c(0), None, Some(32), Cmp::Lt), None);
-        assert_eq!(
-            scmp_fold(c(0), c(1), None, Cmp::Lt),
-            None,
-            "an unknown width refuses"
-        );
-        assert_eq!(scmp_fold(c(0), c(1), Some(0), Cmp::Lt), None);
-        assert_eq!(scmp_fold(c(0), c(1), Some(129), Cmp::Lt), None);
-        assert_eq!(
-            scmp_fold(Some(Lat::Bottom), c(1), Some(32), Cmp::Lt),
-            Some(Lat::Bottom),
-            "a poisoned operand poisons the result"
-        );
-        // The unsigned twin DOES have the zero shortcut, and keeps it.
-        assert_eq!(ucmp_fold(None, c(0), Cmp::Ge), Some(Lat::Const(1)));
     }
 }

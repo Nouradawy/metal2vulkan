@@ -730,8 +730,6 @@ pub(in crate::passes) fn write_texture_dims(
                 (ImageFormat::Rgba16ui, ImageComp::Uint)
             } else if name.contains(".u.") {
                 (ImageFormat::Rgba8ui, ImageComp::Uint)
-            } else if name.contains(".s.") && name.contains(".v4i16") {
-                (ImageFormat::Rgba16i, ImageComp::Sint)
             } else if name.contains(".s.") {
                 (ImageFormat::Rgba8i, ImageComp::Sint)
             } else if name.ends_with(".v4f16") || name.contains(".v4f16") {

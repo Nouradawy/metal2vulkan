@@ -62,43 +62,17 @@ pub(crate) struct EmitSidecar {
     /// aggregate and path survive emitted helper inlining; interface binding remaps `source` to the
     /// concrete descriptor value before resource-wrapper collapse resolves matching extracts.
     pub(crate) aggregate_pointer_values: Vec<AggregatePointerValue>,
-    /// The Workgroup array variable staging an explicit imageblock whose AIR carries
-    /// `air.alias_implicit_imageblock`. The alias says its cells ARE render-target texels, and the
-    /// emitter cannot reach the descriptor-backed planes that represent those; `aliased_imageblock`
-    /// fills every cell from them on entry and writes it back on return.
-    pub(crate) aliased_imageblock_staging: Option<Word>,
+    /// Result ids emitted as typed sentinels for the stable `llvm.agx2.cluster.num` ABI intrinsic.
+    /// The final interface pass replaces each sentinel with the AGX2 physical-cluster number derived
+    /// from Vulkan `LocalInvocationId` and the caller-supplied kernel local size.
+    pub(crate) agx2_cluster_numbers: Vec<Word>,
 }
 
 #[derive(Debug)]
 pub(crate) struct EmissionFailure {
     pub(crate) error: String,
-    /// Boxed so that every emission `Result` in the crate stays one pointer wide in its error arm.
-    pub(crate) rejected: Box<EmissionRejections>,
-}
-
-/// The owned emitter facts a failed emission hands to representation selection. Each names a shape
-/// the attempt proved this source cannot take, and a retry chooses its next representation from
-/// them rather than from the error text.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct EmissionRejections {
-    pub(crate) ordinary_plan_functions: HashSet<String>,
-    pub(crate) ownership_plan_functions: HashSet<String>,
-    /// `(callee, caller-local argument name)` for every helper call the emitter refused because a
-    /// descriptor-relative byte cursor cannot cross a SPIR-V function boundary. Logical addressing
-    /// forbids handing the callee a derived pointer, and the cursor lives in emitter state rather
-    /// than in any SSA value, so the only representation that keeps the callee's accesses on the
-    /// buffer is one with no boundary: the AIR-text retry inlines exactly these call sites.
-    pub(crate) cursor_call_sites: HashSet<(String, String)>,
-}
-
-impl EmissionFailure {
-    /// A failure raised before or beside emission, with no owned emitter facts to carry.
-    pub(crate) fn from_error(error: String) -> Self {
-        EmissionFailure {
-            error,
-            rejected: Box::default(),
-        }
-    }
+    pub(crate) ordinary_plan_rejected_functions: HashSet<String>,
+    pub(crate) ownership_plan_rejected_functions: HashSet<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,15 +94,9 @@ pub(crate) enum AirStructLayoutMappingStatus {
     /// is the raw byte/word view a buffer takes when its accesses are byte-addressed, and it is not
     /// a disagreement with the metadata -- there is nothing to disagree with. Keeping it apart from
     /// [`AirStructLayoutMappingStatus::EmittedShapeMismatch`] matters because the two ask for
-    /// different work: over the 14579 corpus sources 8044 of 8473 unmapped parameters are this, and
-    /// the 378 shape mismatches are the residue worth reading.
+    /// different work: over 2880 corpus sources 1681 of 1805 unmapped parameters are this, and the
+    /// 124 that remain are the ones where two structural descriptions actually differ.
     EmittedIsUntypedBuffer,
-    /// The emitted parameter has members, and walking them against the declared member list did not
-    /// line up. Not every one of these is a layout disagreement: when a buffer keeps the source
-    /// struct verbatim, that type spells its padding out as `[N x i8]` members AIR never names and
-    /// may nest an array AIR describes flat (`[8 x [8 x [8 x T]]]` against `T[512]`), so the walk
-    /// stops even though every declared offset is present in the emitted decorations. Read the
-    /// member offsets before treating one as a bug.
     EmittedShapeMismatch,
     NonIncreasingOffsets,
 }
@@ -234,7 +202,7 @@ impl EmitSidecar {
         for fact in &self.aggregate_pointer_values {
             ids.extend([fact.aggregate, fact.source]);
         }
-        ids.extend(self.aliased_imageblock_staging);
+        ids.extend(self.agx2_cluster_numbers.iter().copied());
         ids.extend(self.air_struct_offsets.keys().copied());
         ids.extend(
             self.air_struct_layout_mappings
@@ -299,7 +267,7 @@ impl EmitSidecar {
             replace(&mut fact.aggregate);
             replace(&mut fact.source);
         }
-        if let Some(id) = &mut self.aliased_imageblock_staging {
+        for id in &mut self.agx2_cluster_numbers {
             replace(id);
         }
         for mapping in &mut self.air_struct_layout_mappings {
@@ -434,6 +402,12 @@ impl EmitSidecar {
             })
             .collect::<Vec<_>>();
         self.aggregate_pointer_values.extend(clones);
+        let clones = self
+            .agx2_cluster_numbers
+            .iter()
+            .filter_map(|id| remap.get(id).copied())
+            .collect::<Vec<_>>();
+        self.agx2_cluster_numbers.extend(clones);
     }
 
     pub(crate) fn remap_local_pointer_field_store_sources(&mut self, remap: &HashMap<Word, Word>) {
@@ -693,7 +667,7 @@ mod tests {
                 source: 44,
                 indices: vec![1, 0],
             }],
-            aliased_imageblock_staging: Some(51),
+            agx2_cluster_numbers: vec![50],
         };
         let remap = HashMap::from([
             (10, 110),
@@ -721,7 +695,6 @@ mod tests {
             (44, 144),
             (5, 105),
             (50, 150),
-            (51, 151),
         ]);
 
         sidecar.remap_ids(&remap);
@@ -763,6 +736,6 @@ mod tests {
         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].id, 140);
         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].root, 141);
         assert_eq!(sidecar.local_pointer_dynamic_field_loads[0].index, 142);
-        assert_eq!(sidecar.aliased_imageblock_staging, Some(151));
+        assert_eq!(sidecar.agx2_cluster_numbers, vec![150]);
     }
 }

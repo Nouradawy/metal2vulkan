@@ -93,6 +93,11 @@ pub(super) fn raw_byte_index_name(name: &str) -> String {
     format!("{name}.air.rawbyte")
 }
 
+/// The synthetic `u32` value bound to a helper raw parameter's byte-cursor shadow.
+pub(super) fn raw_cursor_value_name(name: &str) -> String {
+    format!("{name}.metal2vulkan.raw_cursor")
+}
+
 pub(super) fn compatible_pointer_provenance(a: &GepProvenance, b: &GepProvenance) -> bool {
     a.root == b.root
         && a.addrspace == b.addrspace
@@ -353,11 +358,6 @@ pub(super) fn raw_buffer_block_type() -> LlType {
     LlType::Struct(vec![LlType::Array(Box::new(LlType::Int(32)), 0)])
 }
 
-/// The word array a `[[threadgroup]]` parameter gets when its accesses reinterpret between element
-/// types, so no AIR layout describes it. AIR carries no length -- Metal binds one at encode time --
-/// so 2048 words is a guess, and `passes::stage_input` replaces it with `length / 4` words when the
-/// caller named a byte length for that Metal index. Keep the element `Int(32)`: the body's access
-/// chains are typed against it and only the bound is the caller's to move.
 pub(super) fn raw_workgroup_array_type() -> LlType {
     LlType::Array(Box::new(LlType::Int(32)), 2048)
 }

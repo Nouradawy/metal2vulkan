@@ -4,26 +4,13 @@ use super::*;
 
 pub(in crate::passes) fn lower_air_calls(ctx: &mut Ctx, entry_idx: usize) -> Result<(), String> {
     lower_agx_emask_memory_calls(ctx, entry_idx)?;
-    // A whole-imageblock copy becomes a loop, and a loop needs blocks the walk below cannot add.
-    lower_imageblock_block_copies(ctx, entry_idx)?;
 
     let names = air_names(&ctx.module);
     let v4 = ctx.ty_vecf(4);
-    record_read_sampler_values(ctx, entry_idx, &names);
 
     // Walk each block; collect replacement instruction lists per call site.
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
-    // A lowering that stands an existing SSA value in for an operand it could not resolve has to
-    // prove that value reaches the call. Measured once: this pass rewrites instruction lists inside
-    // blocks and adds none, so the block graph it walks is the one it measured.
-    ctx.air_call_body = Some(crate::passes::AirCallBody {
-        function: entry_idx,
-        dominance: crate::passes::spirv_cfg::BlockDominance::of(
-            &ctx.module.functions[entry_idx].blocks,
-        ),
-    });
     for bi in 0..n_blocks {
-        ctx.air_call_block = bi;
         let mut new_insts: Vec<Instruction> = vec![];
         let insts = ctx.module.functions[entry_idx].blocks[bi]
             .instructions
@@ -55,42 +42,12 @@ pub(in crate::passes) fn lower_air_calls(ctx: &mut Ctx, entry_idx: usize) -> Res
             let res = inst.result_id;
             let rty = inst.result_type;
 
-            let lowered = match lower_one(ctx, name, res, rty, &args, v4) {
-                Ok(lowered) => lowered,
-                Err(error) => {
-                    ctx.air_call_body = None;
-                    return Err(error);
-                }
-            };
+            let lowered = lower_one(ctx, name, res, rty, &args, v4)?;
             new_insts.extend(lowered);
         }
         ctx.module.functions[entry_idx].blocks[bi].instructions = new_insts;
     }
-    ctx.air_call_body = None;
     Ok(())
-}
-
-/// Record the result id of every `air.get_read_sampler()` call in the entry body.
-///
-/// A sampler operand still typed as an AIR pointer when an image call lowers is either this
-/// stateless placeholder — which [`lower_get_read_sampler`] replaces with the translator's default
-/// sampler resource, and whose consumer ignores the sampler anyway — or a sampler whose exact state
-/// the shader chose and this pass could not recover. The two are indistinguishable by type, so the
-/// distinguishing fact (which ids AIR declared stateless) has to be captured before lowering
-/// rewrites the calls. Runs on the pre-rewrite body, so it is independent of block order and of
-/// whether a given call site lowers before or after its consumer.
-fn record_read_sampler_values(ctx: &mut Ctx, entry_idx: usize, names: &HashMap<Word, String>) {
-    ctx.read_sampler_values = ctx.module.functions[entry_idx]
-        .blocks
-        .iter()
-        .flat_map(|block| &block.instructions)
-        .filter(|inst| inst.class.opcode == Op::FunctionCall)
-        .filter(|inst| {
-            matches!(inst.operands.first(), Some(Operand::IdRef(callee))
-                if names.get(callee).is_some_and(|name| name == "air.get_read_sampler"))
-        })
-        .filter_map(|inst| inst.result_id)
-        .collect();
 }
 
 /// `air.fence_texture*`: a texture memory fence with no result. Emits an image-scoped acquire/release
@@ -206,32 +163,24 @@ pub(in crate::passes) fn lower_atomic_integer_rmw(
     Ok(out)
 }
 
-/// Whether this pack/unpack intrinsic carries the sRGB transfer function on its colour channels.
-///
-/// `air.{,un}pack.unorm4x8.srgb.*` differs from plain `unorm4x8` by the transfer alone, and its
-/// name CONTAINS the plain one — so a substring table answers `unorm4x8` for it and silently drops
-/// the curve. Metal packs 0.5 as byte 188, not 128, and decodes byte 188 as 0.5029, not 0.7373;
-/// measured on this repository's reference GPU by the authored `kernel_srgb_pack_roundtrip`.
-/// The alpha channel stays linear in both directions, also measured.
-fn is_srgb_packed_format(name: &str) -> bool {
-    name.contains(".srgb")
-}
-
 /// Pair the inverse GLSL.std.450 operations and vector width for one AIR packed-vector format.
 /// Keeping the format table here prevents pack and unpack dispatch from drifting independently.
 ///
-/// Callers must take the sRGB variants ([`is_srgb_packed_format`]) first: their names contain the
-/// plain format's name, so this table answers for them and answers wrongly.
+/// The packed pixel types (`rgba8unorm<float4>`, `rg16snorm<float2>`, ...) reach AIR as
+/// `air.pack.unorm.rgba8.*` / `air.pack.snorm.rg16.*`: component 0 in the least significant
+/// field, the same layout and normalized conversion as the `4x8` / `2x16` functions, so they share
+/// the GLSL.std.450 pair. sRGB and the mixed-width formats (rgb565, rgb10a2, rg11b10f, rgb9e5) are
+/// not this shape and stay out of the table.
 fn packed_format(name: &str) -> Option<(GLSLstd450, GLSLstd450, u32)> {
     use GLSLstd450 as G;
 
-    if name.contains("unorm4x8") {
+    if name.contains("unorm4x8") || name.contains(".unorm.rgba8.") {
         Some((G::PackUnorm4x8, G::UnpackUnorm4x8, 4))
-    } else if name.contains("snorm4x8") {
+    } else if name.contains("snorm4x8") || name.contains(".snorm.rgba8.") {
         Some((G::PackSnorm4x8, G::UnpackSnorm4x8, 4))
-    } else if name.contains("unorm2x16") {
+    } else if name.contains("unorm2x16") || name.contains(".unorm.rg16.") {
         Some((G::PackUnorm2x16, G::UnpackUnorm2x16, 2))
-    } else if name.contains("snorm2x16") {
+    } else if name.contains("snorm2x16") || name.contains(".snorm.rg16.") {
         Some((G::PackSnorm2x16, G::UnpackSnorm2x16, 2))
     } else if name.contains("half2x16") {
         Some((G::PackHalf2x16, G::UnpackHalf2x16, 2))
@@ -251,12 +200,6 @@ pub(in crate::passes) fn lower_pack(
 ) -> Result<Vec<Instruction>, String> {
     if name.starts_with("air.pack.unorm.rgb565") {
         return lower_pack_rgb565(ctx, name, res, rty, args);
-    }
-    if name.starts_with("air.pack.unorm.rgb10a2") {
-        return lower_pack_rgb10a2(ctx, name, res, rty, args);
-    }
-    if is_srgb_packed_format(name) {
-        return lower_pack_srgb4x8(ctx, name, res, rty, args);
     }
     let (pack_op, _, _) =
         packed_format(name).ok_or_else(|| format!("unhandled pack intrinsic: {name}"))?;
@@ -287,608 +230,11 @@ pub(in crate::passes) fn lower_pack(
     Ok(out)
 }
 
-/// The sRGB electro-optical transfer, applied to the three colour lanes of a four-lane vector and
-/// not to alpha. `encode` is the linear-to-sRGB direction (`pack`), its inverse is `unpack`:
-///
-/// ```text
-/// encode(x) = x <= 0.0031308 ? 12.92 * x : 1.055 * x^(1/2.4) - 0.055
-/// decode(s) = s <= 0.04045   ? s / 12.92 : ((s + 0.055) / 1.055)^2.4
-/// ```
-///
-/// Both arms are evaluated on all four lanes and selected per lane, then alpha is put back
-/// unchanged; `Pow`'s base is non-negative on the arm that is selected, and the unselected arm's
-/// value is discarded. Returns the transformed vector.
-fn srgb_transfer(ctx: &mut Ctx, out: &mut Vec<Instruction>, value: Word, encode: bool) -> Word {
-    let v4 = ctx.ty_vecf(4);
-    let v4bool = ctx.ty_vec_bool(4);
-    let ext = ctx.glsl();
-    let splat = |ctx: &mut Ctx, out: &mut Vec<Instruction>, x: f32| {
-        let scalar = ctx.const_float(x);
-        let id = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::CompositeConstruct,
-            Some(v4),
-            Some(id),
-            vec![Operand::IdRef(scalar); 4],
-        ));
-        id
-    };
-    let (edge, linear_scale, exponent, offset, gain) = if encode {
-        (0.0031308, 12.92, 1.0 / 2.4, 0.055, 1.055)
-    } else {
-        (0.04045, 12.92, 2.4, 0.055, 1.055)
-    };
-    let edge = splat(ctx, out, edge);
-    let scale = splat(ctx, out, linear_scale);
-    let exponent = splat(ctx, out, exponent);
-    let offset = splat(ctx, out, offset);
-    let gain = splat(ctx, out, gain);
-
-    let emit = |ctx: &mut Ctx, out: &mut Vec<Instruction>, op: Op, a: Word, b: Word| {
-        let id = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            op,
-            Some(v4),
-            Some(id),
-            vec![Operand::IdRef(a), Operand::IdRef(b)],
-        ));
-        id
-    };
-    let low = if encode {
-        emit(ctx, out, Op::FMul, value, scale)
-    } else {
-        emit(ctx, out, Op::FDiv, value, scale)
-    };
-    let high = if encode {
-        // 1.055 * x^(1/2.4) - 0.055, with the base clamped up to zero so Pow stays in its domain.
-        let zero = splat(ctx, out, 0.0);
-        let base = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::ExtInst,
-            Some(v4),
-            Some(base),
-            vec![
-                Operand::IdRef(ext),
-                Operand::LiteralExtInstInteger(GLSLstd450::FMax as u32),
-                Operand::IdRef(value),
-                Operand::IdRef(zero),
-            ],
-        ));
-        let powed = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::ExtInst,
-            Some(v4),
-            Some(powed),
-            vec![
-                Operand::IdRef(ext),
-                Operand::LiteralExtInstInteger(GLSLstd450::Pow as u32),
-                Operand::IdRef(base),
-                Operand::IdRef(exponent),
-            ],
-        ));
-        let scaled = emit(ctx, out, Op::FMul, powed, gain);
-        emit(ctx, out, Op::FSub, scaled, offset)
-    } else {
-        // ((s + 0.055) / 1.055)^2.4
-        let shifted = emit(ctx, out, Op::FAdd, value, offset);
-        let base = emit(ctx, out, Op::FDiv, shifted, gain);
-        let powed = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::ExtInst,
-            Some(v4),
-            Some(powed),
-            vec![
-                Operand::IdRef(ext),
-                Operand::LiteralExtInstInteger(GLSLstd450::Pow as u32),
-                Operand::IdRef(base),
-                Operand::IdRef(exponent),
-            ],
-        ));
-        powed
-    };
-    let is_low = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::FOrdLessThanEqual,
-        Some(v4bool),
-        Some(is_low),
-        vec![Operand::IdRef(value), Operand::IdRef(edge)],
-    ));
-    let selected = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::Select,
-        Some(v4),
-        Some(selected),
-        vec![
-            Operand::IdRef(is_low),
-            Operand::IdRef(low),
-            Operand::IdRef(high),
-        ],
-    ));
-    // Alpha is linear in both directions: take lanes 0..3 from the transfer and lane 3 from the
-    // original. Measured against Metal, which leaves alpha alone.
-    let rebuilt = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::VectorShuffle,
-        Some(v4),
-        Some(rebuilt),
-        vec![
-            Operand::IdRef(selected),
-            Operand::IdRef(value),
-            Operand::LiteralBit32(0),
-            Operand::LiteralBit32(1),
-            Operand::LiteralBit32(2),
-            Operand::LiteralBit32(7),
-        ],
-    ));
-    rebuilt
-}
-
-/// Metal decodes sRGB through the hardware's 12-bit table, not through the transfer in full
-/// precision: every answer is a multiple of 1/4095. Measured exhaustively against Metal on this
-/// repository's reference GPU by `validation/fixtures/public/kernel_srgb_unpack_all_bytes` — all 256
-/// byte values equal `round(decode(b / 255) * 4095) / 4095`, and the transfer alone is off by up to
-/// 24% at the bottom of the range, where rounding 1.243 down to 1 is a fifth of the value.
-///
-/// Alpha is not decoded and not quantized: it comes back from `raw` unchanged.
-///
-/// That fixture carries no case, deliberately: MoltenVK's fast-math compiles this `FDiv` into a
-/// multiply by 1/4095, which lands one ULP off Metal's division on 114 of the 256 bytes. The table
-/// STEP is right at all 256 — the residual is the last place of the division, not the decode.
-/// Forbidding it needs `FPFastMathMode None` and the `FloatControls2` capability on 7 modules,
-/// which is not worth its own plumbing; the shipped case picks its float lanes from the 142 bytes
-/// where the two agree bit for bit, and pins the curve itself through the half lane, which absorbs
-/// the last place.
-fn srgb_decode_quantize(
-    ctx: &mut Ctx,
-    out: &mut Vec<Instruction>,
-    decoded: Word,
-    raw: Word,
-) -> Word {
-    let v4 = ctx.ty_vecf(4);
-    let ext = ctx.glsl();
-    let steps = ctx.const_float(4095.0);
-    let steps_v = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::CompositeConstruct,
-        Some(v4),
-        Some(steps_v),
-        vec![Operand::IdRef(steps); 4],
-    ));
-    let scaled = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::FMul,
-        Some(v4),
-        Some(scaled),
-        vec![Operand::IdRef(decoded), Operand::IdRef(steps_v)],
-    ));
-    let rounded = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::ExtInst,
-        Some(v4),
-        Some(rounded),
-        vec![
-            Operand::IdRef(ext),
-            Operand::LiteralExtInstInteger(GLSLstd450::RoundEven as u32),
-            Operand::IdRef(scaled),
-        ],
-    ));
-    let stepped = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::FDiv,
-        Some(v4),
-        Some(stepped),
-        vec![Operand::IdRef(rounded), Operand::IdRef(steps_v)],
-    ));
-    let rebuilt = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::VectorShuffle,
-        Some(v4),
-        Some(rebuilt),
-        vec![
-            Operand::IdRef(stepped),
-            Operand::IdRef(raw),
-            Operand::LiteralBit32(0),
-            Operand::LiteralBit32(1),
-            Operand::LiteralBit32(2),
-            Operand::LiteralBit32(7),
-        ],
-    ));
-    rebuilt
-}
-
-/// `air.pack.unorm4x8.srgb.<arg>` -> sRGB-encode the colour lanes, then `PackUnorm4x8`.
-fn lower_pack_srgb4x8(
-    ctx: &mut Ctx,
-    name: &str,
-    res: Word,
-    rty: Word,
-    args: &[Word],
-) -> Result<Vec<Instruction>, String> {
-    if args.len() != 1 {
-        return Err(format!("{name} expects 1 operand"));
-    }
-    let arg_ty =
-        value_result_type(ctx, args[0]).ok_or_else(|| format!("{name} operand has no type"))?;
-    let v4 = ctx.ty_vecf(4);
-    if float_equivalent(ctx, arg_ty) != v4 {
-        return Err(format!(
-            "{name} operand is not a four-component float vector"
-        ));
-    }
-    let mut out = Vec::new();
-    let mut value = args[0];
-    if arg_ty != v4 {
-        let widened = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FConvert,
-            Some(v4),
-            Some(widened),
-            vec![Operand::IdRef(value)],
-        ));
-        value = widened;
-    }
-    let encoded = srgb_transfer(ctx, &mut out, value, true);
-    out.push(Instruction::new(
-        Op::ExtInst,
-        Some(rty),
-        Some(res),
-        vec![
-            Operand::IdRef(ctx.glsl()),
-            Operand::LiteralExtInstInteger(GLSLstd450::PackUnorm4x8 as u32),
-            Operand::IdRef(encoded),
-        ],
-    ));
-    Ok(out)
-}
-
-/// `air.unpack.unorm4x8.srgb.<ret>` -> `UnpackUnorm4x8`, then sRGB-decode the colour lanes.
-fn lower_unpack_srgb4x8(
-    ctx: &mut Ctx,
-    name: &str,
-    res: Word,
-    rty: Word,
-    args: &[Word],
-) -> Result<Vec<Instruction>, String> {
-    if args.len() != 1 {
-        return Err(format!("{name} expects 1 operand"));
-    }
-    let v4 = ctx.ty_vecf(4);
-    let mut out = Vec::new();
-    let raw = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::ExtInst,
-        Some(v4),
-        Some(raw),
-        vec![
-            Operand::IdRef(ctx.glsl()),
-            Operand::LiteralExtInstInteger(GLSLstd450::UnpackUnorm4x8 as u32),
-            Operand::IdRef(args[0]),
-        ],
-    ));
-    let decoded = srgb_transfer(ctx, &mut out, raw, false);
-    let quantized = srgb_decode_quantize(ctx, &mut out, decoded, raw);
-    let (wide, narrow) = narrowed_unpack_result(ctx, res, rty);
-    out.push(Instruction::new(
-        Op::CopyObject,
-        Some(v4),
-        Some(wide),
-        vec![Operand::IdRef(quantized)],
-    ));
-    out.extend(narrow);
-    Ok(out)
-}
-
-/// `air.pack.unorm.rgb10a2.<arg>` packs four normalized components into 10/10/10/2 bit-fields: R in
-/// bits 0..10, G in 10..20, B in 20..30 and A in 30..32.
-///
-/// It is NOT the same arithmetic as the other normalized packs, and that is the whole reason it
-/// needs its own lowering. Metal rounds the EXACT real product `x * 1023`, not the `float` product:
-/// measured against `pack_float_to_unorm10a2` on device, the model that multiplies in `float` and
-/// rounds the result disagrees on 8 of 14 arguments chosen to separate them, while the exact-product
-/// model agrees on all 20 probed rows including the clamped and NaN ones. Rounding `fl(x * 1023)`
-/// would therefore be visibly wrong wherever the multiply itself rounds across a half-integer.
-///
-/// The exact product is recovered without 64-bit arithmetic, using the standard FMA residual: with
-/// `p = fl(x * M)` and `r = fma(x, M, -p)`, `r` is exact and `x * M = p + r`. Let `f = p - floor(p)`,
-/// which is exact and is a multiple of `ulp(p)`. Because `|r| <= ulp(p)/2` and `0.5` is also a
-/// multiple of `ulp(p)`, `f` differs from `0.5` by at least `ulp(p)` whenever it differs at all, so
-/// `f + r` lands on the same side of `0.5` as `f` does -- the residual can only decide the case
-/// `f == 0.5`, where it breaks the tie by its sign and, when it is zero, by rounding to even. That
-/// makes the whole comparison exact in `float`. Verified against the exact rational product over
-/// 605k arguments including every neighbourhood of a `k + 0.5` boundary.
-///
-/// The multiply must be decorated `NoContraction` or a backend is free to fuse it into the `fma`,
-/// which would make `r` zero and silently restore the wrong model.
-///
-/// The tie rule is not observable: `0.5` is the only `float` in `[0, 1]` whose product with 1023 (or
-/// with 3) is exactly a half-integer, because `1023` and `3` are odd, and both tie directions agree
-/// there. Ties-to-even is chosen to match the sibling packs.
-///
-/// A half operand needs no residual at all -- an 11-bit significand times a 10-bit multiplier is 21
-/// bits, exact in `float` -- but it takes the same path, where `r` is then always zero.
-fn lower_pack_rgb10a2(
-    ctx: &mut Ctx,
-    name: &str,
-    res: Word,
-    rty: Word,
-    args: &[Word],
-) -> Result<Vec<Instruction>, String> {
-    if args.len() != 1 {
-        return Err(format!("{name} expects 1 operand"));
-    }
-    if int_scalar_width(ctx, rty) != Some(32) {
-        return Err(format!("{name} result is not a 32-bit integer"));
-    }
-    let arg_ty = value_result_type(ctx, args[0])
-        .ok_or_else(|| format!("{name} operand has no result type"))?;
-    let v4float = ctx.ty_vecf(4);
-    if float_equivalent(ctx, arg_ty) != v4float {
-        return Err(format!(
-            "{name} operand is not a four-component float vector"
-        ));
-    }
-
-    let float = ctx.ty_float();
-    let uint = ctx.ty_uint();
-    let bool_ty = ctx.ty_bool();
-    let mut out = Vec::new();
-    let vector = if arg_ty == v4float {
-        args[0]
-    } else {
-        let widened = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FConvert,
-            Some(v4float),
-            Some(widened),
-            vec![Operand::IdRef(args[0])],
-        ));
-        widened
-    };
-
-    let zero = ctx.const_float(0.0);
-    let one = ctx.const_float(1.0);
-    let half = ctx.const_float(0.5);
-    let uint_zero = ctx.const_uint(0);
-    let uint_one = ctx.const_uint(1);
-    let mut fields = Vec::with_capacity(4);
-    for (component, maximum, shift) in [
-        (0u32, 1023.0f32, 0u32),
-        (1, 1023.0, 10),
-        (2, 1023.0, 20),
-        (3, 3.0, 30),
-    ] {
-        let scale = ctx.const_float(maximum);
-        let extracted = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::CompositeExtract,
-            Some(float),
-            Some(extracted),
-            vec![Operand::IdRef(vector), Operand::LiteralBit32(component)],
-        ));
-
-        let clamped = ctx.module.fresh_id();
-        // `NClamp`, not `FClamp`: **Metal answers 0 for a NaN component of every normalized
-        // pack**, and `NClamp(NaN, 0, 1)` is `NMin(NMax(NaN, 0), 1)` == 0 by specification, where
-        // `FClamp` of a NaN is undefined. Device-measured over all seven pack families in the case
-        // `pack-every-normalized-format-at-its-edges`: `unorm4x8`, `snorm4x8`, `unorm2x16`,
-        // `snorm2x16`, `unorm.rgb10a2`, `unorm.rgb565` and `unorm4x8.srgb` each answer 0 for NaN
-        // and for `-NaN`, and every out-of-range magnitude clamps. This used to be an `OpIsNan`
-        // plus an `OpSelect` per lane in front of the clamp, which the right opcode makes needless.
-        out.push(Instruction::new(
-            Op::ExtInst,
-            Some(float),
-            Some(clamped),
-            vec![
-                Operand::IdRef(ctx.glsl()),
-                Operand::LiteralExtInstInteger(GLSLstd450::NClamp as u32),
-                Operand::IdRef(extracted),
-                Operand::IdRef(zero),
-                Operand::IdRef(one),
-            ],
-        ));
-        let product = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FMul,
-            Some(float),
-            Some(product),
-            vec![Operand::IdRef(clamped), Operand::IdRef(scale)],
-        ));
-        ctx.module.annotations.push(Instruction::new(
-            Op::Decorate,
-            None,
-            None,
-            vec![
-                Operand::IdRef(product),
-                Operand::Decoration(Decoration::NoContraction),
-            ],
-        ));
-        let negated = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FNegate,
-            Some(float),
-            Some(negated),
-            vec![Operand::IdRef(product)],
-        ));
-        let residual = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::ExtInst,
-            Some(float),
-            Some(residual),
-            vec![
-                Operand::IdRef(ctx.glsl()),
-                Operand::LiteralExtInstInteger(GLSLstd450::Fma as u32),
-                Operand::IdRef(clamped),
-                Operand::IdRef(scale),
-                Operand::IdRef(negated),
-            ],
-        ));
-        let floored = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::ExtInst,
-            Some(float),
-            Some(floored),
-            vec![
-                Operand::IdRef(ctx.glsl()),
-                Operand::LiteralExtInstInteger(GLSLstd450::Floor as u32),
-                Operand::IdRef(product),
-            ],
-        ));
-        let fraction = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FSub,
-            Some(float),
-            Some(fraction),
-            vec![Operand::IdRef(product), Operand::IdRef(floored)],
-        ));
-        let base = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::ConvertFToU,
-            Some(uint),
-            Some(base),
-            vec![Operand::IdRef(floored)],
-        ));
-        // Above the half: round up. Exactly on it: the residual's sign decides, and a zero residual
-        // falls back to ties-to-even on the floor.
-        let above = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FOrdGreaterThan,
-            Some(bool_ty),
-            Some(above),
-            vec![Operand::IdRef(fraction), Operand::IdRef(half)],
-        ));
-        let on_half = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FOrdEqual,
-            Some(bool_ty),
-            Some(on_half),
-            vec![Operand::IdRef(fraction), Operand::IdRef(half)],
-        ));
-        let residual_positive = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FOrdGreaterThan,
-            Some(bool_ty),
-            Some(residual_positive),
-            vec![Operand::IdRef(residual), Operand::IdRef(zero)],
-        ));
-        let residual_zero = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FOrdEqual,
-            Some(bool_ty),
-            Some(residual_zero),
-            vec![Operand::IdRef(residual), Operand::IdRef(zero)],
-        ));
-        let low_bit = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::BitwiseAnd,
-            Some(uint),
-            Some(low_bit),
-            vec![Operand::IdRef(base), Operand::IdRef(uint_one)],
-        ));
-        let floor_is_odd = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::INotEqual,
-            Some(bool_ty),
-            Some(floor_is_odd),
-            vec![Operand::IdRef(low_bit), Operand::IdRef(uint_zero)],
-        ));
-        let tie_to_even_up = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::LogicalAnd,
-            Some(bool_ty),
-            Some(tie_to_even_up),
-            vec![Operand::IdRef(residual_zero), Operand::IdRef(floor_is_odd)],
-        ));
-        let tie_up = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::LogicalOr,
-            Some(bool_ty),
-            Some(tie_up),
-            vec![
-                Operand::IdRef(residual_positive),
-                Operand::IdRef(tie_to_even_up),
-            ],
-        ));
-        let on_half_up = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::LogicalAnd,
-            Some(bool_ty),
-            Some(on_half_up),
-            vec![Operand::IdRef(on_half), Operand::IdRef(tie_up)],
-        ));
-        let round_up = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::LogicalOr,
-            Some(bool_ty),
-            Some(round_up),
-            vec![Operand::IdRef(above), Operand::IdRef(on_half_up)],
-        ));
-        let carry = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::Select,
-            Some(uint),
-            Some(carry),
-            vec![
-                Operand::IdRef(round_up),
-                Operand::IdRef(uint_one),
-                Operand::IdRef(uint_zero),
-            ],
-        ));
-        let integer = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::IAdd,
-            Some(uint),
-            Some(integer),
-            vec![Operand::IdRef(base), Operand::IdRef(carry)],
-        ));
-        if shift == 0 {
-            fields.push(integer);
-        } else {
-            let shifted = ctx.module.fresh_id();
-            out.push(Instruction::new(
-                Op::ShiftLeftLogical,
-                Some(uint),
-                Some(shifted),
-                vec![
-                    Operand::IdRef(integer),
-                    Operand::IdRef(ctx.const_uint(shift)),
-                ],
-            ));
-            fields.push(shifted);
-        }
-    }
-
-    let mut accumulated = fields[0];
-    for field in &fields[1..] {
-        let combined = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::BitwiseOr,
-            Some(uint),
-            Some(combined),
-            vec![Operand::IdRef(accumulated), Operand::IdRef(*field)],
-        ));
-        accumulated = combined;
-    }
-    out.push(Instruction::new(
-        Op::CopyObject,
-        Some(rty),
-        Some(res),
-        vec![Operand::IdRef(accumulated)],
-    ));
-    Ok(out)
-}
-
 /// `air.pack.unorm.rgb565.<arg>` packs three normalized components into the Metal `ushort`
 /// contract: R occupies bits 0..5, G bits 5..11, and B bits 11..16. This is the same normalized
 /// conversion used by GLSL's pack-unorm instructions: clamp to [0, 1], scale by the field maximum,
 /// and round to the nearest integer. Half inputs widen before the arithmetic because SPIR-V Tools
 /// does not accept all GLSL extended instructions directly on half vectors.
-///
-/// The rounding is `RoundEven`, not `Round`: SPIR-V leaves `Round`'s tie direction to the
-/// implementation and SPIRV-Cross spells the two as different MSL functions -- `round`, which
-/// rounds ties away from zero, and `rint`, which rounds them to even. Metal rounds these ties to
-/// EVEN, verified on device: `pack_float_to_unorm565` of the three components whose f32 products
-/// with 31, 63 and 31 are exactly 0.5, 2.5 and 4.5 answers 0, 2 and 4, not 1, 3 and 5. The sibling
-/// sRGB pack already used `RoundEven`; this is the same rule.
 fn lower_pack_rgb565(
     ctx: &mut Ctx,
     name: &str,
@@ -942,21 +288,13 @@ fn lower_pack_rgb565(
             Some(extracted),
             vec![Operand::IdRef(vector), Operand::LiteralBit32(component)],
         ));
-
-        // `NClamp`, not `FClamp`: **Metal answers 0 for a NaN component of every normalized
-        // pack**, and `NClamp(NaN, 0, 1)` is `NMin(NMax(NaN, 0), 1)` == 0 by specification, where
-        // `FClamp` of a NaN is undefined. Device-measured over all seven pack families in the case
-        // `pack-every-normalized-format-at-its-edges`: `unorm4x8`, `snorm4x8`, `unorm2x16`,
-        // `snorm2x16`, `unorm.rgb10a2`, `unorm.rgb565` and `unorm4x8.srgb` each answer 0 for NaN
-        // and for `-NaN`, and every out-of-range magnitude clamps. This used to be an `OpIsNan`
-        // plus an `OpSelect` per lane in front of the clamp, which the right opcode makes needless.
         out.push(Instruction::new(
             Op::ExtInst,
             Some(float),
             Some(clamped),
             vec![
                 Operand::IdRef(ctx.glsl()),
-                Operand::LiteralExtInstInteger(GLSLstd450::NClamp as u32),
+                Operand::LiteralExtInstInteger(GLSLstd450::FClamp as u32),
                 Operand::IdRef(extracted),
                 Operand::IdRef(zero),
                 Operand::IdRef(one),
@@ -977,7 +315,7 @@ fn lower_pack_rgb565(
             Some(rounded),
             vec![
                 Operand::IdRef(ctx.glsl()),
-                Operand::LiteralExtInstInteger(GLSLstd450::RoundEven as u32),
+                Operand::LiteralExtInstInteger(GLSLstd450::Round as u32),
                 Operand::IdRef(scaled),
             ],
         ));
@@ -1027,25 +365,6 @@ fn lower_pack_rgb565(
     Ok(out)
 }
 
-/// Every `air.unpack.*` lowering computes in 32-bit float and the `.v4f16` / `.v3f16` / `.v2f16`
-/// AIR variants narrow afterwards, because none of the packed formats has a half-width unpack.
-/// Returns the id the float32 result must be written to, plus the `OpFConvert` that narrows it to
-/// `rty` — `None` when the AIR result already is the float32 vector, in which case the id returned
-/// is `res` itself and the caller writes its result directly.
-fn narrowed_unpack_result(ctx: &mut Ctx, res: Word, rty: Word) -> (Word, Option<Instruction>) {
-    if !is_half_vector(ctx, rty) {
-        return (res, None);
-    }
-    let wide = ctx.module.fresh_id();
-    let narrow = Instruction::new(
-        Op::FConvert,
-        Some(rty),
-        Some(res),
-        vec![Operand::IdRef(wide)],
-    );
-    (wide, Some(narrow))
-}
-
 /// `air.unpack.unorm.rgb10a2.<ret>` has no GLSL.std.450 equivalent, so unpack the 10/10/10/2
 /// bit-fields by hand: r=(x&0x3FF)/1023, g=((x>>10)&0x3FF)/1023, b=((x>>20)&0x3FF)/1023,
 /// a=((x>>30)&0x3)/3. The `.v4f16` variant FConverts the result down.
@@ -1060,6 +379,7 @@ pub(in crate::passes) fn lower_unpack_rgb10a2(
     let v_float = ctx.ty_vecf(4);
     let c1023 = ctx.const_float(1023.0);
     let c3 = ctx.const_float(3.0);
+    let want_half = is_half_vector(ctx, rty);
     let fields = [
         (0u32, 0x3FFu32, c1023),
         (10, 0x3FF, c1023),
@@ -1105,14 +425,25 @@ pub(in crate::passes) fn lower_unpack_rgb10a2(
         ));
         comps.push(comp);
     }
-    let (vec_res, narrow) = narrowed_unpack_result(ctx, res, rty);
+    let vec_res = if want_half {
+        ctx.module.fresh_id()
+    } else {
+        res
+    };
     out.push(Instruction::new(
         Op::CompositeConstruct,
         Some(v_float),
         Some(vec_res),
         comps.iter().map(|c| Operand::IdRef(*c)).collect(),
     ));
-    out.extend(narrow);
+    if want_half {
+        out.push(Instruction::new(
+            Op::FConvert,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(vec_res)],
+        ));
+    }
     Ok(out)
 }
 
@@ -1130,6 +461,7 @@ pub(in crate::passes) fn lower_unpack_rg11b10f(
     let v2_float = ctx.ty_vecf(2);
     let v_float = ctx.ty_vecf(3);
     let ext = ctx.glsl();
+    let want_half = is_half_vector(ctx, rty);
     // (field_shift, field_mask, exp_shift_within_field, mantissa_mask, mantissa_left_shift)
     let fields = [
         (0u32, 0x7FFu32, 6u32, 0x3Fu32, 4u32),
@@ -1223,14 +555,25 @@ pub(in crate::passes) fn lower_unpack_rg11b10f(
         ));
         comps.push(comp);
     }
-    let (vec_res, narrow) = narrowed_unpack_result(ctx, res, rty);
+    let vec_res = if want_half {
+        ctx.module.fresh_id()
+    } else {
+        res
+    };
     out.push(Instruction::new(
         Op::CompositeConstruct,
         Some(v_float),
         Some(vec_res),
         comps.iter().map(|c| Operand::IdRef(*c)).collect(),
     ));
-    out.extend(narrow);
+    if want_half {
+        out.push(Instruction::new(
+            Op::FConvert,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(vec_res)],
+        ));
+    }
     Ok(out)
 }
 
@@ -1247,6 +590,7 @@ pub(in crate::passes) fn lower_unpack_rgb9e5(
     let float_ty = ctx.ty_float();
     let v_float = ctx.ty_vecf(3);
     let ext = ctx.glsl();
+    let want_half = is_half_vector(ctx, rty);
     let mut out = Vec::new();
     // exp = (x >> 27) & 0x1F ; scale = exp2(float(exp) - 24)
     let c27 = ctx.const_uint(27);
@@ -1329,14 +673,25 @@ pub(in crate::passes) fn lower_unpack_rgb9e5(
         ));
         comps.push(comp);
     }
-    let (vec_res, narrow) = narrowed_unpack_result(ctx, res, rty);
+    let vec_res = if want_half {
+        ctx.module.fresh_id()
+    } else {
+        res
+    };
     out.push(Instruction::new(
         Op::CompositeConstruct,
         Some(v_float),
         Some(vec_res),
         comps.iter().map(|c| Operand::IdRef(*c)).collect(),
     ));
-    out.extend(narrow);
+    if want_half {
+        out.push(Instruction::new(
+            Op::FConvert,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(vec_res)],
+        ));
+    }
     Ok(out)
 }
 
@@ -1349,14 +704,16 @@ pub(in crate::passes) fn lower_unpack(
     rty: Word,
     args: &[Word],
 ) -> Result<Vec<Instruction>, String> {
-    if is_srgb_packed_format(name) {
-        return lower_unpack_srgb4x8(ctx, name, res, rty, args);
-    }
     let (_, unpack_op, n) =
         packed_format(name).ok_or_else(|| format!("unhandled unpack intrinsic: {name}"))?;
     let ext = ctx.glsl();
     let v_float = ctx.ty_vecf(n);
-    let (unpacked, narrow) = narrowed_unpack_result(ctx, res, rty);
+    let want_half = is_half_vector(ctx, rty);
+    let unpacked = if want_half {
+        ctx.module.fresh_id()
+    } else {
+        res
+    };
     let mut out = vec![Instruction::new(
         Op::ExtInst,
         Some(v_float),
@@ -1367,7 +724,14 @@ pub(in crate::passes) fn lower_unpack(
             Operand::IdRef(args[0]),
         ],
     )];
-    out.extend(narrow);
+    if want_half {
+        out.push(Instruction::new(
+            Op::FConvert,
+            Some(rty),
+            Some(res),
+            vec![Operand::IdRef(unpacked)],
+        ));
+    }
     Ok(out)
 }
 
@@ -1389,10 +753,8 @@ pub(in crate::passes) fn lower_image_size_query(
         return Err(format!("{name} missing texture"));
     }
     let mut img = resolve_image_value(ctx, args[0]);
-    if texture_operand_is_absent(ctx, img) {
-        if let Some(query_img) =
-            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Query)
-        {
+    if texture_operand_is_private_pointer(ctx, img) {
+        if let Some(query_img) = single_image_for_private_query(ctx, img) {
             img = query_img;
         } else {
             let zero = ctx.const_int_of(rty, 0);
@@ -1418,10 +780,7 @@ pub(in crate::passes) fn lower_image_size_query(
     let ncomp = spatial + if arrayed { 1 } else { 0 };
     let is_array_size_query = name.starts_with("air.get_array_size_texture");
     if is_array_size_query && !arrayed {
-        return Err(format!(
-            "{name} used on non-array texture id {img} ({})",
-            describe_value(ctx, img)
-        ));
+        return Err(format!("{name} used on non-array texture"));
     }
     let comp = if is_array_size_query {
         spatial
@@ -1511,10 +870,8 @@ pub(in crate::passes) fn lower_get_num_mip_levels(
         .copied()
         .ok_or_else(|| format!("{name} missing texture"))?;
     img = resolve_image_value(ctx, img);
-    if texture_operand_is_absent(ctx, img) {
-        if let Some(query_img) =
-            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Query)
-        {
+    if texture_operand_is_private_pointer(ctx, img) {
+        if let Some(query_img) = single_image_for_private_query(ctx, img) {
             img = query_img;
         } else {
             let uint = ctx.ty_uint();
@@ -1562,8 +919,8 @@ pub(in crate::passes) fn lower_get_num_samples_texture(
         return Err(format!("{name} missing texture"));
     };
     img = resolve_image_value(ctx, img);
-    if texture_operand_is_absent(ctx, img) {
-        match recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Query) {
+    if texture_operand_is_private_pointer(ctx, img) {
+        match single_image_for_private_query(ctx, img) {
             Some(query_img) => img = query_img,
             None => return Ok(single_sample(ctx)),
         }
@@ -1592,7 +949,10 @@ pub(in crate::passes) fn lower_get_num_samples_texture(
 
 /// `air.get_num_samples.i32(flags)` returns graphics pipeline state, not a property of an image
 /// operand. Vulkan exposes no equivalent shader query, so translation embeds the exact value the
-/// caller supplied in [`TransformOptions::raster_sample_count`].
+/// caller supplied in [`TransformOptions::raster_sample_count`] - or, when the caller translates once
+/// for every pipeline that shares the module (a translation cache keyed by the shader), a
+/// specialization constant the pipeline sets to its `rasterizationSamples`
+/// ([`crate::reflect::RASTER_SAMPLE_COUNT_SPEC_ID`]).
 pub(in crate::passes) fn lower_raster_sample_count(
     ctx: &mut Ctx,
     name: &str,
@@ -1604,11 +964,11 @@ pub(in crate::passes) fn lower_raster_sample_count(
     if ctx.stage != Stage::Fragment {
         return Err(format!("{name} requires fragment stage"));
     }
-    let samples = ctx.raster_sample_count.ok_or_else(|| {
-        format!(
-            "{name} requires TransformOptions::raster_sample_count to match the graphics pipeline"
-        )
-    })?;
+    let Some(samples) = ctx.raster_sample_count else {
+        let uint = ctx.ty_uint();
+        let value = ctx.raster_sample_count_spec();
+        return Ok(vec![copy_or_bitcast_result(rty, res, uint, value)]);
+    };
     if !matches!(samples, 1 | 2 | 4 | 8 | 16 | 32 | 64) {
         return Err(format!(
             "{name} raster sample count {samples} is not a Vulkan sample-count value"
@@ -1641,10 +1001,8 @@ pub(in crate::passes) fn lower_calculate_lod_texture_2d(
     }
 
     let mut img = resolve_image_value(ctx, args[0]);
-    if texture_operand_is_absent(ctx, img) {
-        if let Some(sampled_img) =
-            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Sampled)
-        {
+    if texture_operand_is_private_pointer(ctx, img) {
+        if let Some(sampled_img) = single_sampled_image_for_private_read(ctx, img) {
             img = sampled_img;
         }
     }
@@ -1671,7 +1029,7 @@ pub(in crate::passes) fn lower_calculate_lod_texture_2d(
         ));
     }
     let samp = if comp == crate::passes::ImageComp::Float {
-        valid_sampler_value(ctx, args[1], &mut out)?
+        valid_sampler_value(ctx, args[1], &mut out, SamplerUse::LodQuery)?
     } else {
         // Vulkan rejects linear-filter samplers paired with integer sampled images even for LOD
         // queries. The query only needs a valid sampler/image pair, not the AIR filter mode, so use
@@ -1735,9 +1093,23 @@ pub(in crate::passes) fn lower_get_null_texture(
     res: Option<Word>,
 ) -> Result<Vec<Instruction>, String> {
     let res = res.ok_or_else(|| format!("{name} has no result"))?;
-    // `air.get_null_texture_<shape>` names its shape the same way every other texture intrinsic
-    // does; read it with the same parser so a family added to one is not missing from the other.
-    let (dim, arrayed) = intrinsic_texture_shape(name).unwrap_or((Dim::Dim2D, false));
+    let (dim, arrayed) = if name.contains("texture_buffer") {
+        (Dim::DimBuffer, false)
+    } else if name.contains("_1d_array") {
+        (Dim::Dim1D, true)
+    } else if name.contains("_1d") {
+        (Dim::Dim1D, false)
+    } else if name.contains("_3d") {
+        (Dim::Dim3D, false)
+    } else if name.contains("_cube_array") {
+        (Dim::DimCube, true)
+    } else if name.contains("_cube") {
+        (Dim::DimCube, false)
+    } else if name.contains("_2d_array") {
+        (Dim::Dim2D, true)
+    } else {
+        (Dim::Dim2D, false)
+    };
     let var = ctx.default_null_image_of(dim, arrayed)?;
     let img_ty = ctx.ty_image(dim, arrayed, crate::passes::ImageComp::Float);
     ctx.image_dims.insert(res, (dim, arrayed));
@@ -1751,20 +1123,10 @@ pub(in crate::passes) fn lower_get_null_texture(
     )])
 }
 
-/// `air.map_screen_to_physical_coordinates.*`: with a rasterization-rate map whose rate is a uniform
-/// 1.0 the physical grid is the screen grid, so the mapping is the identity and the screen coordinate
-/// passes through unchanged — the same answer, in the same direction, as its inverse
-/// [`lower_map_physical_to_screen`].
-///
-/// Verified on device (Apple M3 Max, `MTLRasterizationRateMap` built from an all-1.0 layer over a
-/// 1024x1024 screen, parameter data via `copyParameterData`, decoded by
-/// `rasterization_rate_map_decoder` in a Metal kernel): `map_screen_to_physical_coordinates` answers
-/// its argument exactly at (0,0), (64,64), (256,256), (512,512), (768,768), (1023,1023) and
-/// (100,900), and `physicalSize == screenSize`. The same probe with a 0.5 rate returns a genuinely
-/// non-linear map in both directions, so a real variable-rate decode remains a separate
-/// resource-model problem shared with the inverse; the identity is the right answer only for the
-/// uniform map, and it is the answer that at least agrees with the inverse.
+/// `air.map_screen_to_physical_coordinates.*`: the private capture harness backs the rasterization-rate map
+/// with a single uniform physical tile, so this resolves to a constant zero physical coordinate.
 pub(in crate::passes) fn lower_map_screen_to_physical(
+    ctx: &mut Ctx,
     name: &str,
     res: Option<Word>,
     rty: Option<Word>,
@@ -1777,11 +1139,12 @@ pub(in crate::passes) fn lower_map_screen_to_physical(
             "{name} expects screen coordinate, map data, and layer"
         ));
     }
+    let zero = ctx.const_float(0.0);
     Ok(vec![Instruction::new(
-        Op::CopyObject,
+        Op::CompositeConstruct,
         Some(rty),
         Some(res),
-        vec![Operand::IdRef(args[0])],
+        vec![Operand::IdRef(zero), Operand::IdRef(zero)],
     )])
 }
 
@@ -1910,6 +1273,19 @@ mod tests {
             assert_eq!(actual_count, component_count, "{name}");
         }
         assert!(packed_format("air.unpack.unorm.rgb10a2.v4f32").is_none());
+        // The packed pixel types share the 4x8 / 2x16 pair; sRGB does not.
+        for (name, pack_op) in [
+            ("air.pack.unorm.rgba8.v4f32", GLSLstd450::PackUnorm4x8),
+            ("air.unpack.unorm.rgba8.v4f32", GLSLstd450::PackUnorm4x8),
+            ("air.pack.snorm.rgba8.v4f16", GLSLstd450::PackSnorm4x8),
+            ("air.pack.unorm.rg16.v2f32", GLSLstd450::PackUnorm2x16),
+            ("air.unpack.snorm.rg16.v2f32", GLSLstd450::PackSnorm2x16),
+        ] {
+            let (actual, _, _) = packed_format(name).unwrap_or_else(|| panic!("classify {name}"));
+            assert_eq!(actual as u32, pack_op as u32, "{name}");
+        }
+        assert!(packed_format("air.pack.srgba8.v4f32").is_none());
+        assert!(packed_format("air.pack.unorm.rgb565.v3f32").is_none());
     }
 
     #[test]

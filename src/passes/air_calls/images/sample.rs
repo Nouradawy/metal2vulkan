@@ -2,71 +2,15 @@
 
 use super::*;
 
-use crate::reflect::SamplerAddressMode;
-
 /// Lower air.sample_texture_<dim>: combine the texture+sampler operands via OpSampledImage and emit
 /// OpImageSampleExplicitLod when AIR carries a scalar float LOD operand, when integer textures require
 /// it, or when a compute kernel cannot legally use implicit derivatives.
 /// AIR call args: a0=texture(loaded image), a1=sampler(loaded sampler), a2=coord, then optional
 /// layer/LOD/flags. Result is AIR's {vecN,i8}; we reproduce it as OpCompositeConstruct so the
 /// downstream CompositeExtract 0 still yields the color.
-/// Whether the AIR family names Metal's explicit-derivative sample.
-fn is_gradient_family(name: &str) -> bool {
-    // `air.sample_texture_2d_grad.v4f16`: the family is the token before the return-type suffix, and
-    // a suffix can itself be several tokens (`.u.v4i16`), so test every token rather than a position.
-    name.split('.').any(|token| token.ends_with("_grad"))
-}
-
-/// Metal's `gradient2d(dPdx, dPdy)` operands, when the AIR family names the gradient form.
-///
-/// The `_grad` symbol places the two derivative vectors immediately after the coordinate (and, for
-/// an arrayed family, its layer), then a single scalar `min_lod_clamp` float. Without this the
-/// generic LOD search reads that clamp as an explicit level and the derivatives are dropped, which
-/// is a sample of the wrong mip in every module that asked for one.
-fn sample_gradient_pair(
-    ctx: &Ctx,
-    name: &str,
-    arrayed: bool,
-    args: &[Word],
-    spatial: usize,
-) -> Result<Option<(Word, Word)>, String> {
-    if !is_gradient_family(name) {
-        return Ok(None);
-    }
-    let start = if arrayed { 4 } else { 3 };
-    let is_derivative = |arg: Word| {
-        value_result_type(ctx, arg)
-            .and_then(|ty| vector_type_shape(ctx, ty))
-            .is_some_and(|(elem, lanes)| lanes as usize == spatial && is_f32_scalar(ctx, elem))
-    };
-    let (Some(&dx), Some(&dy)) = (args.get(start), args.get(start + 1)) else {
-        return Err(format!("{name} has no gradient operands"));
-    };
-    if !is_derivative(dx) || !is_derivative(dy) {
-        return Err(format!(
-            "{name} does not carry two {spatial}-component float derivatives after its coordinate"
-        ));
-    }
-    // The clamp that follows selects a floor for the derived level. Zero is no clamp at all, which
-    // is what every gradient sample in the corpus asks for; a real one would need `MinLod`.
-    if let Some(&clamp) = args.get(start + 2) {
-        let is_zero = value_def_instruction(ctx, clamp).is_some_and(|def| {
-            matches!(def.class.opcode, Op::ConstantNull)
-                || (def.class.opcode == Op::Constant
-                    && def.operands.first() == Some(&Operand::LiteralBit32(0)))
-        });
-        if !is_zero {
-            return Err(format!(
-                "{name} carries a nonzero minimum-LOD clamp, which this translator does not model"
-            ));
-        }
-    }
-    Ok(Some((dx, dy)))
-}
-
 pub(in crate::passes) fn lower_sample(
     ctx: &mut Ctx,
-    name: &str,
+    _name: &str,
     res: Option<Word>,
     rty: Option<Word>,
     args: &[Word],
@@ -80,10 +24,8 @@ pub(in crate::passes) fn lower_sample(
         return Err("air.sample missing texture/sampler/coord".into());
     }
     let (mut img, samp, coord) = (resolve_image_value(ctx, args[0]), args[1], args[2]);
-    if texture_operand_is_absent(ctx, img) {
-        if let Some(sampled_img) =
-            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Sampled)
-        {
+    if texture_operand_is_private_pointer(ctx, img) {
+        if let Some(sampled_img) = single_sampled_image_for_private_read(ctx, img) {
             img = sampled_img;
         } else {
             return lower_null_texture_result(ctx, res, rty);
@@ -122,14 +64,6 @@ pub(in crate::passes) fn lower_sample(
             || sampler_state.uses_pixel_nearest()
             || arrayed;
         if pixel_linear || pixel_bicubic || pixel_fetch {
-            if is_gradient_family(name) {
-                // These paths pick one mip level and fetch taps from it. A gradient sample chooses
-                // its level from the derivatives, which nothing here reads.
-                return Err(format!(
-                    "{name} samples through a pixel-coordinate sampler, whose emulation has no \
-                     place for the gradient the call carries"
-                ));
-            }
             let lod = match find_sample_lod(ctx, arrayed, args, &mut out) {
                 Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
                 None => ctx.const_uint(0),
@@ -231,54 +165,58 @@ pub(in crate::passes) fn lower_sample(
                 .into(),
         );
     }
-    if is_int_tex && is_gradient_family(name) {
-        return Err(format!(
-            "{name} samples an integer texture, whose nearest-fetch emulation has no place for \
-             the gradient the call carries"
-        ));
-    }
     if is_int_tex {
         if let Some(sampler_state) = ctx.sampler_states.get(&samp).copied() {
-            let lod = match find_sample_lod(ctx, arrayed, args, &mut out) {
-                Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
-                None => ctx.const_uint(0),
-            };
-            let fetch = build_normalized_nearest_fetch_coord(
-                ctx,
-                sampler_state,
-                img,
-                dim,
-                arrayed,
-                coord,
-                args,
-                lod,
-                &mut out,
-            )?;
-            let mut color = ctx.module.fresh_id();
-            push_image_read_or_fetch(ctx, &mut out, img, fetch.coord, Some(lod), sample_v4, color)?;
-            if let Some(in_bounds) = fetch.in_bounds {
-                let guarded = ctx.module.fresh_id();
-                let zero_color = const_null_of(ctx, sample_v4);
-                out.push(Instruction::new(
-                    Op::Select,
-                    Some(sample_v4),
-                    Some(guarded),
-                    vec![
-                        Operand::IdRef(in_bounds),
-                        Operand::IdRef(color),
-                        Operand::IdRef(zero_color),
-                    ],
-                ));
-                color = guarded;
+            if sample_uses_normalized_coords(ctx, arrayed, args) {
+                let lod = match find_sample_lod(ctx, arrayed, args, &mut out) {
+                    Some(lod) => sample_lod_to_fetch_lod(ctx, lod, &mut out)?,
+                    None => ctx.const_uint(0),
+                };
+                let fetch = build_normalized_nearest_fetch_coord(
+                    ctx,
+                    sampler_state,
+                    img,
+                    dim,
+                    arrayed,
+                    coord,
+                    args,
+                    lod,
+                    &mut out,
+                )?;
+                let mut color = ctx.module.fresh_id();
+                push_image_read_or_fetch(
+                    ctx,
+                    &mut out,
+                    img,
+                    fetch.coord,
+                    Some(lod),
+                    sample_v4,
+                    color,
+                )?;
+                if let Some(in_bounds) = fetch.in_bounds {
+                    let guarded = ctx.module.fresh_id();
+                    let zero_color = const_null_of(ctx, sample_v4);
+                    out.push(Instruction::new(
+                        Op::Select,
+                        Some(sample_v4),
+                        Some(guarded),
+                        vec![
+                            Operand::IdRef(in_bounds),
+                            Operand::IdRef(color),
+                            Operand::IdRef(zero_color),
+                        ],
+                    ));
+                    color = guarded;
+                }
+                return finish_sample_result(ctx, res, rty, color, sample_v4, out);
             }
-            return finish_sample_result(ctx, res, rty, color, sample_v4, out);
         }
     }
 
     let si_ty = ctx.ty_sampled_image(img_ty);
     let si = ctx.module.fresh_id();
     let color = ctx.module.fresh_id();
-    let samp = valid_sampler_value(ctx, samp, &mut out)?;
+    let samp = valid_sampler_value(ctx, samp, &mut out, SamplerUse::Sample)?;
     out.push(Instruction::new(
         Op::SampledImage,
         Some(si_ty),
@@ -290,16 +228,8 @@ pub(in crate::passes) fn lower_sample(
     // arg[2]; for *_array samples the layer index is the NEXT integer arg (arg[3]). The combined
     // coordinate has (#spatial-dims + arrayed) float components.
     let mut coord_for_sample = build_sample_coord(ctx, dim, arrayed, coord, args, &mut out)?;
+    let explicit_lod = find_sample_lod(ctx, arrayed, args, &mut out);
     let spatial = sample_spatial_dims(dim);
-    let grad = match spatial {
-        Some(spatial) => sample_gradient_pair(ctx, name, arrayed, args, spatial)?,
-        None => sample_gradient_pair(ctx, name, arrayed, args, 0)?,
-    };
-    let level = if grad.is_some() {
-        None
-    } else {
-        find_sample_level(ctx, arrayed, args, &mut out)
-    };
     let (const_offset, dynamic_offset) = if let Some(spatial) = spatial {
         let (const_offset, dynamic_offset) =
             sample_const_or_dynamic_offset(ctx, arrayed, args, spatial as u32)?;
@@ -321,6 +251,7 @@ pub(in crate::passes) fn lower_sample(
             arrayed,
             coord_for_sample,
             offset,
+            sample_uses_normalized_coords(ctx, arrayed, args),
             spatial,
             &mut out,
         )?;
@@ -332,10 +263,9 @@ pub(in crate::passes) fn lower_sample(
         color,
         si,
         coord_for_sample,
-        level,
+        explicit_lod,
         is_int_tex,
         const_offset,
-        grad,
     );
 
     finish_sample_result(ctx, res, rty, color, sample_v4, out)
@@ -421,15 +351,8 @@ fn lower_pixel_bicubic_sample(
         } else {
             component
         };
-        let component = clamp_pixel_coord_component_finite(
-            ctx,
-            sampler_state,
-            component,
-            size,
-            spatial > 1,
-            axis as u32,
-            out,
-        );
+        let component =
+            clamp_pixel_coord_component_finite(ctx, component, size, spatial > 1, axis as u32, out);
         let biased = ctx.module.fresh_id();
         out.push(Instruction::new(
             Op::FSub,
@@ -636,33 +559,18 @@ fn catmull_rom_weights(ctx: &mut Ctx, t: Word, out: &mut Vec<Instruction>) -> [W
     [w0, w1, w2, w3]
 }
 
-/// Clamp a float pixel-space sample coordinate component to a finite range before it is floored
-/// and converted to an integer texel index. `OpConvertFToS` of inf/NaN is undefined and the
-/// linear-filter fraction `inf - floor(inf)` is NaN, which no zero-weight guard can mask, while a
-/// hardware sampler resolves a non-finite coordinate through the address mode like any other
-/// far-out-of-range one. `NClamp` maps a NaN coordinate to the low bound deterministically.
-///
-/// *Which* finite range is safe depends on the axis address mode, because it is that mode which
-/// resolves the integer texel downstream:
-///
-/// * The three CLAMP modes saturate, so `[-9.0, size + 9.0]` is free: sample offsets are bounded
-///   to `[-8, 7]` texels by the AIR contract, so any value at or below -9 (or at or beyond
-///   size + 9) still resolves purely through the address mode after the offset is applied, and
-///   the downstream per-tap clamp / in-bounds guard yields the identical edge texel or border
-///   zero for the clamped value.
-/// * The two REPEAT modes wrap modulo the extent, so saturating first destroys the coordinate's
-///   phase and answers the wrong texel — on an 8-wide texture a pixel coordinate of 25.5 wraps to
-///   texel 1, and clamped to 17.0 it does not. Wrap by whole periods instead (`size` for `Repeat`,
-///   `2 * size` for `MirroredRepeat`). `x - period * floor(x / period)` subtracts an exact integer
-///   multiple of the period, so the fraction the filter weights are built from survives bit for
-///   bit, and the result lands in `[0, period]` — which the saturating clamp would then break
-///   again for a mirrored axis, so the two are alternatives and never composed.
-///
-/// The wrap does not make the downstream `SMod` redundant: the half-texel bias can still push the
-/// base texel to `-1`, and a bicubic footprint still reaches a tap or two past the extent.
+/// Clamp a float pixel-space sample coordinate component to the finite range `[-9.0, size + 9.0]`
+/// before it is floored / converted to an integer texel index. For finite coordinates this
+/// preserves sampling behavior: sample offsets are bounded to [-8, 7] texels by the AIR contract,
+/// so any value at or below -9 (or at or beyond size + 9) still resolves purely through the
+/// address mode after the offset is applied, and the downstream per-tap clamp / in-bounds guard
+/// yields the identical edge texel or border zero for the clamped value. Non-finite coordinates,
+/// however, poison the integer conversion — `OpConvertFToS` of inf/NaN is undefined, and the
+/// linear-filter fraction `inf - floor(inf)` is NaN, which no zero-weight guard can mask — while a
+/// hardware sampler resolves them through the address mode like any other far-out-of-range
+/// coordinate. `NClamp` maps a NaN coordinate to the low bound deterministically.
 pub(in crate::passes) fn clamp_pixel_coord_component_finite(
     ctx: &mut Ctx,
-    sampler_state: StaticSamplerState,
     comp: Word,
     size: Word,
     size_is_vector: bool,
@@ -691,77 +599,15 @@ pub(in crate::passes) fn clamp_pixel_coord_component_finite(
         Some(size_f),
         vec![Operand::IdRef(size_axis)],
     ));
-    let period = match sampler_state.spatial_address_mode(axis as usize) {
-        Some(SamplerAddressMode::Repeat) => Some(size_f),
-        Some(SamplerAddressMode::MirroredRepeat) => {
-            let two = ctx.const_float(2.0);
-            let period = ctx.module.fresh_id();
-            out.push(Instruction::new(
-                Op::FMul,
-                Some(float_ty),
-                Some(period),
-                vec![Operand::IdRef(size_f), Operand::IdRef(two)],
-            ));
-            Some(period)
-        }
-        _ => None,
-    };
-    let Some(period) = period else {
-        let slack = ctx.const_float(9.0);
-        let hi = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FAdd,
-            Some(float_ty),
-            Some(hi),
-            vec![Operand::IdRef(size_f), Operand::IdRef(slack)],
-        ));
-        let lo = ctx.const_float(-9.0);
-        return nclamp_float(ctx, comp, lo, hi, out);
-    };
-    // Only to make the coordinate finite: 2^22 is far past any texture extent, and keeping
-    // `period * floor(x / period)` well inside the f32 integer range is what keeps the wrap exact.
-    let hi = ctx.const_float(4_194_304.0);
-    let lo = ctx.const_float(-4_194_304.0);
-    let finite = nclamp_float(ctx, comp, lo, hi, out);
-    let quotient = ctx.module.fresh_id();
+    let slack = ctx.const_float(9.0);
+    let hi = ctx.module.fresh_id();
     out.push(Instruction::new(
-        Op::FDiv,
+        Op::FAdd,
         Some(float_ty),
-        Some(quotient),
-        vec![Operand::IdRef(finite), Operand::IdRef(period)],
+        Some(hi),
+        vec![Operand::IdRef(size_f), Operand::IdRef(slack)],
     ));
-    let whole = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::ExtInst,
-        Some(float_ty),
-        Some(whole),
-        vec![
-            Operand::IdRef(glsl),
-            Operand::LiteralExtInstInteger(8), // Floor
-            Operand::IdRef(quotient),
-        ],
-    ));
-    let periods = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::FMul,
-        Some(float_ty),
-        Some(periods),
-        vec![Operand::IdRef(period), Operand::IdRef(whole)],
-    ));
-    let wrapped = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::FSub,
-        Some(float_ty),
-        Some(wrapped),
-        vec![Operand::IdRef(finite), Operand::IdRef(periods)],
-    ));
-    wrapped
-}
-
-/// `GLSLstd450NClamp(x, lo, hi)`, which resolves a NaN `x` to `lo`.
-fn nclamp_float(ctx: &mut Ctx, x: Word, lo: Word, hi: Word, out: &mut Vec<Instruction>) -> Word {
-    let float_ty = ctx.ty_float();
-    let glsl = ctx.glsl();
+    let lo = ctx.const_float(-9.0);
     let clamped = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::ExtInst,
@@ -770,7 +616,7 @@ fn nclamp_float(ctx: &mut Ctx, x: Word, lo: Word, hi: Word, out: &mut Vec<Instru
         vec![
             Operand::IdRef(glsl),
             Operand::LiteralExtInstInteger(81), // NClamp
-            Operand::IdRef(x),
+            Operand::IdRef(comp),
             Operand::IdRef(lo),
             Operand::IdRef(hi),
         ],
@@ -830,7 +676,6 @@ pub(in crate::passes) fn lower_pixel_linear_sample(
         };
         let comp = clamp_pixel_coord_component_finite(
             ctx,
-            sampler_state,
             comp,
             size,
             spatial > 1 || arrayed,
@@ -1170,112 +1015,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(scaled_extent_ids.len(), 2);
-    }
-
-    #[test]
-    fn a_repeating_bicubic_wraps_the_coordinate_rather_than_clamping_it() {
-        // A saturating clamp to `[-9, size + 9]` is only free for the three CLAMP address modes.
-        // Under `address::repeat` it destroys the coordinate's phase, so both axes must wrap by
-        // whole periods instead — and must not do both, since a wrap already lands in range.
-        let mut ctx = Ctx::new(Module::new());
-        let image_ty = ctx.ty_image(Dim::Dim2D, false, crate::passes::ImageComp::Float);
-        let image = ctx.module.fresh_id();
-        ctx.new_globals.push(Instruction::new(
-            Op::Undef,
-            Some(image_ty),
-            Some(image),
-            vec![],
-        ));
-        let coord_ty = ctx.ty_vecf(2);
-        let x = ctx.const_float(3.0625);
-        let y = ctx.const_float(0.4375);
-        let coord = ctx.module.fresh_id();
-        ctx.new_globals.push(Instruction::new(
-            Op::ConstantComposite,
-            Some(coord_ty),
-            Some(coord),
-            vec![Operand::IdRef(x), Operand::IdRef(y)],
-        ));
-        let sample_v4 = ctx.ty_vecf(4);
-        let lod = ctx.const_uint(0);
-        // The word `constant sampler(filter::bicubic, address::repeat, coord::normalized)` compiles
-        // to, taken from `validation/fixtures/public/kernel_bicubic_repeat_wrap.metal`.
-        let sampler_state = StaticSamplerState::from_air_words([34901797601023122, 0])
-            .expect("bicubic repeat AIR sampler state");
-        assert!(sampler_state.uses_bicubic_filter());
-        assert!(!sampler_state.uses_pixel_coordinates());
-        for axis in 0..2 {
-            assert_eq!(
-                sampler_state.spatial_address_mode(axis),
-                Some(SamplerAddressMode::Repeat)
-            );
-        }
-
-        let mut out = Vec::new();
-        lower_pixel_bicubic_sample(
-            &mut ctx,
-            sampler_state,
-            image,
-            Dim::Dim2D,
-            false,
-            coord,
-            &[image, 0, coord],
-            lod,
-            sample_v4,
-            true,
-            &mut out,
-        )
-        .expect("bicubic repeat lowering");
-
-        let float_constant = |value: f32, ctx: &Ctx| {
-            ctx.new_globals.iter().any(|inst| {
-                inst.class.opcode == Op::Constant
-                    && inst.operands.first() == Some(&Operand::LiteralBit32(value.to_bits()))
-            })
-        };
-        for slack in [9.0f32, -9.0f32] {
-            assert!(
-                !float_constant(slack, &ctx),
-                "a repeating axis must not saturate to size {slack:+}"
-            );
-        }
-
-        // One `x - period * floor(x / period)` per axis, and each period is the axis extent
-        // rather than a constant, so the wrap tracks the texture it is actually sampling.
-        let floored_quotients = out
-            .iter()
-            .filter(|inst| {
-                inst.class.opcode == Op::ExtInst
-                    && inst.operands.get(1) == Some(&Operand::LiteralExtInstInteger(8))
-            })
-            .filter(|inst| {
-                let Some(Operand::IdRef(source)) = inst.operands.get(2) else {
-                    return false;
-                };
-                out.iter().any(|candidate| {
-                    candidate.result_id == Some(*source) && candidate.class.opcode == Op::FDiv
-                })
-            })
-            .filter_map(|inst| inst.result_id)
-            .collect::<HashSet<_>>();
-        assert_eq!(floored_quotients.len(), 2);
-        let wraps = out
-            .iter()
-            .filter(|inst| inst.class.opcode == Op::FSub)
-            .filter(|inst| {
-                let Some(Operand::IdRef(subtrahend)) = inst.operands.get(1) else {
-                    return false;
-                };
-                out.iter().any(|candidate| {
-                    candidate.result_id == Some(*subtrahend)
-                        && candidate.class.opcode == Op::FMul
-                        && candidate.operands.iter().any(|operand| {
-                            matches!(operand, Operand::IdRef(id) if floored_quotients.contains(id))
-                        })
-                })
-            })
-            .count();
-        assert_eq!(wraps, 2);
     }
 
     #[test]

@@ -8,55 +8,57 @@
 //! copies formerly open-coded in `inline/mod.rs` and `lower/access.rs`.
 
 use crate::spirv_module::Block;
-use spirv::Word;
+use crate::spirv_module::Operand;
+use spirv::{Op, Word};
 use std::collections::HashMap;
 
-pub(in crate::passes) use crate::spirv_module::block_successors;
-
-pub(in crate::passes) use crate::spirv_module::block_successors_by_label;
-
-/// Block dominance of one owned SPIR-V function body, indexed by block position.
-///
-/// The passes layer needs the same question the owned-CFG check asks — does the block that defines
-/// a value dominate the block that uses it — whenever it substitutes an existing SSA value for an
-/// operand it did not find in place. Built from [`block_successors`] over the positional block
-/// order, so `0` is the entry block, and answered through the crate's single dominator computation
-/// rather than a second copy of it.
-pub(in crate::passes) struct BlockDominance {
-    reachable: Vec<bool>,
-    intervals: Vec<Option<(usize, usize)>>,
+/// Successor block labels of one owned `Block`, read from its terminator. Branch/BranchConditional
+/// arms in operand order; switch default + case targets sorted and deduped. Non-terminating or
+/// unstructured-terminator blocks yield no successors.
+pub(in crate::passes) fn block_successors(block: &Block) -> Vec<Word> {
+    fn id_ref(operand: &Operand) -> Option<Word> {
+        match operand {
+            Operand::IdRef(id) => Some(*id),
+            _ => None,
+        }
+    }
+    let Some(inst) = block.instructions.last() else {
+        return Vec::new();
+    };
+    match inst.class.opcode {
+        Op::Branch => inst.operands.first().and_then(id_ref).into_iter().collect(),
+        Op::BranchConditional => inst
+            .operands
+            .iter()
+            .skip(1)
+            .take(2)
+            .filter_map(id_ref)
+            .collect(),
+        Op::Switch => {
+            let mut out = Vec::new();
+            if let Some(default) = inst.operands.get(1).and_then(id_ref) {
+                out.push(default);
+            }
+            let mut idx = 3;
+            while idx < inst.operands.len() {
+                if let Some(target) = inst.operands.get(idx).and_then(id_ref) {
+                    out.push(target);
+                }
+                idx += 2;
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+        _ => Vec::new(),
+    }
 }
 
-impl BlockDominance {
-    pub(in crate::passes) fn of(blocks: &[Block]) -> Self {
-        let positions: HashMap<Word, usize> = blocks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, block)| Some((block.label.as_ref()?.result_id?, index)))
-            .collect();
-        let successors = blocks
-            .iter()
-            .map(|block| {
-                block_successors(block)
-                    .into_iter()
-                    .filter_map(|label| positions.get(&label).copied())
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let predecessors = crate::dominators::build_predecessors(&successors);
-        let (reachable, intervals, _) = crate::dominators::dominance(&successors, &predecessors);
-        Self {
-            reachable,
-            intervals,
-        }
-    }
-
-    /// Whether `dominator` dominates `block`. An unreachable use is dominated by nothing, which is
-    /// the conservative answer: a substitution there cannot be justified by dominance either.
-    pub(in crate::passes) fn dominates(&self, dominator: usize, block: usize) -> bool {
-        if !self.reachable.get(block).copied().unwrap_or(false) {
-            return false;
-        }
-        crate::dominators::dominates_interval(&self.intervals, dominator, block)
-    }
+/// Forward-edge adjacency of an owned SPIR-V function body keyed by block label id
+/// (via [`block_successors`]). Blocks without a label id are skipped.
+pub(in crate::passes) fn block_successors_by_label(blocks: &[Block]) -> HashMap<Word, Vec<Word>> {
+    blocks
+        .iter()
+        .filter_map(|block| Some((block.label.as_ref()?.result_id?, block_successors(block))))
+        .collect()
 }

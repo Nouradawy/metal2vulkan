@@ -179,28 +179,10 @@ impl Emitter {
             return Ok(false);
         };
         let elem = self.resolve_type(elem)?;
-        if *lanes == 0 {
+        if !types_compatible(pointee, &elem) || *lanes == 0 {
             return Ok(false);
         }
-        // The lanes are addressed as SLOTS of the pointee type, and each slot is reinterpreted into
-        // the result's element type. When the two agree the reinterpret is the identity; when they
-        // are incompatible but equal in width it is one `OpBitcast` per lane. That is exactly the
-        // set `emit_vector_to_scalar_stores` accepts in the other direction, and the two must accept
-        // the same set or a module cannot read back the vector it just wrote lane by lane.
-        let slot_ty = if types_compatible(pointee, &elem) {
-            elem.clone()
-        } else {
-            let (Some(elem_bits), Some(pointee_bits)) =
-                (bitcast_width(&elem), bitcast_width(pointee))
-            else {
-                return Ok(false);
-            };
-            if elem_bits != pointee_bits {
-                return Ok(false);
-            }
-            pointee.clone()
-        };
-        if *lanes > 1 && !self.can_emit_gep_provenance_lane_ptrs(ptr_value, &slot_ty)? {
+        if *lanes > 1 && !self.can_emit_gep_provenance_lane_ptrs(ptr_value, &elem)? {
             return self.emit_scalar_pointer_vector_load(
                 result,
                 &elem,
@@ -216,7 +198,7 @@ impl Emitter {
             let lane_ptr = if lane == 0 {
                 ptr
             } else {
-                self.emit_gep_provenance_lane_ptr(ptr_value, &slot_ty, lane, instructions)?
+                self.emit_gep_provenance_lane_ptr(ptr_value, &elem, lane, instructions)?
                     .ok_or_else(|| {
                         "native emitter: scalar-to-vector load lost pointer provenance".to_string()
                     })?
@@ -225,29 +207,15 @@ impl Emitter {
         }
 
         let elem_type = self.type_id(&elem)?;
-        let slot_type = self.type_id(&slot_ty)?;
-        let lanes_need_bitcast = slot_type != elem_type;
         let mut lane_ids = Vec::with_capacity(*lanes as usize);
         for lane_ptr in lane_ptrs {
             let lane_id = self.fresh();
             instructions.push(Self::inst(
                 Op::Load,
-                Some(slot_type),
+                Some(elem_type),
                 Some(lane_id),
                 vec![Operand::IdRef(lane_ptr)],
             ));
-            let lane_id = if lanes_need_bitcast {
-                let reinterpreted = self.fresh();
-                instructions.push(Self::inst(
-                    Op::Bitcast,
-                    Some(elem_type),
-                    Some(reinterpreted),
-                    vec![Operand::IdRef(lane_id)],
-                ));
-                reinterpreted
-            } else {
-                lane_id
-            };
             lane_ids.push(Operand::IdRef(lane_id));
         }
 
@@ -345,8 +313,8 @@ impl Emitter {
         Ok(true)
     }
 
-    /// Reinterpret-load a WIDER result from a narrower SCALAR pointee by reading the contiguous scalar
-    /// slots that span the result's bytes and bit-reinterpreting them. The dominant case is an
+    /// Reinterpret-load a WIDER VECTOR result from a narrower SCALAR pointee by reading the contiguous
+    /// scalar slots that span the result's bytes and bit-reinterpreting them. The dominant case is an
     /// `OpLoad %v4float` (128 bits) through a `half` element pointer into a `device half*` runtime array
     /// (an MPS half-buffer read as a float vector): 8 contiguous halfs are the 4 floats' bytes. For each
     /// result lane this packs `slots_per_elem = result_elem_bits / pointee_bits` consecutive pointee
@@ -355,12 +323,6 @@ impl Emitter {
     /// it to the result vector. Packing into a `uint` vector (never an N-wide pointee vector) keeps the
     /// component count in {2,3,4} — no `Vector16` capability is needed.
     ///
-    /// A SCALAR result is the one-lane case of the same assembly and takes the same path: the single
-    /// accumulator is the result, with no `OpCompositeConstruct` around it. It is reached where a byte
-    /// pointer cannot be re-typed and `emit_scalar_load_from_byte_pointer` has already declined —
-    /// notably on a Private byte view, where per-byte `OpPtrAccessChain` is illegal but a
-    /// gep-provenance sibling pointer is not.
-    ///
     /// Byte-EXACT on a little-endian target (the assembled bits are the bytes the load reads at the
     /// chain address). Byte-SAFE by construction: only fires when the gep provenance strides a
     /// contiguous element (a single leading pointer-stride index, or a multi-index chain whose last
@@ -368,7 +330,7 @@ impl Emitter {
     /// differently-typed member). Floor-SAFE by construction: only REACHED on a width mismatch a valid
     /// module never has, and returns false unless the provenance proves contiguity, so a banked module
     /// is provably untouched.
-    pub(in crate::native::emitter) fn emit_scalar_slots_to_wider_load(
+    pub(in crate::native::emitter) fn emit_scalar_to_wider_vector_load(
         &mut self,
         result: Word,
         pointee: &LlType,
@@ -380,27 +342,24 @@ impl Emitter {
         if matches!(pointee, LlType::Vector(..)) {
             return Ok(false);
         }
-        let (result_elem, lanes) = match result_ty {
-            LlType::Vector(elem, lanes) => (self.resolve_type(elem)?, *lanes),
-            LlType::Float | LlType::Half | LlType::BFloat | LlType::Int(_) => {
-                (result_ty.clone(), 1)
-            }
-            _ => return Ok(false),
+        let LlType::Vector(result_elem, lanes) = result_ty else {
+            return Ok(false);
         };
+        let result_elem = self.resolve_type(result_elem)?;
         let (Some(pointee_bits), Some(result_elem_bits)) =
             (bitcast_width(pointee), bitcast_width(&result_elem))
         else {
             return Ok(false);
         };
         if pointee_bits == 0
-            || lanes == 0
+            || *lanes == 0
             || result_elem_bits <= pointee_bits
             || result_elem_bits % pointee_bits != 0
         {
             return Ok(false);
         }
         let slots_per_elem = result_elem_bits / pointee_bits;
-        let total_slots = slots_per_elem * lanes;
+        let total_slots = slots_per_elem * *lanes;
         // Byte-safety gate: the sibling slots must be a contiguous array/vector stride, and the
         // provenance must be able to form per-slot sibling pointers.
         if !self.gep_provenance_strides_contiguous(ptr_value, pointee)?
@@ -451,8 +410,8 @@ impl Emitter {
         }
 
         // Pack `slots_per_elem` consecutive slots, little-endian, into each result element's uint.
-        let mut elem_uints = Vec::with_capacity(lanes as usize);
-        for lane in 0..lanes {
+        let mut elem_uints = Vec::with_capacity(*lanes as usize);
+        for lane in 0..*lanes {
             let mut acc: Option<Word> = None;
             for j in 0..slots_per_elem {
                 let slot_uint = slot_uints[(lane * slots_per_elem + j) as usize];
@@ -503,50 +462,24 @@ impl Emitter {
             })?));
         }
 
-        // Assemble the accumulators into the result: a vector result composes its lanes first, a
-        // scalar result IS its single accumulator. Either way a bitcast follows unless the result is
-        // already the unsigned integer the lanes were packed into.
+        // Build the uint vector, then bitcast to the result vector type if it isn't already uint.
+        let uint_vec_ty = LlType::Vector(Box::new(elem_uint.clone()), *lanes);
         let bitcast_needed = !types_compatible(&result_elem, &elem_uint);
-        let packed = match result_ty {
-            LlType::Vector(..) => {
-                let uint_vec_type =
-                    self.type_id(&LlType::Vector(Box::new(elem_uint.clone()), lanes))?;
-                let uint_vec = if bitcast_needed { self.fresh() } else { result };
-                instructions.push(Self::inst(
-                    Op::CompositeConstruct,
-                    Some(uint_vec_type),
-                    Some(uint_vec),
-                    elem_uints,
-                ));
-                uint_vec
-            }
-            _ => {
-                let Operand::IdRef(acc) = elem_uints[0] else {
-                    return Ok(false);
-                };
-                if bitcast_needed {
-                    acc
-                } else {
-                    // The accumulator already has the result type, but `result` still needs a
-                    // defining instruction.
-                    let result_type = self.type_id(result_ty)?;
-                    instructions.push(Self::inst(
-                        Op::CopyObject,
-                        Some(result_type),
-                        Some(result),
-                        vec![Operand::IdRef(acc)],
-                    ));
-                    result
-                }
-            }
-        };
+        let uint_vec_type = self.type_id(&uint_vec_ty)?;
+        let uint_vec = if bitcast_needed { self.fresh() } else { result };
+        instructions.push(Self::inst(
+            Op::CompositeConstruct,
+            Some(uint_vec_type),
+            Some(uint_vec),
+            elem_uints,
+        ));
         if bitcast_needed {
             let result_type = self.type_id(result_ty)?;
             instructions.push(Self::inst(
                 Op::Bitcast,
                 Some(result_type),
                 Some(result),
-                vec![Operand::IdRef(packed)],
+                vec![Operand::IdRef(uint_vec)],
             ));
         }
         Ok(true)

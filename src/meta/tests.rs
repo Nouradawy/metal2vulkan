@@ -240,15 +240,14 @@ entry:
     assert_eq!(m.role_of(0), Some(&FragRole::Texture(4)));
 }
 
-/// Both Metal spellings of the threadgroup size have a lowering, and they are not the same one.
+/// Both Metal spellings of the threadgroup size denote the same value in Vulkan.
 ///
-/// They differ under `dispatchThreads:`, where a final partial threadgroup reports a smaller
-/// `threads_per_threadgroup` than the dispatch asked for -- and this translator reproduces that
-/// dispatch by giving each region of `KernelDispatchPlan` its own local size, so the difference
-/// survives into Vulkan rather than collapsing there. What both roles must keep is a lowering at
-/// all: a parameter that read a zero instead of the size divided by it in every shader that used it.
+/// They differ only under `dispatchThreads:`, where a final partial threadgroup reports a smaller
+/// `threads_per_threadgroup` than the dispatch asked for. `vkCmdDispatch` issues whole workgroups
+/// only, so there is nothing for the two to disagree about — and a parameter that read a zero
+/// instead of the size divided by it in every shader that used it.
 #[test]
-fn each_threadgroup_size_role_has_its_own_lowering() {
+fn both_threadgroup_size_roles_are_the_execution_local_size() {
     let ll = |role: &str| {
         format!(
             r#"
@@ -264,18 +263,15 @@ define void @K(i32 %size) {{
 "#
         )
     };
-    for (role, expected) in [
-        ("threads_per_threadgroup", KernRole::ThreadsPerThreadgroup),
-        (
-            "dispatch_threads_per_threadgroup",
-            KernRole::DispatchThreadsPerThreadgroup,
-        ),
+    for role in [
+        "threads_per_threadgroup",
+        "dispatch_threads_per_threadgroup",
     ] {
         let meta = parse_air_kernel_meta(&ll(role)).expect("kernel metadata");
         assert_eq!(
             meta.role_of(0),
-            Some(&expected),
-            "`air.{role}` decodes as its own threadgroup-size role"
+            Some(&KernRole::ThreadsPerThreadgroup),
+            "`air.{role}` is the execution local size"
         );
         assert!(
             meta.unmodelled_input_params.is_empty(),
@@ -284,13 +280,11 @@ define void @K(i32 %size) {{
     }
 }
 
-/// A gated-off texture that STATES its Metal slot keeps its binding. `[[texture(0),
-/// function_constant(a)]]` beside `[[texture(0), function_constant(!a)]]` is Metal's own spelling of
-/// mutually exclusive typed alternatives: the slot is written down rather than summed, so it is this
-/// argument's slot whichever alternative the pipeline enables.
 #[test]
-fn kernel_function_constant_texture_with_a_literal_location_is_bound_when_disabled_by_default() {
+fn kernel_function_constant_texture_with_valid_location_is_bound_when_disabled_by_default() {
     let ll = r#"
+@texture_location = internal addrspace(2) global i32 40, align 4
+@sampler_location = internal addrspace(2) global i32 15, align 4
 @texture_enabled = internal addrspace(2) global i8 0, align 1
 
 define void @K(ptr addrspace(1) %texture, ptr addrspace(2) %sampler) {
@@ -301,55 +295,13 @@ define void @K(ptr addrspace(1) %texture, ptr addrspace(2) %sampler) {
 !0 = !{ptr @K, !1, !2}
 !1 = !{}
 !2 = !{!3, !4}
-!3 = !{i32 0, !"air.function_constant", !5, !"air.texture", !"air.location_index", i32 40, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
-!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 15, i32 1, !"air.arg_type_name", !"sampler"}
+!3 = !{i32 0, !"air.function_constant", !5, !"air.texture", !"air.location_index", ptr addrspace(2) @texture_location, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
+!4 = !{i32 1, !"air.sampler", !"air.location_index", ptr addrspace(2) @sampler_location, i32 1, !"air.arg_type_name", !"sampler"}
 !5 = !{ptr addrspace(2) @texture_enabled, !"bool", !"texture_enabled"}
 "#;
     let meta = parse_air_kernel_meta(ll).expect("kernel metadata");
     assert_eq!(meta.role_of(0), Some(&KernRole::Texture(40)));
     assert_eq!(meta.role_of(1), Some(&KernRole::Sampler(15)));
-}
-
-/// ...and a gated-off texture whose slot is a RUNNING SUM the static initializer computes does not.
-///
-/// Metal compiles `[[texture(fc_expr)]]` into a sum over the arguments the pipeline enables, so for
-/// an argument this variant leaves out the global holds wherever the sum stopped -- which is the
-/// LIVE texture's own slot, as it is here. Binding the gated argument there decorates two
-/// differently shaped images with one descriptor, so it must not be bound at all. 4851 corpus
-/// `air.location_index` operands are spelled this way and every one of them is a global the static
-/// initializer writes; none is a constant global like the literal case above.
-#[test]
-fn kernel_function_constant_texture_summed_onto_a_live_texture_slot_is_not_bound() {
-    let ll = r#"
-@live_enabled = internal addrspace(2) global i8 1, align 1
-@gated_enabled = internal addrspace(2) global i8 0, align 1
-@live_location = internal addrspace(2) global i32 0, align 4
-@gated_location = internal addrspace(2) global i32 0, align 4
-
-define internal void @_GLOBAL__sub_I_alternatives.metal() #0 section "air.static_init" {
-  store i32 3, ptr addrspace(2) @live_location, align 4
-  store i32 3, ptr addrspace(2) @gated_location, align 4
-  ret void
-}
-
-define void @K(ptr addrspace(1) %live, ptr addrspace(1) %gated) {
-  ret void
-}
-
-!air.kernel = !{!0}
-!0 = !{ptr @K, !1, !2}
-!1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.function_constant", !5, !"air.texture", !"air.location_index", ptr addrspace(2) @live_location, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>"}
-!4 = !{i32 1, !"air.function_constant", !6, !"air.texture", !"air.location_index", ptr addrspace(2) @gated_location, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d_array<float, sample>"}
-!5 = !{ptr addrspace(2) @live_enabled, !"bool", !"live_enabled"}
-!6 = !{ptr addrspace(2) @gated_enabled, !"bool", !"gated_enabled"}
-"#;
-    let meta = parse_air_kernel_meta(ll).expect("kernel metadata");
-    assert_eq!(meta.role_of(0), Some(&KernRole::Texture(3)));
-    // Not `Other`: the argument is a TEXTURE this variant leaves out, and saying so is what lets
-    // the lowering tell its placeholder apart from a handle it merely lost.
-    assert_eq!(meta.role_of(1), Some(&KernRole::VariantAbsentTexture));
 }
 
 #[test]
@@ -371,7 +323,7 @@ define void @K(ptr addrspace(1) %texture) {
 "#;
 
     let meta = parse_air_kernel_meta(ll).expect("kernel metadata");
-    assert_eq!(meta.role_of(0), Some(&KernRole::VariantAbsentTexture));
+    assert_eq!(meta.role_of(0), Some(&KernRole::Other));
 }
 
 #[test]
@@ -752,18 +704,8 @@ fn vertex_render_target_array_index_role() {
     );
 }
 
-/// A `[[function_constant]]`-gated return member keeps the varying slot it occupies.
-///
-/// Vertex→fragment linkage is by `Location`, and the two stages are translated as separate modules
-/// from the same Metal varying struct. The fragment decode reads a gated `air.fragment_input` as
-/// the varying it is and numbers it; if the vertex decode drops the same member, every later
-/// varying in that struct is numbered one lower on the vertex side. Both modules still validate,
-/// and the fragment silently reads the wrong interpolant. Only an AIR-specialized-off predicate
-/// (`air.function_constant_disabled`) removes a member, and specialization is applied to both
-/// stages alike. `tests/gated_varying_locations.rs` pins the same rule end to end on the emitted
-/// `Location` decorations.
 #[test]
-fn a_gated_vertex_output_keeps_the_varying_slot_it_declares() {
+fn vertex_function_constant_output_is_disabled_by_default() {
     let ll = r#"
 !air.vertex = !{!0}
 !0 = !{ptr @vmain, !1, !6}
@@ -776,21 +718,11 @@ fn a_gated_vertex_output_keeps_the_varying_slot_it_declares() {
 "#;
     let m = parse_air_vertex_meta(ll).unwrap();
     assert_eq!(m.output_role_of(0), Some(&VertOutRole::Position));
-    assert_eq!(m.output_role_of(1), Some(&VertOutRole::Varying(0)));
-    assert_eq!(m.output_role_of(2), Some(&VertOutRole::Varying(1)));
-
-    // The specialized-off form is the one that removes the member, and it removes it from every
-    // stage: `specialize_function_constant_metadata` rewrites the wrapper for the whole module.
-    let disabled = parse_air_vertex_meta(&ll.replace(
-        "!\"air.function_constant\", !4,",
-        "!\"air.function_constant_disabled\", !4,",
-    ))
-    .unwrap();
     assert_eq!(
-        disabled.output_role_of(1),
+        m.output_role_of(1),
         Some(&VertOutRole::FunctionConstantDisabled)
     );
-    assert_eq!(disabled.output_role_of(2), Some(&VertOutRole::Varying(0)));
+    assert_eq!(m.output_role_of(2), Some(&VertOutRole::Varying(0)));
 }
 
 // `!air.kernel`: buffers + compute builtins (mirrors multi_add.air + harvested app kernels).
@@ -833,112 +765,11 @@ fn kernel_roles() {
     assert_eq!(m.role_of(6), Some(&KernRole::ThreadgroupsPerGrid));
     assert_eq!(m.role_of(7), Some(&KernRole::ThreadgroupPositionInGrid));
     assert_eq!(m.role_of(8), Some(&KernRole::ThreadIndexInThreadgroup));
-    assert_eq!(
-        m.role_of(9),
-        Some(&KernRole::ExecutionGroup {
-            fact: ExecutionGroupFact::ThreadIndexInGroup,
-            lanes: 32,
-        })
-    );
-    assert_eq!(
-        m.role_of(10),
-        Some(&KernRole::ExecutionGroup {
-            fact: ExecutionGroupFact::GroupIndexInThreadgroup,
-            lanes: 32,
-        })
-    );
+    assert_eq!(m.role_of(9), Some(&KernRole::ThreadIndexInSimdgroup));
+    assert_eq!(m.role_of(10), Some(&KernRole::SimdgroupIndexInThreadgroup));
     assert_eq!(m.role_of(11), Some(&KernRole::ThreadsPerGrid));
-    assert_eq!(
-        m.role_of(12),
-        Some(&KernRole::ExecutionGroup {
-            fact: ExecutionGroupFact::ThreadsPerGroup,
-            lanes: 32,
-        })
-    );
-    assert_eq!(
-        m.role_of(13),
-        Some(&KernRole::ExecutionGroup {
-            fact: ExecutionGroupFact::GroupsPerThreadgroup,
-            lanes: 32,
-        })
-    );
-}
-
-/// Every marker the execution-group family decodes is one some stage's inventory calls modelled,
-/// and exactly the stages that can answer it.
-///
-/// The decoder and the inventory are separate statements of one fact -- [`execution_group_role`]
-/// decides what the emitter can lower, [`air_input_role_is_modelled`] decides what it refuses -- and
-/// a member missing from the second is refused despite having a lowering, while one missing from the
-/// first is bound to a zero and never reported. `air.quadgroups_per_threadgroup` was in neither, and
-/// the whole family was in the kernel's alone: a fragment declaring
-/// `[[thread_index_in_simdgroup]]`, a lane index that needs no threadgroup, was refused outright.
-#[test]
-fn every_execution_group_marker_is_listed_as_modelled() {
-    for &(group, lanes) in AIR_EXECUTION_GROUPS {
-        for (marker, fact) in [
-            (
-                format!("thread_index_in_{group}"),
-                ExecutionGroupFact::ThreadIndexInGroup,
-            ),
-            (
-                format!("{group}_index_in_threadgroup"),
-                ExecutionGroupFact::GroupIndexInThreadgroup,
-            ),
-            (
-                format!("{group}s_per_threadgroup"),
-                ExecutionGroupFact::GroupsPerThreadgroup,
-            ),
-            (
-                format!("threads_per_{group}"),
-                ExecutionGroupFact::ThreadsPerGroup,
-            ),
-        ] {
-            assert_eq!(
-                execution_group_role(&marker),
-                Some((fact, lanes)),
-                "`air.{marker}` names a {group}, which is {lanes} threads wide"
-            );
-            for stage in [Stage::Kernel, Stage::Fragment, Stage::Vertex] {
-                let answerable = stage == Stage::Kernel || !fact.needs_a_threadgroup();
-                assert_eq!(
-                    air_input_role_is_modelled(stage, &marker),
-                    answerable,
-                    "`air.{marker}` at {stage:?}: a fact about the group is answered at every \
-                     stage, a fact about the threadgroup only where there is one"
-                );
-                // `dispatch_` asks what the DISPATCH requested. The two differ only for a final
-                // partial threadgroup, which `vkCmdDispatch` cannot issue.
-                let dispatched = format!("dispatch_{marker}");
-                assert_eq!(
-                    air_input_role_is_modelled(stage, &dispatched),
-                    answerable,
-                    "`air.{dispatched}` is `air.{marker}` under Vulkan"
-                );
-            }
-            // No inventory may spell the family out a second time; the decoder is the one statement.
-            for inventory in [FRAGMENT_INPUT_ROLES, VERTEX_INPUT_ROLES, KERNEL_INPUT_ROLES] {
-                assert!(
-                    !inventory.contains(&marker.as_str()),
-                    "`air.{marker}` is decoded from its shape and must not also be listed"
-                );
-            }
-        }
-    }
-    // Neighbours whose markers END the same way but name no execution group.
-    for marker in [
-        "threads_per_threadgroup",
-        "thread_index_in_threadgroup",
-        "threadgroups_per_grid",
-        "threads_per_grid",
-        "thread_position_in_grid",
-    ] {
-        assert_eq!(
-            execution_group_role(marker),
-            None,
-            "`air.{marker}` is not an execution-group fact"
-        );
-    }
+    assert_eq!(m.role_of(12), Some(&KernRole::ThreadsPerSimdgroup));
+    assert_eq!(m.role_of(13), Some(&KernRole::SimdgroupsPerThreadgroup));
 }
 
 #[test]
@@ -1250,140 +1081,6 @@ define void @k(ptr addrspace(1) %optional) {
     assert_eq!(promoted.buffer_type_name(0), Some("float"));
 }
 
-/// A gated buffer the module's own static initializers drive ON is bound; the same declaration
-/// behind a gate driven OFF, or behind one the module cannot resolve, stays absent. AIR shape from
-/// `CC`-style `!"air.function_constant", !PRED, !"air.buffer"` arguments, whose predicate global is
-/// written by the `air.static_init` constructor.
-#[test]
-fn a_gated_buffer_is_bound_only_when_the_module_drives_its_gate_on() {
-    let ll = |stored: &str| {
-        format!(
-            r#"
-@pred = internal addrspace(2) global i8 undef, align 1
-
-define internal void @ctor() section "air.static_init" {{
-  store i8 {stored}, ptr addrspace(2) @pred, align 1
-  ret void
-}}
-
-define void @k(ptr addrspace(1) %optional) {{
-  ret void
-}}
-
-!air.kernel = !{{!0}}
-!0 = !{{ptr @k, !1, !2}}
-!1 = !{{}}
-!2 = !{{!3}}
-!3 = !{{i32 0, !"air.function_constant", !4, !"air.buffer", !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"optional"}}
-!4 = !{{ptr addrspace(2) @pred, !"bool", !"kOptional"}}
-"#
-        )
-    };
-
-    let on = parse_air_kernel_meta(&ll("1")).expect("gate on");
-    assert_eq!(on.role_of(0), Some(&KernRole::Buffer(7)));
-    assert_eq!(on.buffer_address_space(0), Some(1));
-    assert_eq!(on.buffer_type_name(0), Some("float"));
-
-    let off = parse_air_kernel_meta(&ll("0")).expect("gate off");
-    assert_eq!(off.role_of(0), Some(&KernRole::Other));
-
-    // An initializer this evaluator cannot fold leaves the gate unresolved, and "may be present"
-    // is not evidence of presence: the possibly-absent placeholder stays.
-    let unresolved = parse_air_kernel_meta(&ll("%runtime")).expect("gate unresolved");
-    assert_eq!(unresolved.role_of(0), Some(&KernRole::Other));
-}
-
-/// The vertex decode answers the same declaration the same way. One gated buffer must not be a
-/// binding on one stage and a Private placeholder on another.
-#[test]
-fn a_vertex_gated_buffer_follows_the_same_gate_evidence() {
-    let ll = |stored: &str| {
-        format!(
-            r#"
-@pred = internal addrspace(2) global i8 undef, align 1
-
-define internal void @ctor() section "air.static_init" {{
-  store i8 {stored}, ptr addrspace(2) @pred, align 1
-  ret void
-}}
-
-define void @v(ptr addrspace(1) %optional) {{
-  ret void
-}}
-
-!air.vertex = !{{!0}}
-!0 = !{{ptr @v, !1, !2}}
-!1 = !{{}}
-!2 = !{{!3}}
-!3 = !{{i32 0, !"air.function_constant", !4, !"air.buffer", !"air.location_index", i32 5, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"optional"}}
-!4 = !{{ptr addrspace(2) @pred, !"bool", !"kOptional"}}
-"#
-        )
-    };
-
-    let on = parse_air_vertex_meta(&ll("1")).expect("gate on");
-    assert_eq!(on.role_of(0), Some(&VertRole::Buffer(5)));
-
-    let off = parse_air_vertex_meta(&ll("0")).expect("gate off");
-    assert_eq!(off.role_of(0), Some(&VertRole::Other));
-}
-
-/// A gated buffer on a FRAGMENT entry keeps its binding whichever way the gate resolves, and that
-/// is not the kernel and vertex answer above. The asymmetry is measured, not an oversight.
-///
-/// Making the fragment agree with the other two -- dropping the descriptor when the module's own
-/// initializers drive the gate to zero -- changes 172 of the 14579 local corpus sources' SPIR-V
-/// bytes and 175 of their reflections, for **490 buffer bindings dropped and none gained**. 132 of
-/// those 490 are referenced by the module's own instructions: 1060 `OpLoad`s become `OpCopyObject`
-/// of a null, in 100 modules. Nothing is rescued (zero status transitions) and the only gain is 10
-/// fewer duplicate `(kind, set, binding)` slots.
-///
-/// The rule [`variant_texture_slot`] already applies says why the fragment is the right answer: a
-/// gated-off argument declaring a LITERAL slot keeps it, because `[[buffer(0), function_constant(a)]]`
-/// beside `[[buffer(0), function_constant(!a)]]` is Metal's own spelling of mutually exclusive
-/// alternatives. Only a slot SUMMED through a function constant is fabricated when the argument is
-/// absent -- and a census of all 933 gated fragment buffer declarations in the corpus finds **zero**
-/// with a summed slot. The evidence that drops a texture slot does not exist for a buffer, and the
-/// gate alone is not it: the seeded-to-zero `air.fc_initializer` default is what the module compiles
-/// against, not what the pipeline binds.
-#[test]
-fn a_fragment_gated_buffer_keeps_its_literal_slot_whichever_way_the_gate_resolves() {
-    let ll = |stored: &str| {
-        format!(
-            r#"
-@pred = internal addrspace(2) global i8 undef, align 1
-
-define internal void @ctor() section "air.static_init" {{
-  store i8 {stored}, ptr addrspace(2) @pred, align 1
-  ret void
-}}
-
-define void @f(ptr addrspace(1) %optional) {{
-  ret void
-}}
-
-!air.fragment = !{{!0}}
-!0 = !{{ptr @f, !1, !2}}
-!1 = !{{!5}}
-!5 = !{{!"air.render_target", i32 0, i32 0}}
-!2 = !{{!3}}
-!3 = !{{i32 0, !"air.function_constant", !4, !"air.buffer", !"air.buffer_size", i32 4, !"air.location_index", i32 7, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float", !"air.arg_name", !"optional"}}
-!4 = !{{ptr addrspace(2) @pred, !"bool", !"kOptional"}}
-"#
-        )
-    };
-
-    for stored in ["1", "0", "%runtime"] {
-        let meta = parse_air_fragment_meta(&ll(stored)).expect("fragment meta");
-        assert_eq!(
-            meta.role_of(0),
-            Some(&FragRole::Buffer(7)),
-            "gate stored as {stored}"
-        );
-    }
-}
-
 #[test]
 fn primitive_air_type_names_include_64_bit_integers() {
     assert_eq!(
@@ -1421,80 +1118,6 @@ fn nested_bitfield_struct_type_info_uses_declared_storage() {
             AirMember {
                 offset: 4,
                 ty: AirType::Scalar(Float)
-            }
-        ]))
-    );
-}
-
-/// AIR spells a C bitfield by giving each field the offset of the byte its run starts in beside
-/// the size of the WHOLE underlying storage unit. Read member-by-member, `cv3d` corpus source
-/// `5e3a0bbd` reconstructs `uint pixel_x` at 0, `uint pixel_y` at 1 and `uint matid` at 3 as a
-/// seven-byte struct for a four-byte argument, which `validate_descriptor_abi` refuses -- so the
-/// whole module failed to translate over a layout nobody asked for.
-#[test]
-fn top_level_bitfield_struct_type_info_has_no_reconstructed_layout() {
-    let ll = r#"
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Packed", !"air.arg_name", !"packed"}
-!4 = !{i32 0, i32 4, i32 0, !"uint", !"pixel_x", i32 1, i32 4, i32 0, !"uint", !"pixel_y", i32 3, i32 4, i32 0, !"uint", !"matid"}
-"#;
-    let m = parse_air_kernel_meta(ll).unwrap();
-    assert_eq!(m.layout_of(0), None);
-}
-
-/// A union is the other shape with overlapping members, and it is refused for the same reason:
-/// the layout's consumer builds a SPIR-V struct type from it, and a `Block` cannot decorate two
-/// members onto the same bytes. Handing it one does not produce an overlapping struct -- it makes
-/// the emitter address the WHOLE buffer as raw words. Reporting the union instead cost `87c1f8ca`
-/// every typed access chain into its `PKMetalStrokeVertex` array; refusing it lets the emitter's
-/// own reconstruction take over, which gained typed chains on 32 corpus sources and lost them on
-/// none.
-#[test]
-fn union_struct_type_info_has_no_reconstructed_layout() {
-    let ll = r#"
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Params", !"air.arg_name", !"params"}
-!4 = !{i32 0, i32 4, i32 0, !"float", !"as_float", i32 0, i32 4, i32 0, !"int", !"as_int", i32 0, i32 4, i32 0, !"uint", !"as_uint"}
-"#;
-    let m = parse_air_kernel_meta(ll).unwrap();
-    assert_eq!(m.layout_of(0), None);
-}
-
-/// A nested node that is refused leaves its member exactly as well described as before, because
-/// AIR stated the member's size in the enclosing tuple. It must NOT take the whole enclosing
-/// layout down with it.
-#[test]
-fn a_refused_nested_node_costs_only_its_own_member() {
-    let ll = r#"
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.struct_type_info", !4, !"air.arg_type_size", i32 12, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"Outer", !"air.arg_name", !"outer"}
-!4 = !{i32 0, i32 4, i32 0, !"float", !"lead", !"air.struct_type_info", !5, i32 4, i32 4, i32 0, !"Bits", !"bits", i32 8, i32 4, i32 0, !"uint", !"tail"}
-!5 = !{i32 0, i32 4, i32 0, !"uint", !"x", i32 1, i32 4, i32 0, !"uint", !"y"}
-"#;
-    let m = parse_air_kernel_meta(ll).unwrap();
-    assert_eq!(
-        m.layout_of(0),
-        Some(&AirType::Struct(vec![
-            AirMember {
-                offset: 0,
-                ty: AirType::Scalar(Float)
-            },
-            AirMember {
-                offset: 4,
-                ty: AirType::Scalar(UInt)
-            },
-            AirMember {
-                offset: 8,
-                ty: AirType::Scalar(UInt)
             }
         ]))
     );
@@ -1834,551 +1457,26 @@ entry:
     assert_eq!(meta.render_target_members, vec![(0, 0), (1, 1)]);
 }
 
-/// The fragment decode reads a gated argument's role with `primary_role`, which looks past the
-/// `air.function_constant` wrapper unconditionally; the kernel and vertex decodes read theirs with
-/// `fc_promoted_role`. For a resource role the two have to answer the same thing, or one
-/// declaration produces a descriptor in one stage and nothing in another -- which is how a gated
-/// `air.sampler` came to bind in fragments and vanish in kernels and vertices while the gated
-/// `air.texture` beside it bound in all three.
-///
-/// Checked over the promotion list itself rather than over a copy of it, so a role added to
-/// `FC_PROMOTED_RESOURCE_ROLES` is covered by construction. That makes it silent about a role
-/// MISSING from the list, which is the defect that happened; the non-vacuous pin for that is
-/// `tests/gated_system_values.rs::a_gated_sampler_is_a_descriptor_in_every_stage`, which builds one
-/// declaration and translates it in all three stages.
+/// Dawn's coverage blending (Skia Graphite paths and icons in Chrome) returns two colors for
+/// attachment 0: `[[color(0), index(0)]]` and `[[color(0), index(1)]]`. The second operand after
+/// `air.render_target` is that index. Both members keep Location 0; the index-1 member is the
+/// blend's second source, not another attachment, so it is absent from the attachment list.
 #[test]
-fn a_promoted_resource_role_reads_the_same_wrapped_as_bare() {
-    for role in FC_PROMOTED_RESOURCE_ROLES {
-        let bare = vec![(*role).to_string()];
-        let wrapped = vec!["function_constant".to_string(), (*role).to_string()];
-        assert_eq!(
-            fc_promoted_role(&wrapped, false),
-            Some(*role),
-            "a gated {role} keeps its role"
-        );
-        assert_eq!(
-            fc_promoted_role(&wrapped, false),
-            fc_promoted_role(&bare, false),
-            "and reads the same as the ungated declaration"
-        );
-        assert_eq!(
-            fc_promoted_role(&wrapped, false),
-            primary_role(&wrapped),
-            "and the same as the fragment decode's reader"
-        );
-    }
-}
-
-/// Every role the vertex output decode lowers is read past an `air.function_constant` wrapper.
-///
-/// Driven off `VERTEX_OUTPUT_ROLES`, which is the table the decode itself matches on -- a role
-/// cannot be lowered without appearing here, so unlike a role list beside a `match` this cannot go
-/// vacuous about a role the decode handles. That is the whole point of the table: the wrapper list
-/// and the lowering used to be two spellings of one fact, and the wrapper list named no output role
-/// at all.
-#[test]
-fn every_vertex_output_role_is_read_past_the_function_constant_wrapper() {
-    for (role, _) in VERTEX_OUTPUT_ROLES {
-        let bare = vec![(*role).to_string()];
-        let wrapped = vec!["function_constant".to_string(), (*role).to_string()];
-        let read = |strs: &[String]| {
-            gated_role(strs, |role| vertex_output_kind(role).is_some()).map(str::to_string)
-        };
-        assert_eq!(
-            read(&wrapped),
-            Some((*role).to_string()),
-            "a gated air.{role} return member declares air.{role}"
-        );
-        assert_eq!(read(&wrapped), read(&bare), "same as the bare declaration");
-        assert_eq!(
-            read(&wrapped),
-            primary_role(&wrapped).map(str::to_string),
-            "and same as the fragment decode's reader, which reads every wrapped role"
-        );
-    }
-}
-
-/// A gated BUILTIN is absent unless the module's own initializer turns it on; a gated VARYING is
-/// present either way.
-///
-/// The asymmetry is [`AIR_SYSTEM_VALUE_ROLES`]', for the same reason.
-/// Nothing writes a builtin whose predicate is not on, and declaring `Layer` or `ViewportIndex`
-/// anyway puts a device capability in the module for a value nothing produces; four vertex sources
-/// of a 14579-source corpus declare TWO gated `air.point_size` members under mutually exclusive
-/// predicates, and promoting both emits two `PointSize` builtins, which is invalid. A varying is
-/// kept because the stage consuming the same struct keeps it -- dropping it on one side renumbers
-/// every later varying on that side only.
-#[test]
-fn a_gated_vertex_builtin_is_absent_and_a_gated_varying_is_not() {
-    let module = |role: &str| {
-        format!(
-            r#"
-@off = internal addrspace(2) global i8 0, align 1
-
-!air.vertex = !{{!0}}
-!0 = !{{ptr @vmain, !1, !9}}
-!1 = !{{!2, !3, !5}}
-!2 = !{{!"air.position", !"air.arg_type_name", !"float4"}}
-!3 = !{{!"air.function_constant", !4, !"air.{role}", !"air.arg_type_name", !"float", !"air.arg_name", !"gated"}}
-!4 = !{{ptr addrspace(2) @off, !"bool", !"gate"}}
-!5 = !{{!"air.vertex_output", !"air.arg_type_name", !"float", !"air.arg_name", !"after"}}
-!9 = !{{}}
-"#
-        )
-    };
-    for (role, kind) in VERTEX_OUTPUT_ROLES {
-        // `air.position` is not a gated case: a vertex shader without a clip position is not a
-        // vertex shader, and the decode gives member 0 the position whatever it says.
-        if matches!(kind, VertexOutputKind::Position) {
-            continue;
-        }
-        let m = parse_air_vertex_meta(&module(role)).unwrap();
-        if kind.is_system_value() {
-            assert_eq!(
-                m.output_role_of(1),
-                Some(&VertOutRole::FunctionConstantDisabled),
-                "an off air.{role} builtin is absent"
-            );
-            assert_eq!(
-                m.output_role_of(2),
-                Some(&VertOutRole::Varying(0)),
-                "and never consumed a varying location to begin with"
-            );
-        } else {
-            assert_eq!(
-                m.output_role_of(1),
-                Some(&VertOutRole::Varying(0)),
-                "a gated air.{role} keeps its slot"
-            );
-            assert_eq!(
-                m.output_role_of(2),
-                Some(&VertOutRole::Varying(1)),
-                "and the member behind it keeps its own"
-            );
-        }
-    }
-}
-
-/// The other end. A wrapped `buffer` stays collapsed unless the caller asks for the promoted
-/// projection, which is the one role whose descriptor the default path deliberately does not create.
-#[test]
-fn an_unpromoted_wrapped_role_stays_the_function_constant() {
-    let bare_wrapper = vec!["function_constant".to_string()];
-    assert_eq!(
-        fc_promoted_role(&bare_wrapper, true),
-        Some("function_constant")
-    );
-
-    let wrapped_buffer = vec!["function_constant".to_string(), "buffer".to_string()];
-    assert_eq!(
-        fc_promoted_role(&wrapped_buffer, false),
-        Some("function_constant")
-    );
-    assert_eq!(fc_promoted_role(&wrapped_buffer, true), Some("buffer"));
-}
-
-/// [`declared_role`] reads the role behind an `air.function_constant` wrapper POSITIONALLY: the
-/// wrapper is a marker plus the predicate it gates on, and the role is whatever follows.
-///
-/// Every case below is a node this reading has to tell apart from the others. A bare
-/// function-constant parameter IS the function constant, and reading past its wrapper by SCANNING
-/// lands on the node's own `air.arg_type_name`; asking [`fc_promoted_role`] instead answers `None`
-/// for every gated role the emitter does not promote, which is exactly the set a caller needs this
-/// for. The `air.amplification_id` row is a real corpus shape that was classified `Other`, bound to
-/// a zero, and never reported.
-#[test]
-fn a_declared_role_is_read_past_the_wrapper_by_position() {
-    for (node, expected) in [
-        (
-            r#"i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1"#,
-            Some("buffer"),
-        ),
-        (
-            r#"i32 0, !"air.function_constant", !9, !"air.texture", !"air.arg_type_name", !"texture2d<float, sample>""#,
-            Some("texture"),
-        ),
-        (
-            r#"i32 0, !"air.function_constant", !9, !"air.amplification_id""#,
-            Some("amplification_id"),
-        ),
-        // A wrapper whose predicate is followed by a qualifier gates a parameter that has no role.
-        (
-            r#"i32 0, !"air.function_constant", !9, !"air.arg_type_name", !"uint""#,
-            None,
-        ),
-        // ...as does one carrying no predicate at all.
-        (
-            r#"i32 0, !"air.function_constant", !"air.arg_type_name", !"uint""#,
-            None,
-        ),
-        // `specialize_function_constant_metadata` rewrites a resolved-off wrapper to this, and a
-        // declaration the pipeline leaves out declares no role to place.
-        (
-            r#"i32 0, !"air.function_constant_disabled", !9, !"air.texture""#,
-            None,
-        ),
-        (r#"i32 0"#, None),
-    ] {
-        assert_eq!(declared_role(node).as_deref(), expected, "reading `{node}`");
-    }
-}
-
-/// A kernel's stage-input ABI is a function of its SIGNATURE, not of the order AIR happens to list
-/// its argument nodes.
-///
-/// The same three arguments, listed forwards and backwards, must hand a consumer the same synthetic
-/// buffer slots. Allocation used to walk `roles` in list order, so a producer that emitted the
-/// argument nodes in a different order would have given the same shader different slots -- an ABI
-/// that depends on a metadata layout nothing else reads. Every kernel argument list in the local
-/// corpus is already in parameter-index order, so this pins a property rather than fixing an
-/// observed difference.
-#[test]
-fn kernel_stage_input_slots_do_not_depend_on_the_argument_list_order() {
-    const FORWARD: &str = r#"
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"float", !"air.arg_name", !"params"}
-!4 = !{i32 1, !"air.stage_in", !"air.location_index", i32 7, i32 1, !"air.arg_type_name", !"uint3", !"air.arg_name", !"first"}
-!5 = !{i32 2, !"air.stage_in", !"air.location_index", i32 9, i32 1, !"air.arg_type_name", !"uint3", !"air.arg_name", !"second"}
+fn a_dual_source_render_target_carries_its_blend_index() {
+    const FRAGMENT: &str = r#"
+!air.fragment = !{!0}
+!0 = !{ptr @F, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
+!3 = !{!"air.render_target", i32 0, i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"blend"}
+!4 = !{}
 "#;
-    const REVERSED: &str = r#"
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!5, !4, !3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_name", !"float", !"air.arg_name", !"params"}
-!4 = !{i32 1, !"air.stage_in", !"air.location_index", i32 7, i32 1, !"air.arg_type_name", !"uint3", !"air.arg_name", !"first"}
-!5 = !{i32 2, !"air.stage_in", !"air.location_index", i32 9, i32 1, !"air.arg_type_name", !"uint3", !"air.arg_name", !"second"}
-"#;
-    let forward = parse_air_kernel_meta(FORWARD).expect("kernel metadata");
-    let reversed = parse_air_kernel_meta(REVERSED).expect("kernel metadata");
-    assert_eq!(
-        forward.stage_input_bindings(),
-        reversed.stage_input_bindings(),
-        "the same kernel listed in a different order got different stage-input slots"
-    );
-    // ...and the slots skip the buffer the kernel already binds at 1.
-    assert_eq!(
-        forward.stage_input_bindings(),
-        HashMap::from([(1, 0), (2, 2)]),
-    );
-}
 
-/// The slot a role occupies in the Metal buffer table is one answer, and the synthetic stage-input
-/// allocator is its only consumer. A role that names a buffer index but reports `None` here would
-/// have a stage input allocated on top of it.
-#[test]
-fn every_kernel_role_that_names_a_buffer_index_reports_it() {
-    for (role, slot) in [
-        (KernRole::Buffer(3), Some(3)),
-        (KernRole::AccelerationStructureShadow(4), Some(4)),
-        (KernRole::PrimitiveAccelerationStructure(5), Some(5)),
-        (KernRole::PrimitiveAccelerationStructureShadow(6), Some(6)),
-        (KernRole::VisibleFunctionTable(7), Some(7)),
-        (KernRole::IntersectionFunctionTable(8), Some(8)),
-        // A texture or sampler index is a different table, and a stage input's own `u32` is the AIR
-        // attribute location the synthetic slot stands in for.
-        (KernRole::Texture(0), None),
-        (KernRole::Sampler(0), None),
-        (KernRole::StageInput(0), None),
-        (KernRole::ThreadPositionInGrid, None),
-        (KernRole::Other, None),
-    ] {
-        assert_eq!(role.buffer_table_slot(), slot, "{role:?}");
-    }
-}
-
-/// An unmodelled role behind a gate the module's own initializers do NOT resolve is still
-/// unmodelled, at every declaration site that refuses one.
-///
-/// The two questions a function-constant gate answers are not complements. "May this declaration be
-/// present" (`metadata_enabled_by_default`) reads an unresolved gate as absent; "did this variant
-/// leave the declaration out" (`function_constant_gate_disabled`) reads it as unknown. Refusing an
-/// unmodelled role is only excused by the second: a role the emitter cannot lower, behind a
-/// predicate the module does not decide, still ends up bound to a zero the shader reads as a
-/// barycentric coordinate or a sample mask.
-///
-/// The unresolved spelling here is the corpus's own -- the constructor stores a value the static
-/// evaluator cannot fold -- so the global's `0` initializer is no longer evidence of anything.
-#[test]
-fn an_unmodelled_role_behind_an_unresolved_gate_is_still_refused() {
-    // `store i8 0` folds; `store i8 %opaque` does not, and drops the global from the resolved set.
-    let module = |stage: &str, list: &str, resolved: bool| {
-        let stored = if resolved { "0" } else { "%opaque" };
-        format!(
-            r#"
-@gate = internal addrspace(2) global i8 0, align 1
-
-declare i8 @opaque()
-
-define internal void @_GLOBAL__sub_I.metal() #0 section "air.static_init" {{
-  %opaque = call i8 @opaque()
-  store i8 {stored}, ptr addrspace(2) @gate, align 1
-  ret void
-}}
-
-define void @E() {{
-  ret void
-}}
-
-!air.{stage} = !{{!0}}
-!0 = !{{ptr @E, !1, !2}}
-{list}
-!9 = !{{ptr addrspace(2) @gate, !"bool", !"gate"}}
-"#
-        )
-    };
-    // Each stage's own parameter list, plus the fragment return list -- the four places a declared
-    // role is checked against the roles that stage models.
-    let unmodelled_roles = |stage: &str, list: &str, resolved: bool| -> Vec<(u32, String)> {
-        let ll = module(stage, list, resolved);
-        match stage {
-            "kernel" => {
-                parse_air_kernel_meta(&ll)
-                    .expect("kernel metadata")
-                    .unmodelled_input_params
-            }
-            "vertex" => {
-                parse_air_vertex_meta(&ll)
-                    .expect("vertex metadata")
-                    .unmodelled_input_params
-            }
-            _ => {
-                let meta = parse_air_fragment_meta(&ll).expect("fragment metadata");
-                if list.contains("air.vertex_output") {
-                    meta.unmodelled_output_members
-                } else {
-                    meta.unmodelled_input_params
-                }
-            }
-        }
-    };
-    let empty_first = "!1 = !{}";
-    let sites = [
-        (
-            "kernel entry parameter",
-            "kernel",
-            format!(
-                "{empty_first}\n!2 = !{{!3}}\n!3 = !{{i32 0, !\"air.function_constant\", !9, \
-                 !\"air.render_target_array_index\"}}"
-            ),
-        ),
-        (
-            "fragment entry parameter",
-            "fragment",
-            format!(
-                "{empty_first}\n!2 = !{{!3}}\n!3 = !{{i32 0, !\"air.function_constant\", !9, \
-                 !\"air.simdgroup_index_in_threadgroup\"}}"
-            ),
-        ),
-        (
-            "vertex entry parameter",
-            "vertex",
-            format!(
-                "{empty_first}\n!2 = !{{!3}}\n!3 = !{{i32 0, !\"air.function_constant\", !9, \
-                 !\"air.point_coord\"}}"
-            ),
-        ),
-        (
-            "fragment return member",
-            "fragment",
-            "!1 = !{!3}\n!2 = !{}\n!3 = !{!\"air.function_constant\", !9, \
-             !\"air.vertex_output\"}"
-                .to_string(),
-        ),
-    ];
-    for (site, stage, list) in sites {
-        assert!(
-            unmodelled_roles(stage, &list, true).is_empty(),
-            "{site}: a gate this module's initializers drive to zero leaves the declaration out of \
-             the variant, so there is nothing to refuse"
-        );
-        assert_eq!(
-            unmodelled_roles(stage, &list, false).len(),
-            1,
-            "{site}: the gate is unresolved, so the role is still one this stage cannot lower"
-        );
-    }
-}
-
-/// A gated entry parameter that names a SYSTEM VALUE is classified as that system value unless the
-/// module's own initializers turn the gate off.
-///
-/// The fragment decode always read the role past the wrapper and consulted the system-value list
-/// only to drop the gated-OFF ones. The kernel and vertex decodes instead asked `fc_promoted_role`,
-/// which collapses every role it does not PROMOTE back to the wrapper -- so a gated-ON
-/// `air.thread_index_in_simdgroup` was classified `Other` and bound to a ZERO, in a module that
-/// validated and reflected as though nothing were missing. All three stages now answer through
-/// `present_system_value_role`, so the two halves of the rule cannot come apart per stage again.
-#[test]
-fn a_gated_on_system_value_is_the_system_value_at_every_stage() {
-    let module = |stage: &str, list: &str, on: bool| {
-        let value = u8::from(on);
-        format!(
-            r#"
-@gate = internal addrspace(2) global i8 {value}, align 1
-
-define void @E(i32 %sys) {{
-  ret void
-}}
-
-!air.{stage} = !{{!0}}
-!0 = !{{ptr @E, !1, !2}}
-!1 = !{{}}
-!2 = !{{!3}}
-{list}
-!9 = !{{ptr addrspace(2) @gate, !"bool", !"gate"}}
-"#
-        )
-    };
-    let node = |role: &str| {
-        format!(
-            "!3 = !{{i32 0, !\"air.function_constant\", !9, !\"air.{role}\", \
-             !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"sys\"}}"
-        )
-    };
-
-    for (role, expected) in [
-        (
-            "thread_index_in_simdgroup",
-            KernRole::ExecutionGroup {
-                fact: ExecutionGroupFact::ThreadIndexInGroup,
-                lanes: 32,
-            },
-        ),
-        (
-            "thread_index_in_threadgroup",
-            KernRole::ThreadIndexInThreadgroup,
-        ),
-    ] {
-        let list = node(role);
-        assert_eq!(
-            parse_air_kernel_meta(&module("kernel", &list, true))
-                .expect("kernel metadata")
-                .role_of(0),
-            Some(&expected),
-            "a gated-ON air.{role} is the builtin the kernel reads"
-        );
-        assert_eq!(
-            parse_air_kernel_meta(&module("kernel", &list, false))
-                .expect("kernel metadata")
-                .role_of(0),
-            Some(&KernRole::Other),
-            "...and a gated-OFF one is absent, so a zero is what Metal defines"
-        );
-    }
-
-    for (role, expected) in [
-        ("instance_id", VertRole::InstanceId),
-        ("vertex_id", VertRole::VertexId),
-    ] {
-        let list = node(role);
-        assert_eq!(
-            parse_air_vertex_meta(&module("vertex", &list, true))
-                .expect("vertex metadata")
-                .role_of(0),
-            Some(&expected),
-            "a gated-ON air.{role} is the builtin the vertex shader reads"
-        );
-        assert_eq!(
-            parse_air_vertex_meta(&module("vertex", &list, false))
-                .expect("vertex metadata")
-                .role_of(0),
-            Some(&VertRole::Other),
-            "...and a gated-OFF one is absent"
-        );
-    }
-
-    // The fragment decode already answered both halves; it must keep answering them the same way.
-    for (role, expected) in [
-        ("front_facing", FragRole::FrontFacing),
-        ("sample_id", FragRole::SampleId),
-    ] {
-        let list = node(role);
-        assert_eq!(
-            parse_air_fragment_meta(&module("fragment", &list, true))
-                .expect("fragment metadata")
-                .role_of(0),
-            Some(&expected),
-        );
-        assert_eq!(
-            parse_air_fragment_meta(&module("fragment", &list, false))
-                .expect("fragment metadata")
-                .role_of(0),
-            Some(&FragRole::Other),
-        );
-    }
-}
-
-/// Every arrayed texture spelling reflects as arrayed, including the two that no enumeration of
-/// per-dimension substrings caught: `texture2d_ms_array` and `depth2d_ms_array` do not contain
-/// `2d_array`, so they used to reflect as plain multisample 2D textures while the interface pass
-/// built an arrayed `OpTypeImage` for them from the same name. One `_array` suffix answers the
-/// question for all of them.
-#[test]
-fn every_arrayed_texture_spelling_reflects_as_arrayed() {
-    use crate::meta::{texture_shape_from_name, TextureDimension};
-
-    let arrayed: [(&str, TextureDimension, bool); 8] = [
-        (
-            "texture1d_array<float, sample>",
-            TextureDimension::D1,
-            false,
-        ),
-        (
-            "texture2d_array<float, sample>",
-            TextureDimension::D2,
-            false,
-        ),
-        (
-            "texture2d_ms_array<float, read>",
-            TextureDimension::D2,
-            true,
-        ),
-        ("depth2d_array<float, sample>", TextureDimension::D2, false),
-        ("depth2d_ms_array<float, read>", TextureDimension::D2, true),
-        (
-            "texturecube_array<float, sample>",
-            TextureDimension::Cube,
-            false,
-        ),
-        (
-            "depthcube_array<float, sample>",
-            TextureDimension::Cube,
-            false,
-        ),
-        (
-            "array<texture2d_ms_array<float, read>, 4>",
-            TextureDimension::D2,
-            true,
-        ),
-    ];
-    for (name, dimension, multisampled) in arrayed {
-        let shape = texture_shape_from_name(name);
-        assert!(shape.arrayed, "{name} is arrayed");
-        assert_eq!(shape.dimension, dimension, "{name}");
-        assert_eq!(shape.multisampled, multisampled, "{name}");
-    }
-
-    let single: [(&str, TextureDimension, bool); 7] = [
-        ("texture1d<float, sample>", TextureDimension::D1, false),
-        ("texture2d<float, sample>", TextureDimension::D2, false),
-        ("texture2d_ms<float, read>", TextureDimension::D2, true),
-        ("texture3d<float, sample>", TextureDimension::D3, false),
-        ("texturecube<float, sample>", TextureDimension::Cube, false),
-        ("depth2d<float, sample>", TextureDimension::D2, false),
-        (
-            "texture_buffer<float, read>",
-            TextureDimension::Buffer,
-            false,
-        ),
-    ];
-    for (name, dimension, multisampled) in single {
-        let shape = texture_shape_from_name(name);
-        assert!(!shape.arrayed, "{name} is a single texture");
-        assert_eq!(shape.dimension, dimension, "{name}");
-        assert_eq!(shape.multisampled, multisampled, "{name}");
-    }
+    let meta = parse_air_fragment_meta(FRAGMENT).unwrap();
+    assert_eq!(meta.render_target_members, vec![(0, 0), (1, 0)]);
+    assert_eq!(meta.render_target_dual_indices, vec![(1, 1)]);
+    assert_eq!(meta.render_target_dual_index_for_member(0), 0);
+    assert_eq!(meta.render_target_dual_index_for_member(1), 1);
+    assert_eq!(meta.render_target_indices, vec![0]);
+    assert_eq!(meta.n_render_targets, 1);
 }

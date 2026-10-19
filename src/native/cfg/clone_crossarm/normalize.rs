@@ -153,19 +153,6 @@ pub(in crate::native) fn fresh(orig: &str, id: usize) -> String {
     format!("%xa{id}_{stripped}")
 }
 
-/// The name [`fresh`] was given, for a name it produced.
-///
-/// Cloning renames every value it duplicates, and the emitter carries several facts about a value
-/// keyed by NAME -- which buffer parameter is addressed as raw words, above all. Those facts are
-/// derived before the CFG is structured, so nothing re-keys them onto the clone and the clone
-/// silently has none. Rather than thread a rename map out of three call sites and up through the
-/// planner, ask the name: this is the exact inverse of `fresh`, held by
-/// `clone_source_name_inverts_fresh`.
-pub(in crate::native) fn clone_source_name(cloned: &str) -> Option<String> {
-    let (id, original) = cloned.strip_prefix("%xa")?.split_once('_')?;
-    (!id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())).then(|| format!("%{original}"))
-}
-
 /// LLVM's textual block labels and SSA values can carry the same spelling in AIR. A whole-token
 /// rename map cannot distinguish those namespaces, so a clone must decline when one of its labels
 /// is also used or defined as an SSA value anywhere in the function. Another structurization path

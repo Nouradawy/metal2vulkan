@@ -57,14 +57,6 @@ impl LlModule {
                 let (name, body) = line
                     .split_once(" = type ")
                     .ok_or_else(|| format!("native emitter: malformed type alias: {line}"))?;
-                // `%struct._texture_2d_t = type opaque` declares a name whose body LLVM itself
-                // does not know -- Metal's texture and sampler handles. Leaving it out of the
-                // table is what keeps it opaque here too: a pointer to it still parses (the
-                // pointee is dropped), and anything that reaches for the body gets an honest
-                // "unknown named type" instead of a body we invented.
-                if body.trim() == "opaque" {
-                    continue;
-                }
                 types.insert(name.trim().to_string(), parse_type(body.trim())?);
             }
         }
@@ -146,51 +138,8 @@ impl LlModule {
                     .and_then(|function| function.params.get(index))
                     .map(|(name, _)| name.clone())
             });
-        // Whether the tile is shared is a property of the AIR, not of the stride the emitter can
-        // reach for. Conjoining the `[[threads_per_threadgroup]]` parameter here answered "is this
-        // imageblock shared?" with "can I linearize it?", and a kernel that addresses a second
-        // coordinate without that parameter fell through to per-invocation Private staging, where
-        // every coordinate resolves to the same private slot. `emit_imageblock_threadgroup_width`
-        // already refuses the missing stride; let it.
-        // An `air.alias_implicit_imageblock` explicit imageblock is not tile-local scratch at all:
-        // its storage IS the implicit imageblock, so each cell is one render-target texel and the
-        // tile is shared with whatever rasterized into it. Per-invocation staging, where every
-        // coordinate resolves to one Private slot, cannot represent that however few coordinates
-        // the entry happens to name -- so an aliased block takes the shared-cell path
-        // unconditionally, and `aliased_imageblock` fills its cells from the planes and writes
-        // them back.
-        let aliased_imageblock_planes = kern
-            .and_then(|meta| {
-                meta.aliased_implicit_imageblock_params
-                    .first()
-                    .and_then(|param| meta.aliased_implicit_imageblock_planes.get(param))
-            })
-            .cloned()
-            .unwrap_or_default();
-        let imageblock_shared_cells = cross_coordinate_imageblock
-            || !aliased_imageblock_planes.is_empty()
-            || calls_imageblock_slice_write(&functions, &entry_functions);
-        let imageblock_cell_scale = infer_imageblock_cell_scale(&functions, &entry_functions);
-        // A shared tile is linearised `y * width + x`, and nothing in AIR states that width: it is
-        // the threadgroup extent, a dispatch-time fact. A kernel that takes
-        // `[[threads_per_threadgroup]]` hands it to us directly; one that does not used to leave
-        // the emitter with no stride at all. But the pass layer already answers
-        // `air.get_imageblock_width` with `TransformOptions::kernel_local_size` -- the same number,
-        // from the one place that knows it. Declare that intrinsic so the emitter can ask the
-        // question instead of inventing a second derivation of the tile extent.
-        if imageblock_shared_cells
-            && imageblock_dimensions.is_none()
-            && imageblock_threads_per_threadgroup_param.is_none()
-            && !declarations
-                .iter()
-                .any(|declaration| declaration.name == IMAGEBLOCK_WIDTH_INTRINSIC)
-        {
-            declarations.push(LlDeclaration {
-                name: IMAGEBLOCK_WIDTH_INTRINSIC.to_string(),
-                ret: LlType::Int(32),
-                params: Vec::new(),
-            });
-        }
+        let imageblock_shared_cells =
+            cross_coordinate_imageblock && imageblock_threads_per_threadgroup_param.is_some();
         // Private imageblock scratch normally keeps only its first metadata member, because a
         // single-coordinate slice never addresses another field. A byte GEP rooted at
         // `air.imageblock_data` proves that this module does address a later field, though; retain
@@ -221,9 +170,7 @@ impl LlModule {
             imageblock_data_pointee,
             imageblock_dimensions,
             imageblock_shared_cells,
-            aliased_imageblock_planes,
             imageblock_threads_per_threadgroup_param,
-            imageblock_cell_scale,
             metadata_pointee_params: HashSet::new(),
             metadata_pointee_sizes: HashMap::new(),
             metadata_byte_buffer_params,

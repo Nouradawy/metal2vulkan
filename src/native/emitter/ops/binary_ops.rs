@@ -127,12 +127,6 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<(), String> {
         let result_ty = self.resolve_type(&lhs.ty)?;
-        if op == Op::IAdd {
-            // Adding to a bound buffer's address moves within that buffer. Carry the base forward so
-            // an `inttoptr` at the end of the chain still knows which buffer it is in; the integer
-            // result itself is emitted exactly as before.
-            self.extend_symbolic_buffer_address(&name, &lhs, &rhs);
-        }
         let int_alignment = match op {
             Op::IAdd | Op::ISub => add_int_alignment(
                 self.int_value_alignment(&lhs.value),
@@ -321,99 +315,6 @@ impl Emitter {
             vec![Operand::IdRef(signed_result)],
         ));
         self.record_int_alignment(&name, &result_ty, 1);
-        Ok(())
-    }
-}
-
-impl Emitter {
-    /// Emit a float binary op and return the ids of every arithmetic result it produced.
-    ///
-    /// One LLVM instruction can expand into several: a wider-than-four vector scalarizes into one op
-    /// per lane, and a bf16 operand widens to `float` around an inner op. All of them descend from
-    /// the same source instruction and carry the same fast-math permissions, so a caller that has to
-    /// state a withheld permission states it about all of them.
-    fn emit_float_op_collecting_results(
-        &mut self,
-        op: Op,
-        lhs: TypedValue,
-        rhs: TypedValue,
-        name: String,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<Vec<Word>, String> {
-        let emitted_before = instructions.len();
-        self.emit_binary_float_op_resolved(op, lhs, rhs, name, instructions)?;
-        Ok(instructions[emitted_before..]
-            .iter()
-            .filter(|instruction| {
-                matches!(
-                    instruction.class.opcode,
-                    Op::FMul | Op::FAdd | Op::FSub | Op::FDiv | Op::FNegate
-                )
-            })
-            .filter_map(|instruction| instruction.result_id)
-            .collect())
-    }
-
-    /// A float arithmetic instruction that withholds at least one fast-math permission, emitted with
-    /// every arithmetic result it produces decorated `FPFastMathMode` carrying exactly the
-    /// permissions LLVM granted.
-    ///
-    /// Metal decides its float relaxations from the module's math mode and the expression's
-    /// `precise`-ness; SPIR-V has no equivalent module state, so an undecorated `OpFMul` is an open
-    /// invitation and MoltenVK -- whose own fast-math default is on -- takes it. Measured twice:
-    /// decorating the pair in `StyleEngineCoefficients::filterStep` moves its four lanes off the
-    /// fused answer onto the separately rounded one, and decorating the division in
-    /// `MinMaxReduction_float2` moves its five-texel average off the multiply-by-rounded-reciprocal
-    /// answer onto the correctly rounded quotient.
-    ///
-    /// `FPFastMathMode` rather than `NoContraction` for all four opcodes, because `NoContraction`
-    /// can only say one of the seven things a flag run says. It forbids fusion and leaves
-    /// reassociation permitted, and 437 corpus sources carry a three-term association chain no
-    /// instruction of which permits regrouping. `SPV_KHR_float_controls2` is the only
-    /// per-instruction spelling for the rest, so a module with such an instruction requires it.
-    ///
-    /// `AllowTransform` is never set. It is the umbrella permission over reassociation, contraction
-    /// and the reciprocal, and setting it would grant a fusion of the three that no LLVM flag asked
-    /// for; withholding it is the conservative reading of a flag run that already withheld
-    /// something.
-    pub(in crate::native::emitter) fn emit_float_op_granting(
-        &mut self,
-        op: Op,
-        lhs: TypedValue,
-        rhs: TypedValue,
-        name: String,
-        mode: crate::native::tir::FloatMathMode,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<(), String> {
-        let results = self.emit_float_op_collecting_results(op, lhs, rhs, name, instructions)?;
-        if results.is_empty() {
-            return Ok(());
-        }
-        let granted = [
-            (mode.not_nan, spirv::FPFastMathMode::NOT_NAN),
-            (mode.not_inf, spirv::FPFastMathMode::NOT_INF),
-            (mode.signed_zero_insignificant, spirv::FPFastMathMode::NSZ),
-            (mode.allow_reciprocal, spirv::FPFastMathMode::ALLOW_RECIP),
-            (mode.allow_contract, spirv::FPFastMathMode::ALLOW_CONTRACT),
-            (mode.allow_reassociate, spirv::FPFastMathMode::ALLOW_REASSOC),
-        ]
-        .into_iter()
-        .filter(|(permitted, _)| *permitted)
-        .fold(spirv::FPFastMathMode::NONE, |mask, (_, bit)| mask | bit);
-        self.require_capability(Capability::FloatControls2);
-        self.require_extension("SPV_KHR_float_controls2");
-        for result in results {
-            self.module.annotations.push(Self::inst(
-                Op::Decorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(result),
-                    Operand::Decoration(spirv::Decoration::FPFastMathMode),
-                    Operand::FPFastMathMode(granted),
-                ],
-            ));
-        }
         Ok(())
     }
 }

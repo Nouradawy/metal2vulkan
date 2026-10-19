@@ -3,26 +3,15 @@
 use super::*;
 
 impl Emitter {
-    /// The scope an atomic on `ptr_arg` is performed over: the storage class of the pointer
-    /// [`Self::atomic_i32_pointer_id`] will emit for the SAME argument.
-    ///
-    /// The two must test `raw_offsets` and `unmodeled_pointers` in the SAME order, because a
-    /// placeholder name is in BOTH sets -- an unmodelled pointer carries its real addressing in
-    /// `raw_offsets` and only falls back to a Workgroup slot when it has no such entry. Testing
-    /// `unmodeled_pointers` first here while the pointer side tests `raw_offsets` first answered
-    /// `Workgroup` for 32 atomics in 8 corpus modules whose emitted pointer is
-    /// `PhysicalStorageBuffer`: a device-address atomic scoped to one threadgroup, which is not
-    /// atomic against any other threadgroup, and whose semantics named `WorkgroupMemory` for a
-    /// device-memory access.
     pub(in crate::native::emitter) fn atomic_i32_scope_for_arg(
         &self,
         ptr_arg: &TypedValue,
     ) -> Result<Scope, String> {
         let storage = if let LlValue::Local(name) = &ptr_arg.value {
-            if let Some(raw) = self.raw_offsets.get(name) {
-                self.raw_access_storage(raw)?
-            } else if self.unmodeled_pointers.contains(name) {
+            if self.unmodeled_pointers.contains(name) {
                 StorageClass::Workgroup
+            } else if let Some(raw) = self.raw_offsets.get(name) {
+                self.raw_access_storage(raw)?
             } else {
                 let LlType::Ptr(addrspace) = self.resolve_type(&ptr_arg.ty)? else {
                     return Err(format!(
@@ -230,19 +219,6 @@ impl Emitter {
         Ok(result)
     }
 
-    /// The atomic slot for a pointer that has no addressing at all -- neither a raw offset nor a
-    /// modelled pointee. Both callers reach `raw_offsets` first, so this is the placeholder with
-    /// nothing behind it, and the atomic it carries writes into a threadgroup word nothing reads.
-    ///
-    /// **Measured dead: 0 of the 706 corpus sources that name any `air.atomic.*` reach either this
-    /// or [`Self::unmodeled_atomic_f32_pointer`].** Deleting them looks like an easy win and is
-    /// not: without them an f32 atomic on a placeholder falls through to the Private placeholder
-    /// ID itself and the pointer-storage-class check refuses the module. What reaches them is
-    /// UNDERSPECIFIED AIR, not anything the Metal frontend emits -- `device atomic_float*` carries
-    /// `air.struct_type_info` and `air.arg_type_name "metal::_atomic"`, and with those the buffer
-    /// is modelled as an array of its own struct and the atomic lands on the real slot. Drop the
-    /// struct info, as a hand-written fixture easily does, and the buffer collapses to a word view
-    /// the float GEP cannot be typed through. Keep these as the floor for that input.
     pub(in crate::native::emitter) fn unmodeled_atomic_i32_pointer(
         &mut self,
     ) -> Result<Word, String> {

@@ -38,6 +38,15 @@ struct PhiSlot {
 }
 
 #[derive(Clone, Debug)]
+struct ValueSlot {
+    ty: LlType,
+    owner: usize,
+    original: String,
+    current: String,
+    next: String,
+}
+
+#[derive(Clone, Debug)]
 struct HeaderPointerDerivation {
     owner: usize,
     original: String,
@@ -189,6 +198,22 @@ fn dominating_pointer_derivations(
     (names, instructions)
 }
 
+fn passthrough(name: &str, target: &str) -> BodyBlock {
+    synthetic_block(
+        name.to_string(),
+        vec![format!("br label {target}")],
+        BlockRole::Normal,
+    )
+}
+
+fn route_passthrough(name: &str, target: &str) -> BodyBlock {
+    synthetic_block(
+        name.to_string(),
+        vec![format!("br label {target}")],
+        BlockRole::ConstructTreeRoute,
+    )
+}
+
 fn carrier_with_phis(
     name: &str,
     target: &str,
@@ -210,6 +235,81 @@ fn carrier_with_phis(
 
 fn renamed_value(value: &LlValue, map: &HashMap<String, String>) -> LlValue {
     tir::renamed_llvalue(value, map)
+}
+
+fn collect_value_locals(value: &LlValue, out: &mut Vec<String>) {
+    match value {
+        LlValue::Local(name) => out.push(name.clone()),
+        LlValue::Vector(values) | LlValue::Array(values) | LlValue::Struct(values) => {
+            for value in values {
+                collect_value_locals(&value.value, out);
+            }
+        }
+        LlValue::Splat(value) => collect_value_locals(&value.value, out),
+        LlValue::Gep(gep) => {
+            collect_value_locals(&gep.base.value, out);
+            for index in &gep.indices {
+                collect_value_locals(&index.value, out);
+            }
+        }
+        LlValue::IntToPtr { source, .. } => collect_value_locals(&source.value, out),
+        LlValue::Global(_)
+        | LlValue::Bool(_)
+        | LlValue::Int(_)
+        | LlValue::SignedInt(_)
+        | LlValue::Hex(_)
+        | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
+        | LlValue::HalfBits(_)
+        | LlValue::BFloatBits(_)
+        | LlValue::Zero
+        | LlValue::Undef => {}
+    }
+}
+
+fn substitute_cross_slot_value(
+    value: &mut LlValue,
+    value_slots: &HashMap<&str, &ValueSlot>,
+    source: usize,
+) {
+    match value {
+        LlValue::Local(name) => {
+            let Some(slot) = value_slots.get(name.as_str()) else {
+                return;
+            };
+            if slot.owner != source {
+                *value = LlValue::Local(slot.current.clone());
+            }
+        }
+        LlValue::Vector(values) | LlValue::Array(values) | LlValue::Struct(values) => {
+            for value in values {
+                substitute_cross_slot_value(&mut value.value, value_slots, source);
+            }
+        }
+        LlValue::Splat(value) => {
+            substitute_cross_slot_value(&mut value.value, value_slots, source);
+        }
+        LlValue::Gep(gep) => {
+            substitute_cross_slot_value(&mut gep.base.value, value_slots, source);
+            for index in &mut gep.indices {
+                substitute_cross_slot_value(&mut index.value, value_slots, source);
+            }
+        }
+        LlValue::IntToPtr {
+            source: operand, ..
+        } => substitute_cross_slot_value(&mut operand.value, value_slots, source),
+        LlValue::Global(_)
+        | LlValue::Bool(_)
+        | LlValue::Int(_)
+        | LlValue::SignedInt(_)
+        | LlValue::Hex(_)
+        | LlValue::Float(_)
+        | LlValue::Float32Bits(_)
+        | LlValue::HalfBits(_)
+        | LlValue::BFloatBits(_)
+        | LlValue::Zero
+        | LlValue::Undef => {}
+    }
 }
 
 fn terminator_value_uses(terminator: &tir::TirTerminator) -> Vec<String> {

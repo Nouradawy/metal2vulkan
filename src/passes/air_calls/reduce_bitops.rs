@@ -149,22 +149,21 @@ pub(in crate::passes) fn lower_quad_integer_extrema(
     Ok(out)
 }
 
-/// Build the trailing operands for a `GroupNonUniform` arithmetic reduction.
-///
-/// A whole-subgroup `Reduce` is lowered as a `ClusteredReduce` over a 32-lane cluster -- Metal's
-/// simdgroup width -- so a driver whose subgroup is WIDER than 32 still reduces over exactly the 32
-/// lanes Apple's `simd_*` intrinsics define, rather than the whole (possibly 64-lane) subgroup.
-/// This is the same lane model the shuffle family rebases onto unconditionally.
-///
-/// Scans are untouched here: `ClusteredReduce` is a reduce-only group operation, so
-/// [`lower_simd_sum`] corrects a scan by subtracting its partition's prefix instead.
+/// Build the trailing operands for a `GroupNonUniform` arithmetic reduction. Under the M-D2
+/// `TransformOptions::simd_cluster32` opt-in a whole-subgroup `Reduce` is lowered to a `ClusteredReduce`
+/// over a 32-lane cluster — Metal's simdgroup width — so a driver whose subgroup is WIDER than 32
+/// still reduces over exactly the 32 lanes Apple's `simd_*` intrinsics define, rather than the whole
+/// (possibly 64-lane) subgroup. Scans are untouched: `ClusteredReduce` is a reduce-only group
+/// operation. Off by default (the extra operand + `GroupNonUniformClustered` capability are byte- and
+/// capability-changing); pending G7 on the `kern_tiled_da_gather_reduce` rows.
 pub(in crate::passes) fn group_reduce_operands(
     ctx: &mut Ctx,
     scope: Word,
     operation: GroupOperation,
     value: Word,
+    cluster32: bool,
 ) -> Vec<Operand> {
-    if matches!(operation, GroupOperation::Reduce) {
+    if cluster32 && matches!(operation, GroupOperation::Reduce) {
         let cluster = ctx.const_uint(32);
         return vec![
             Operand::IdScope(scope),
@@ -197,11 +196,14 @@ pub(in crate::passes) fn lower_simd_sum(
         _ => return Err("simd sum element type is not numeric".to_string()),
     };
     let scope = ctx.const_uint(Scope::Subgroup as u32);
-    let operands = group_reduce_operands(ctx, scope, operation, value);
-    if !matches!(
-        operation,
-        GroupOperation::ExclusiveScan | GroupOperation::InclusiveScan
-    ) {
+    let cluster32 = ctx.simd_cluster32;
+    let operands = group_reduce_operands(ctx, scope, operation, value, cluster32);
+    if !cluster32
+        || !matches!(
+            operation,
+            GroupOperation::ExclusiveScan | GroupOperation::InclusiveScan
+        )
+    {
         return Ok(vec![Instruction::new(
             op,
             Some(result_type),
@@ -285,7 +287,8 @@ pub(in crate::passes) fn lower_simd_bitwise(
         return Err("simd bitwise element type is not integer".to_string());
     }
     let scope = ctx.const_uint(Scope::Subgroup as u32);
-    let operands = group_reduce_operands(ctx, scope, operation, value);
+    let cluster32 = ctx.simd_cluster32;
+    let operands = group_reduce_operands(ctx, scope, operation, value, cluster32);
     Ok(vec![Instruction::new(
         op,
         Some(result_type),
@@ -300,18 +303,8 @@ pub(in crate::passes) enum SimdExtrema {
     Max,
 }
 
-/// A subgroup min or max, with its comparison taken from the AIR symbol.
-///
-/// `name` is the whole callee, e.g. `air.simd_min.s.i16`. The `.s.`/`.u.` marker is the ONLY
-/// statement of which comparison AIR wants, and it is the same marker `lower_integer_op` reads for
-/// the ordinary `air.min`/`air.max`/`air.abs_diff` forms. This used to read the signedness off the
-/// SPIR-V result type instead -- a second derivation of the same fact, and the wrong one: an LLVM
-/// `i16` carries no sign, so the emitter types it `%ushort` and every `.s.` reduction came out
-/// `OpGroupNonUniformUMin`. Device-measured on `simd_min` over `tid - 10` across one 32-lane
-/// threadgroup: Metal answers -10 and the unsigned reduction answers 0.
 pub(in crate::passes) fn lower_simd_extrema(
     ctx: &mut Ctx,
-    name: &str,
     result: Word,
     result_type: Word,
     value: Word,
@@ -322,27 +315,14 @@ pub(in crate::passes) fn lower_simd_extrema(
     let Some(elem_def) = type_def_of(ctx, elem_ty) else {
         return Err("simd extrema element type is undefined".to_string());
     };
-    let mut reduce_ty = result_type;
     let op = match elem_def.class.opcode {
         Op::TypeFloat => match extrema {
             SimdExtrema::Min => Op::GroupNonUniformFMin,
             SimdExtrema::Max => Op::GroupNonUniformFMax,
         },
         Op::TypeInt => {
-            let signed = if name.contains(".s.") {
-                true
-            } else if name.contains(".u.") {
-                false
-            } else {
-                return Err(format!(
-                    "{name} is an integer subgroup extrema with neither a .s. nor a .u. marker, so                      which comparison AIR wants is unstated"
-                ));
-            };
-            // The emitter types every LLVM integer unsigned, and this crate requires an S-op's
-            // result type to be signed, so a signed reduction runs in the signed sibling type and
-            // bitcasts back. The bitcasts are free: the two types have the same bit pattern.
-            reduce_ty = signed_int_type(ctx, result_type, signed)
-                .ok_or_else(|| format!("{name} result type is not an integer shape"))?;
+            let signed = integer_is_signed(ctx, elem_ty)
+                .ok_or_else(|| "simd extrema integer signedness is undefined".to_string())?;
             match (extrema, signed) {
                 (SimdExtrema::Min, true) => Op::GroupNonUniformSMin,
                 (SimdExtrema::Min, false) => Op::GroupNonUniformUMin,
@@ -353,70 +333,29 @@ pub(in crate::passes) fn lower_simd_extrema(
         _ => return Err("simd extrema element type is not numeric".to_string()),
     };
     let scope = ctx.const_uint(Scope::Subgroup as u32);
-    if reduce_ty == result_type {
-        let operands = group_reduce_operands(ctx, scope, operation, value);
-        return Ok(vec![Instruction::new(
-            op,
-            Some(result_type),
-            Some(result),
-            operands,
-        )]);
-    }
-    let mut out = Vec::new();
-    let input = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::Bitcast,
-        Some(reduce_ty),
-        Some(input),
-        vec![Operand::IdRef(value)],
-    ));
-    let reduced = ctx.module.fresh_id();
-    let operands = group_reduce_operands(ctx, scope, operation, input);
-    out.push(Instruction::new(
+    let cluster32 = ctx.simd_cluster32;
+    let operands = group_reduce_operands(ctx, scope, operation, value, cluster32);
+    Ok(vec![Instruction::new(
         op,
-        Some(reduce_ty),
-        Some(reduced),
-        operands,
-    ));
-    out.push(Instruction::new(
-        Op::Bitcast,
         Some(result_type),
         Some(result),
-        vec![Operand::IdRef(reduced)],
-    ));
-    Ok(out)
+        operands,
+    )])
 }
 
-/// `ty`'s shape with its integer element spelled with the requested signedness.
-fn signed_int_type(ctx: &mut Ctx, ty: Word, signed: bool) -> Option<Word> {
-    let def = type_def_of(ctx, ty)?.clone();
+pub(in crate::passes) fn integer_is_signed(ctx: &Ctx, ty: Word) -> Option<bool> {
+    let def = type_def_of(ctx, ty)?;
     match def.class.opcode {
-        Op::TypeInt => {
-            let Some(&Operand::LiteralBit32(width)) = def.operands.first() else {
-                return None;
-            };
-            Some(ctx.get_or_create(
-                Op::TypeInt,
-                None,
-                vec![
-                    Operand::LiteralBit32(width),
-                    Operand::LiteralBit32(u32::from(signed)),
-                ],
-            ))
-        }
+        Op::TypeInt => match def.operands.get(1)? {
+            Operand::LiteralBit32(signed) => Some(*signed != 0),
+            _ => None,
+        },
         Op::TypeVector => {
-            let Some(&Operand::IdRef(elem)) = def.operands.first() else {
-                return None;
+            let elem = match def.operands.first()? {
+                Operand::IdRef(elem) => *elem,
+                _ => return None,
             };
-            let Some(&Operand::LiteralBit32(lanes)) = def.operands.get(1) else {
-                return None;
-            };
-            let elem = signed_int_type(ctx, elem, signed)?;
-            Some(ctx.get_or_create(
-                Op::TypeVector,
-                None,
-                vec![Operand::IdRef(elem), Operand::LiteralBit32(lanes)],
-            ))
+            integer_is_signed(ctx, elem)
         }
         _ => None,
     }

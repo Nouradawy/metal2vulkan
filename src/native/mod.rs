@@ -4,7 +4,6 @@
 //! function, typed parameters, and an aggregate/vector return. Retained-SPIR-V interface and
 //! lowering passes consume that module.
 
-mod air_text;
 mod async_copy;
 mod cfg;
 // Differential test support for the control-flow constructors (test builds only).
@@ -13,7 +12,7 @@ mod cfg_testkit;
 mod constfold;
 // Read-only typed-SSA soundness / carrier-comparison / reject-census diagnostics (no emission path).
 mod diagnostics;
-mod dynamic_memcpy;
+mod dominators;
 mod emitter;
 // Emitter entry points for the primary and structurally selected alternate representations.
 mod emit_tiers;
@@ -43,28 +42,7 @@ mod tir;
 use crate::spirv_module::Instruction;
 use crate::spirv_module::Module;
 use crate::spirv_module::Operand;
-/// The shared pre-emit AIR-text lowering: every representation that derives stage metadata or
-/// emits from a module must observe the SAME program, so the passes that rewrite AIR text before
-/// [`ir::LlModule::parse`] are composed here rather than chained at each call site. Both members
-/// borrow their input when they find nothing to do, so an ordinary module allocates nothing.
-pub(crate) fn lower_air_text(san_ll: &str) -> std::borrow::Cow<'_, str> {
-    match async_copy::lower_simdgroup_async_copy(san_ll) {
-        std::borrow::Cow::Borrowed(borrowed) => {
-            dynamic_memcpy::lower_dynamic_length_memcpy(borrowed)
-        }
-        std::borrow::Cow::Owned(owned) => {
-            std::borrow::Cow::Owned(dynamic_memcpy::lower_dynamic_length_memcpy_owned(owned))
-        }
-    }
-}
-
-/// Owned counterpart of [`lower_air_text`], for callers that can relinquish the source buffer so a
-/// rewrite drops the superseded text before typed parsing begins.
-pub(crate) fn lower_air_text_owned(san_ll: String) -> String {
-    dynamic_memcpy::lower_dynamic_length_memcpy_owned(async_copy::lower_simdgroup_async_copy_owned(
-        san_ll,
-    ))
-}
+pub(crate) use async_copy::{lower_simdgroup_async_copy, lower_simdgroup_async_copy_owned};
 pub use diagnostics::{
     cond_other_witness_report, irreducible_region_report, param_pointee_check,
     straddle_region_report, straddle_witness_report, structured_reject_loop_classes,
@@ -97,9 +75,7 @@ pub(crate) fn inline_direct_function_pointer_consumers(
     inline::inline_direct_function_pointer_consumers(san_ll, direct_functions)
 }
 
-pub(crate) use owned_cfg::{
-    owned_module_failure, owned_module_failures, scalar_width_capability, OwnedModuleFailure,
-};
+pub(crate) use owned_cfg::{owned_module_failure, owned_module_failures, OwnedModuleFailure};
 pub(crate) use parse::{
     parse_return_type as parse_llvm_return_type, parse_type_prefix as parse_llvm_type_prefix,
 };
@@ -122,7 +98,6 @@ use spirv::{Capability, Op, StorageClass, Word};
 use std::collections::{HashMap, HashSet};
 
 fn add_native_module_capabilities(module: &mut Module) {
-    crate::spirv_variable_ptr::lower_storage_buffer_pointer_phis(module);
     crate::spirv_variable_ptr::lower_zero_base_storage_buffer_ptr_access_chains(module);
     let (has_storage_buffer_pointer_merge, has_other_pointer_merge) =
         crate::spirv_variable_ptr::variable_pointer_requirement(module);
@@ -185,7 +160,7 @@ pub(crate) fn requires_device_address_model_for_source(
     kern: Option<&crate::meta::KernMeta>,
     entry: Option<&str>,
 ) -> bool {
-    let san_ll = lower_air_text(san_ll);
+    let san_ll = async_copy::lower_simdgroup_async_copy(san_ll);
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(&san_ll);
     let san_ll = inline::inline_pointer_select_consumers(&san_ll, entry).source;
     ir::LlModule::parse_with_stage_meta(&san_ll, kern, entry)

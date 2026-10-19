@@ -473,12 +473,6 @@ pub(in crate::native) fn push_inst_line(
         .unwrap_or("")
         .to_string();
     let fast_math = rhs_of(line).split_whitespace().nth(1) == Some("fast");
-    // LLVM spells each fast-math permission three ways: the aggregate `fast`, the individual
-    // keyword, or not at all. Metal honours the distinction -- a module compiled
-    // `air.compile.fast_math_disable`, and any `precise` expression inside one that is not, carries
-    // neither keyword. SPIR-V has no per-module math mode, so a withheld permission has to travel
-    // on the instruction; see `emit_body_inst`.
-    let float_math_mode = granted_float_relaxations(rhs_of(line));
     let alloca_ty = if opcode == "alloca" {
         resolve_alloca_ty(line)
     } else {
@@ -610,37 +604,7 @@ pub(in crate::native) fn push_inst_line(
         opcode: TirOpcode::new(opcode),
         data: Box::new(TirInstDetails {
             fast_math,
-            float_math_mode,
             payload: data,
         }),
     });
-}
-
-/// The fast-math permissions a float arithmetic instruction's flag run GRANTS, or `None` when it
-/// grants everything and an undecorated SPIR-V instruction already says so.
-///
-/// An LLVM flag run is a whitelist and a SPIR-V `FPFastMathMode` is a whitelist, so this is one
-/// translation rather than a per-permission question. Reading it as "does it withhold fusion" and
-/// "does it withhold the reciprocal" -- two booleans for two of the seven permissions -- left
-/// reassociation unstated on 437 corpus sources whose association chains Metal will not regroup.
-///
-/// The flag run is the whitespace-separated tokens between the mnemonic and the type: `fmul fast
-/// float` grants everything, `fmul afn arcp ninf nnan nsz float` grants four of the seven, and a
-/// bare `fsub float` grants none. A vector type stops the scan on its own (`<4` is not
-/// all-lowercase), which is what keeps the type's words out of the flag run.
-fn granted_float_relaxations(rhs: &str) -> Option<FloatMathMode> {
-    let mut tokens = rhs.split_whitespace();
-    if !matches!(tokens.next(), Some("fmul" | "fadd" | "fsub" | "fdiv")) {
-        return None;
-    }
-    let flags = tokens
-        .take_while(|token| token.chars().all(|c| c.is_ascii_lowercase()))
-        .collect::<Vec<_>>();
-    // The aggregate `fast` grants everything, which is what an undecorated SPIR-V instruction
-    // already permits. Say nothing rather than spell it out.
-    if flags.contains(&"fast") {
-        return None;
-    }
-    let granted = FloatMathMode::from_llvm_flags(&flags);
-    (!granted.grants_every_rewrite()).then_some(granted)
 }

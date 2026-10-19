@@ -617,7 +617,7 @@ pub(crate) fn all_air_intersection_calls_are_lowerable(ll: &str) -> bool {
 }
 
 const TRIANGLE_QUERY_HELPER: &str = r#"
-define internal { i32, float, i32, i32, i64, <2 x float>, i1 } @metal2vulkan.intersect.callback_free.triangle_data(<3 x float> %origin, <3 x float> %direction, float %min_distance, float %max_distance, ptr addrspace(1) %acceleration_structure, ptr addrspace(1) %table, ptr %payload, i64 %payload_stride, i32 %front_facing_winding, i32 %triangle_cull_mode, i32 %a10, i32 %a11, i32 %a12, i32 %a13, i32 %a14, i32 %a15, i32 %a16, i1 %a17) {
+define internal { i32, float, i32, i32, i64, <2 x float>, i1 } @metal2vulkan.intersect.callback_free.triangle_data(<3 x float> %origin, <3 x float> %direction, float %min_distance, float %max_distance, ptr addrspace(1) %acceleration_structure, ptr addrspace(1) %table, ptr %payload, i64 %payload_stride, i32 %a8, i32 %a9, i32 %a10, i32 %a11, i32 %a12, i32 %a13, i32 %a14, i32 %a15, i32 %a16, i1 %a17) {
 entry:
   %triangle_count = load i32, ptr addrspace(1) %acceleration_structure, align 4
   %ox = extractelement <3 x float> %origin, i32 0
@@ -735,29 +735,8 @@ body:
   %valid1 = and i1 %valid0, %v_nonnegative
   %valid2 = and i1 %valid1, %uv_in_triangle
   %valid3 = and i1 %valid2, %after_min
-  %valid4 = and i1 %valid3, %before_best
-  %det_positive = fcmp ogt float %det, 0.000000e+00
-  %det_negative = fcmp olt float %det, 0.000000e+00
-  ; Metal's `winding` says which sign of the Moller-Trumbore determinant is the front face: 0 is
-  ; clockwise, which is the default `intersection_params` holds, and 1 is counterclockwise, which
-  ; swaps the two. It has to be read before anything that names a face -- the cull mode below and
-  ; the front-facing result field are the same question asked twice.
-  %counterclockwise = icmp eq i32 %front_facing_winding, 1
-  %clockwise = icmp ne i32 %front_facing_winding, 1
-  %front_cw = and i1 %clockwise, %det_positive
-  %front_ccw = and i1 %counterclockwise, %det_negative
-  %front = or i1 %front_cw, %front_ccw
-  %back_cw = and i1 %clockwise, %det_negative
-  %back_ccw = and i1 %counterclockwise, %det_positive
-  %back = or i1 %back_cw, %back_ccw
-  ; Metal's `triangle_cull_mode`: 0 none, 1 front, 2 back. Each mode only removes hits, so keeping
-  ; one means the mode either is not that mode or names the face this hit is not on.
-  %not_cull_front = icmp ne i32 %triangle_cull_mode, 1
-  %not_cull_back = icmp ne i32 %triangle_cull_mode, 2
-  %keep_front = or i1 %not_cull_front, %back
-  %keep_back = or i1 %not_cull_back, %front
-  %kept = and i1 %keep_front, %keep_back
-  %valid = and i1 %valid4, %kept
+  %valid = and i1 %valid3, %before_best
+  %front = fcmp ogt float %det, 0.000000e+00
   %selected_distance = select i1 %valid, float %distance, float %best_distance
   %selected_primitive = select i1 %valid, i32 %index, i32 %best_primitive
   %selected_u = select i1 %valid, float %u, float %best_u
@@ -803,7 +782,7 @@ entry:
   ret { i32, float, i32, i32, i64, <2 x float>, i1 } %full
 }
 
-define internal { i32, float, i32, i32, i64, i32, i32, <2 x float>, i1 } @metal2vulkan.intersect.callback_free.instancing.triangle_data(<3 x float> %origin, <3 x float> %direction, float %min_distance, float %max_distance, ptr addrspace(1) %acceleration_structure, i32 %instance_mask, ptr addrspace(1) %table, ptr %payload, i64 %payload_stride, i32 %front_facing_winding, i32 %triangle_cull_mode, i32 %a11, i32 %a12, i32 %a13, i32 %a14, i32 %a15, i32 %a16, i32 %a17, i1 %a18, i1 %a19) {
+define internal { i32, float, i32, i32, i64, i32, i32, <2 x float>, i1 } @metal2vulkan.intersect.callback_free.instancing.triangle_data(<3 x float> %origin, <3 x float> %direction, float %min_distance, float %max_distance, ptr addrspace(1) %acceleration_structure, i32 %instance_mask, ptr addrspace(1) %table, ptr %payload, i64 %payload_stride, i32 %a9, i32 %a10, i32 %a11, i32 %a12, i32 %a13, i32 %a14, i32 %a15, i32 %a16, i32 %a17, i1 %a18, i1 %a19) {
 entry:
   %instance_count = load i32, ptr addrspace(1) %acceleration_structure, align 4
   %has_instance = icmp ne i32 %instance_count, 0
@@ -848,31 +827,10 @@ entry:
   %valid3 = and i1 %valid2, %v_nonnegative
   %valid4 = and i1 %valid3, %uv_in_triangle
   %valid5 = and i1 %valid4, %after_min
-  %valid6 = and i1 %valid5, %before_max
-  %det_positive = fcmp ogt float %det, 0.000000e+00
-  %det_negative = fcmp olt float %det, 0.000000e+00
-  ; Metal's `winding` says which sign of the Moller-Trumbore determinant is the front face: 0 is
-  ; clockwise, which is the default `intersection_params` holds, and 1 is counterclockwise, which
-  ; swaps the two. It has to be read before anything that names a face -- the cull mode below and
-  ; the front-facing result field are the same question asked twice.
-  %counterclockwise = icmp eq i32 %front_facing_winding, 1
-  %clockwise = icmp ne i32 %front_facing_winding, 1
-  %front_cw = and i1 %clockwise, %det_positive
-  %front_ccw = and i1 %counterclockwise, %det_negative
-  %front = or i1 %front_cw, %front_ccw
-  %back_cw = and i1 %clockwise, %det_negative
-  %back_ccw = and i1 %counterclockwise, %det_positive
-  %back = or i1 %back_cw, %back_ccw
-  ; Metal's `triangle_cull_mode`: 0 none, 1 front, 2 back. Each mode only removes hits, so keeping
-  ; one means the mode either is not that mode or names the face this hit is not on.
-  %not_cull_front = icmp ne i32 %triangle_cull_mode, 1
-  %not_cull_back = icmp ne i32 %triangle_cull_mode, 2
-  %keep_front = or i1 %not_cull_front, %back
-  %keep_back = or i1 %not_cull_back, %front
-  %kept = and i1 %keep_front, %keep_back
-  %valid = and i1 %valid6, %kept
+  %valid = and i1 %valid5, %before_max
   %intersection_type = select i1 %valid, i32 1, i32 0
   %selected_distance = select i1 %valid, float %distance, float %max_distance
+  %front = fcmp ogt float %det, 0.000000e+00
   %selected_front = and i1 %valid, %front
   %selected_u = select i1 %valid, float %u, float 0.000000e+00
   %selected_v = select i1 %valid, float %v, float 0.000000e+00
@@ -965,91 +923,6 @@ mod tests {
         assert!(lowered.contains(TRIANGLE_PRIMITIVE_MOTION_LOWERED_CALLEE));
         assert!(!lowered.contains("@air.intersect.triangle_data.primitive_motion("));
         assert!(all_air_intersection_calls_are_lowerable(ll));
-    }
-
-    #[test]
-    fn triangle_facing_reads_the_winding_and_the_cull_mode_air_passes_beside_it() {
-        // AIR's operand order is Apple's: `winding, triangle_cull_mode, geometry_cull_mode,
-        // opacity_cull_mode, forced_opacity, geometry_type, ...`, so the two this lowering reads sit
-        // immediately after the payload stride. Reading one slot over silently turns a cull mode
-        // into a geometry cull mode and a winding into a cull mode, and every family that adds an
-        // operand -- motion time, instance mask -- adds it before that block, never inside it.
-        let plain = "%hit = call { i32, float, i32, i32, ptr addrspace(1), <2 x float>, i1 } \
-@air.intersect.triangle_data(<3 x float> zeroinitializer, <3 x float> zeroinitializer, float 0.0, \
-float 1.0, ptr addrspace(1) %as, ptr addrspace(1) %table, ptr null, i64 0, i32 1, i32 2, i32 0, \
-i32 0, i32 0, i32 3, i32 -1, i32 -1, i32 0, i1 false)\n";
-        let motion = "%hit = call { i32, float, i32, i32, ptr addrspace(1), <2 x float>, i1 } \
-@air.intersect.triangle_data.primitive_motion(<3 x float> zeroinitializer, <3 x float> \
-zeroinitializer, float 0.0, float 1.0, ptr addrspace(1) %as, float 0.0, ptr addrspace(1) %table, \
-ptr null, i64 0, i32 1, i32 2, i32 0, i32 0, i32 0, i32 3, i32 -1, i32 -1, i32 0, i1 false)\n";
-        let instanced = "%hit = call { i32, float, i32, i32, ptr addrspace(1), i32, i32, \
-<2 x float>, i1 } @air.intersect.instancing.triangle_data(<3 x float> zeroinitializer, \
-<3 x float> zeroinitializer, float 0.0, float 1.0, ptr addrspace(1) %as, i32 255, \
-ptr addrspace(1) %table, ptr null, i64 0, i32 1, i32 2, i32 0, i32 0, i32 0, i32 3, i32 -1, \
-i32 -1, i32 0, i1 false, i1 false)\n";
-        // Everything after the payload stride, by name, or `None` when the line has no stride.
-        let tail = |line: &str| {
-            line.split_once("i64 %payload_stride, ").map(|(_, rest)| {
-                rest.trim_end_matches([')', ' ', '{'])
-                    .split(", ")
-                    .filter_map(|operand| operand.split_whitespace().last().map(str::to_string))
-                    .collect::<Vec<_>>()
-            })
-        };
-        for source in [plain, motion, instanced] {
-            let lowered = lower_callback_free_triangle_queries(source).expect("lowered");
-            let mut cores = 0usize;
-            let mut wrappers = 0usize;
-            let mut definition: Option<Vec<String>> = None;
-            for line in lowered.lines() {
-                let trimmed = line.trim_start();
-                if line.starts_with("define internal") {
-                    definition = tail(line);
-                    if line.contains("callback_free.triangle_data(")
-                        || line.contains("callback_free.instancing.triangle_data(")
-                    {
-                        cores += 1;
-                        let names = definition.clone().expect("a core takes a payload stride");
-                        assert_eq!(
-                            &names[..2],
-                            ["%front_facing_winding", "%triangle_cull_mode"],
-                            "the two operands AIR puts after the payload stride are the winding \
-                             and the cull mode: {line}"
-                        );
-                    }
-                    continue;
-                }
-                // A wrapper adds its extra operand before the trailing block, so it must hand that
-                // block on unshifted: its call's tail is its own parameter tail, name for name.
-                if trimmed.starts_with("%full = call")
-                    && trimmed.contains("@metal2vulkan.intersect.callback_free")
-                {
-                    wrappers += 1;
-                    assert_eq!(
-                        tail(line),
-                        definition,
-                        "a wrapper must forward the trailing operand block unshifted: {line}"
-                    );
-                }
-            }
-            assert!(cores >= 1, "no triangle core was emitted: {lowered}");
-            assert!(wrappers >= 1, "no wrapper was emitted: {lowered}");
-            // The front face is whichever determinant sign the winding names, so facing can no
-            // longer be a bare comparison against zero: the cull mode and the front-facing result
-            // field are the same question, and both need the winding asked first.
-            assert!(
-                !lowered.contains("%front = fcmp ogt float %det"),
-                "facing must follow the winding: {lowered}"
-            );
-            assert!(
-                lowered.contains("%front = or i1 %front_cw, %front_ccw"),
-                "facing must follow the winding: {lowered}"
-            );
-            assert!(
-                lowered.contains("%kept = and i1 %keep_front, %keep_back"),
-                "a culled hit must not reach the result: {lowered}"
-            );
-        }
     }
 
     #[test]

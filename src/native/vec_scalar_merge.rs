@@ -25,7 +25,7 @@
 
 use super::lex::split_top_level;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Rewrite every function in `san_ll` that carries a scalar/vector pointer-merge into its scalarized
 /// form. Returns the text unchanged when no such merge exists (the common case).
@@ -248,7 +248,7 @@ fn select_arm_values(rest: &str) -> Vec<String> {
 
 /// Resolve every value's pointee shape to a fixpoint and collect the names of `phi`/`select` results
 /// whose arms mix a scalar and a same-element vector pointee.
-fn classify(defs: &BTreeMap<String, Def>) -> (HashMap<String, Pointee>, HashSet<String>) {
+fn classify(defs: &HashMap<String, Def>) -> (HashMap<String, Pointee>, HashSet<String>) {
     let mut pointees: HashMap<String, Pointee> = HashMap::new();
     let mut mismatches: HashSet<String> = HashSet::new();
     // Bounded fixpoint: each pass can only refine Unknown → concrete, so it converges in at most one
@@ -348,8 +348,8 @@ fn merge_arms(
 }
 
 /// Undirected pointer-flow adjacency: every def linked to its arm/base/bitcast-source neighbours.
-fn pointer_adjacency(defs: &BTreeMap<String, Def>) -> BTreeMap<String, Vec<String>> {
-    let mut adj: BTreeMap<String, Vec<String>> = BTreeMap::new();
+fn pointer_adjacency(defs: &HashMap<String, Def>) -> HashMap<String, Vec<String>> {
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for (name, def) in defs {
         for nb in pointer_neighbours(def) {
             adj.entry(name.clone()).or_default().push(nb.clone());
@@ -360,7 +360,7 @@ fn pointer_adjacency(defs: &BTreeMap<String, Def>) -> BTreeMap<String, Vec<Strin
 }
 
 /// Undirected pointer-flow component reachable from the mismatch merges.
-fn component(defs: &BTreeMap<String, Def>, seeds: &HashSet<String>) -> HashSet<String> {
+fn component(defs: &HashMap<String, Def>, seeds: &HashSet<String>) -> HashSet<String> {
     let adj = pointer_adjacency(defs);
     let mut seen: HashSet<String> = HashSet::new();
     let mut queue: VecDeque<String> = seeds.iter().cloned().collect();
@@ -509,11 +509,11 @@ fn use_widths(body: &[&str]) -> HashMap<String, UseWidths> {
 /// and any component touching a memory-reloaded pointer (`memory_ptr` — a `load ptr` whose pointee is
 /// pinned by memory-stored siblings the SSA adjacency cannot reach, so scalarizing only the visible
 /// half is a partial retype; see [`memory_reloaded_pointers`]) are excluded.
-fn widen_targets(body: &[&str], defs: &BTreeMap<String, Def>) -> Vec<(HashSet<String>, String)> {
+fn widen_targets(body: &[&str], defs: &HashMap<String, Def>) -> Vec<(HashSet<String>, String)> {
     let widths = use_widths(body);
     let reloaded = memory_reloaded_pointers(body);
     let adj = pointer_adjacency(defs);
-    let mut nodes: BTreeSet<String> = adj.keys().cloned().collect();
+    let mut nodes: HashSet<String> = adj.keys().cloned().collect();
     nodes.extend(widths.keys().cloned());
 
     let mut visited: HashSet<String> = HashSet::new();
@@ -734,7 +734,7 @@ impl Rewriter {
 }
 
 fn rewrite_function_body(body: &[&str], widen: bool) -> Option<Vec<String>> {
-    let defs: BTreeMap<String, Def> = body
+    let defs: HashMap<String, Def> = body
         .iter()
         .filter_map(|line| parse_def(line))
         .map(|d| (d.name.to_string(), d))
@@ -861,57 +861,6 @@ pub(in crate::native) fn lower_with_widen_for_test(san_ll: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// [`classify`]'s iteration has TWO fixpoints on a cyclic merge, and which one it lands in is
-    /// decided by the order it visits definitions in. `merge_arms` ignores an arm it has not
-    /// resolved yet, so resolving `%b` before `%a` and resolving `%a` before `%b` are not the same
-    /// question -- and both answers are stable, so the loop converges to whichever it reached
-    /// first.
-    ///
-    /// Here `%a` merges a `<4 x float>` walk with `%b`, `%b` merges an `i32` walk with `%a`, and
-    /// `%c` merges a `float` walk with `%a`:
-    ///
-    /// - visit `%a` first: `%b` is unresolved and ignored, so `%a` is `<4 x float>`; `%b` then sees
-    ///   `i32` beside `float` and is Unknown; `%c` sees `float` beside `<4 x float>` -- a
-    ///   scalar/vector MISMATCH -- and the component scalarizes.
-    /// - visit `%b` first: `%b` is `i32`, so `%a` sees `i32` beside `float` and is Unknown, and
-    ///   `%c` sees only `float`. No mismatch, and nothing is rewritten.
-    ///
-    /// While `defs` was a `HashMap` that order came from Rust's per-process hash seed, so ONE
-    /// corpus source (`9a0dae8e…`) emitted two different modules from one binary at about a 30%
-    /// rate. An ordered map makes the visit order a property of the input.
-    #[test]
-    fn a_cyclic_scalar_vector_merge_resolves_the_same_way_every_run() {
-        let src = "\
-define void @k(ptr addrspace(1) %fp, ptr addrspace(1) %ip, i64 %n) {
-entry:
-  %sf = getelementptr inbounds float, ptr addrspace(1) %fp, i64 %n
-  %si = getelementptr inbounds i32, ptr addrspace(1) %ip, i64 %n
-  %vf = getelementptr inbounds <4 x float>, ptr addrspace(1) %fp, i64 %n
-  br label %loop
-loop:
-  %a = phi ptr addrspace(1) [ %vf, %entry ], [ %b, %loop ]
-  %b = phi ptr addrspace(1) [ %si, %entry ], [ %a, %loop ]
-  %c = phi ptr addrspace(1) [ %sf, %entry ], [ %a, %loop ]
-  %v = load <4 x float>, ptr addrspace(1) %c, align 16
-  store <4 x float> %v, ptr addrspace(1) %c, align 16
-  br label %loop
-}
-";
-        let out = lower_vector_scalar_pointer_merge(src);
-        assert!(
-            !out.contains("load <4 x float>"),
-            "the mismatch fixpoint was not the one reached:\n{out}"
-        );
-        assert!(
-            !out.contains("store <4 x float>"),
-            "the mismatch fixpoint was not the one reached:\n{out}"
-        );
-        assert!(
-            !out.contains("getelementptr inbounds <4 x float>"),
-            "the mismatch fixpoint was not the one reached:\n{out}"
-        );
-    }
 
     /// The `MPSRNNBreakUpToOutputVecs` shape: a vectorized `<4 x float>` walk merged with a scalar
     /// `float` walk via `phi`. The pass must scalarize the vector loads/stores/geps so the merge

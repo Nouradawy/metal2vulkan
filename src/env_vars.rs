@@ -51,11 +51,6 @@ pub const REGISTRY: &[EnvVar] = &[
         effect: "path to dump a failing retry or corpus-audit SPIR-V module (debug)",
     },
     EnvVar {
-        name: "METAL2VULKAN_PHASE_DUMP",
-        default: "unset",
-        effect: "path prefix for a per-phase SPIR-V dump of the lowering pipeline (debug)",
-    },
-    EnvVar {
         name: "METAL2VULKAN_<TOOL>",
         default: "PATH search",
         effect: "absolute per-tool override (for example METAL2VULKAN_LLVM_DIS or \
@@ -229,15 +224,6 @@ pub fn repro_dir() -> Option<OsString> {
 
 pub fn retry_dump() -> Option<OsString> {
     std::env::var_os("METAL2VULKAN_RETRY_DUMP")
-}
-
-/// Path prefix for a per-phase SPIR-V dump, the companion of [`pass_contract`].
-///
-/// `pass_contract` names the phase that broke a contract; this writes the module that phase started
-/// from, as `<prefix>-<NN>-<phase>.spv`, so the offending instruction can be read with `spirv-dis`
-/// instead of inferred from the verdict string.
-pub fn phase_dump() -> Option<OsString> {
-    std::env::var_os("METAL2VULKAN_PHASE_DUMP")
 }
 
 /// Optional path override for an external tool `cmd` (`llvm-dis`, `spirv-val`, …), read from

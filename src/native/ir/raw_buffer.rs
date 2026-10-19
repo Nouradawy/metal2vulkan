@@ -544,13 +544,7 @@ impl LlModule {
             }
             AirType::Struct(members) => {
                 let mut ranges = Vec::with_capacity(members.len());
-                // No alignment floor, for the same reason as `spirv_size_align` (`ffdde3cc`): a
-                // struct's alignment is the largest alignment among its members. Here the number is
-                // not an address, it is the extent each member is rounded up to before the overlap
-                // test below -- so a floor inflates a nested member's end past the start of the next
-                // one and FABRICATES a union, and a fabricated union costs the whole buffer its
-                // typed access chains and puts it on the raw word view.
-                let mut max_align = 1;
+                let mut max_align = 4;
                 let mut nested_overlap = false;
                 for member in members {
                     let (size, align, overlaps) =
@@ -735,106 +729,6 @@ impl LlModule {
             }
             _ => false,
         }
-    }
-
-    /// Whether `function` reads or writes memory through its parameter `param`.
-    ///
-    /// The emitter can hand a callee a `Private` zero placeholder for a pointer whose real
-    /// addressing it holds only in its own raw-cursor state. That is harmless when the callee never
-    /// touches the pointer, and a silent loss of every access when it does, so the refusal that
-    /// guards it needs this exact question rather than "is a placeholder passed".
-    ///
-    /// Conservative in the safe direction: an alias path this does not model (a pointer that
-    /// escapes through a select, a phi, or a struct field) answers `false`, which keeps today's
-    /// behaviour rather than refusing a module on a guess. Pointer arguments handed on to another
-    /// bodied helper are followed, so a dereference one call deeper still counts.
-    pub(in crate::native) fn param_is_dereferenced(&self, function: &str, param: &str) -> bool {
-        let mut seen = HashSet::new();
-        self.param_is_dereferenced_seen(function, param, &mut seen)
-    }
-
-    fn param_is_dereferenced_seen(
-        &self,
-        function: &str,
-        param: &str,
-        seen: &mut HashSet<(String, String)>,
-    ) -> bool {
-        if !seen.insert((function.to_string(), param.to_string())) {
-            return false;
-        }
-        let Some(f) = self.functions.iter().find(|f| f.name == function) else {
-            return false;
-        };
-        let mut aliases: HashSet<String> = HashSet::from([param.to_string()]);
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for inst in f.carrier_insts() {
-                let Some(result) = inst.result.as_ref() else {
-                    continue;
-                };
-                if aliases.contains(result) {
-                    continue;
-                }
-                let derived = inst
-                    .gep()
-                    .as_deref()
-                    .and_then(|gep| match &gep.base.value {
-                        LlValue::Local(base) => Some(base.clone()),
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        inst.identity_ptr_bitcast()
-                            .map(|(_, base)| base.to_string())
-                    })
-                    .is_some_and(|base| aliases.contains(&base));
-                if derived {
-                    aliases.insert(result.clone());
-                    changed = true;
-                }
-            }
-        }
-        let names =
-            |value: &LlValue| matches!(value, LlValue::Local(name) if aliases.contains(name));
-        f.carrier_insts().any(|inst| {
-            if inst
-                .load()
-                .as_deref()
-                .is_some_and(|load| names(&load.ptr.value))
-            {
-                return true;
-            }
-            if inst
-                .store()
-                .as_deref()
-                .is_some_and(|(_, pointer)| names(&pointer.value))
-            {
-                return true;
-            }
-            let Some(call) = inst.call().as_deref() else {
-                return false;
-            };
-            let passed = call
-                .args
-                .iter()
-                .enumerate()
-                .filter(|(_, arg)| names(&arg.value))
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if passed.is_empty() {
-                return false;
-            }
-            // An `air.*`/`llvm.*` intrinsic taking the pointer is a memory access by definition;
-            // there is no body to walk and every such symbol that takes a pointer dereferences it.
-            let Some(callee) = self.functions.iter().find(|f| f.name == call.callee) else {
-                return true;
-            };
-            passed.into_iter().any(|index| {
-                callee.params.get(index).is_some_and(|(name, _)| {
-                    self.param_is_dereferenced_seen(&callee.name.clone(), &name.clone(), seen)
-                })
-            })
-        })
     }
 
     pub(in crate::native) fn type_contains_pointer(&self, ty: &LlType) -> bool {

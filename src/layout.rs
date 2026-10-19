@@ -102,24 +102,6 @@ pub(super) fn scalar_storage_size(
 
 /// The "Native" rule: tight packing, alignment = element alignment (a vec3 is 12/4 — no vector-size
 /// growth). Was `LlModule::type_storage_size_align`.
-///
-/// **Do not unify this with the Memcpy rule.** It disagrees with `memcpy_size_align` on every type
-/// containing a vector — measured over the corpus, 2086 of 14579 sources ask it something the two
-/// rules answer differently, e.g. `%struct.ASVCameraUniforms` 500/4 here against 512/16 there. It
-/// has exactly two callers, and at BOTH the smaller, less-aligned answer is the CONSERVATIVE one:
-///
-/// * `raw_buffer::infer_call_connected_raw_buffer_params` compares a caller's and a callee's pointee
-///   layouts and forces the raw byte view when they differ. Two structs the Memcpy rule rounds up
-///   to the same 128/16 can differ here (96/8 against 120/8) — swapping the rule would DROP the
-///   raw forcing on 343 call edges across 30 sources.
-/// * `raw_buffer::memcpy_source_implies_raw_bytes` asks whether a `memcpy` length covers the whole
-///   object. A smaller size makes "covers it" true more often, which again forces the raw view;
-///   swapping the rule would drop it in 3 sources (a 72-byte copy of an object this rule sizes at
-///   68 and the Memcpy rule at 80).
-///
-/// Both callers only ever DECIDE with the answer, never address with it, so a conservative
-/// under-estimate costs typed access chains and nothing else. See `layout_abi_tests` in
-/// `native::ir` for the pinned divergence.
 pub(super) fn native_size_align(
     ty: &LlType,
     resolve: &impl Fn(&LlType) -> LlType,
@@ -157,8 +139,7 @@ pub(super) fn native_size_align(
 }
 
 /// The "Memcpy" rule: LLVM allocation layout for a `memcpy`, using the source vector ABI alignment
-/// (or LLVM's power-of-two default). An array's alignment is its element's, as in the Native and
-/// Raw rules -- the vector arm is the only place this rule diverges from them. Was
+/// (or LLVM's power-of-two default) and aligning arrays to at least four bytes. Was
 /// `LlModule::native_memcpy_type_size_align`.
 pub(super) fn memcpy_size_align(
     ty: &LlType,
@@ -187,7 +168,10 @@ pub(super) fn memcpy_size_align(
         }
         LlType::Array(elem, len) => {
             let (elem_size, elem_align) = memcpy_size_align(&elem, resolve, data_layout)?;
-            Some((round_up_u64(elem_size, elem_align) * len as u64, elem_align))
+            Some((
+                round_up_u64(elem_size, elem_align) * len as u64,
+                elem_align.max(4),
+            ))
         }
         LlType::Struct(fields) => {
             let mut offset = 0u64;
@@ -205,9 +189,8 @@ pub(super) fn memcpy_size_align(
 }
 
 /// The "Raw" rule (emitter): LLVM allocation sizes using the source vector ABI alignment (or LLVM's
-/// power-of-two default). An array's alignment is its element's, which is what decides where the
-/// explicit `[N x i8]` pads Metal writes into a packed struct put every member behind them. It
-/// differs from the optional calculators above in two other ways:
+/// power-of-two default), with arrays floored to four-byte alignment. It differs from the optional
+/// calculators above in two other ways:
 ///   * `resolve` is FALLIBLE — a `Named` type the module can't expand is an error, not a fallthrough.
 ///   * uncovered types (odd-width ints, `Void`) are an `Err`, not `None` — the Raw rule only accepts
 ///     the standard scalar widths it knows how to lay out.
@@ -241,7 +224,7 @@ pub(super) fn raw_size_align(
         LlType::Array(elem, len) => {
             let (elem_size, elem_align) = raw_size_align(&elem, resolve, data_layout)?;
             let stride = round_up_u64(elem_size, elem_align);
-            Ok((stride * len as u64, elem_align))
+            Ok((stride * len as u64, elem_align.max(4)))
         }
         LlType::Struct(fields) => {
             let mut off = 0;
@@ -287,15 +270,14 @@ pub(super) fn air_metadata_size_align(
 ///
 /// This is the quantity comparable to `air.arg_type_size`, which is the argument's `sizeof` and so
 /// always at least as large. [`air_metadata_size_align`] answers a different question -- the stride
-/// a pointee type needs -- and rounds to the aggregate's alignment, which makes it unusable as a
-/// bound: over the 14579 corpus sources it still exceeds the declared argument size for 2 buffers
-/// whose layout is correct. (It was 462 while arrays were floored to four-byte alignment.)
+/// a pointee type needs -- and rounds accordingly, which makes it unusable as a bound: over 2880
+/// corpus sources it exceeds the declared argument size for 96 buffers whose layout is correct.
 ///
 /// An array strides by its element's *declared* size, not a recomputed one, because that is what
 /// AIR states: a member tuple carries the per-element size beside the array length, and the
 /// corpus bears it out exactly (`i32 8192, i32 2, i32 4096, !"half"` -- 4096 halves at stride two
-/// starting where the previous 4096 ended). Recomputing it would re-derive a stride AIR already
-/// spelled out, and AIR's is the ABI.
+/// starting where the previous 4096 ended). Recomputing it inflates a `packed_half3` element from
+/// six bytes to eight, since [`memcpy_size_align`] floors array alignment at four.
 ///
 /// Overlap is normal here and needs no special case: AIR describes unions by giving two members
 /// the same offset, so the reach is a maximum rather than a sum.
@@ -416,14 +398,7 @@ pub(crate) fn spirv_size_align(
         Op::TypeStruct => {
             let mut cursor = 0u32;
             let mut end = 0u32;
-            // No alignment floor. A struct's alignment is the largest alignment among its members
-            // and nothing more -- `{ short a[5]; uchar b[7]; }` is 17 bytes of members aligned to 2,
-            // so it is 18 bytes, and Metal says so in `air.arg_type_size` and in its own `sizeof`.
-            // Starting this at 4 made it 20, and that number became the buffer's `ArrayStride`, so
-            // every element but the zeroth was addressed two bytes per record too far along. The
-            // same floor was in `raw_size_align` (removed by `9993cca8`) and in `memcpy_size_align`
-            // (removed by `1c2d724d`); this was the third copy of one rule.
-            let mut max_align = 1u32;
+            let mut max_align = 4u32;
             let explicit_offsets = rule.struct_offsets(ty);
             for (index, operand) in def.operands.iter().enumerate() {
                 let Operand::IdRef(member) = operand else {
@@ -503,15 +478,14 @@ pub(crate) fn round_up_u32(value: u32, align: u32) -> u32 {
 mod tests {
     use super::*;
 
-    /// The rule `air_metadata_extent` states that `air_metadata_size_align` does not: overlapping
-    /// members reach rather than accumulate. Array stride is no longer a divergence -- both take
-    /// the element's own alignment.
+    /// The two rules `air_metadata_extent` states that `air_metadata_size_align` does not: an array
+    /// strides by its element's tight size, and overlapping members reach rather than accumulate.
     #[test]
     fn air_metadata_extent_strides_arrays_tightly_and_takes_the_furthest_reach() {
         use crate::meta::{AirMember, AirScalar};
 
-        // `packed_half3[3]` is 18 bytes, and both rules say so. Flooring array alignment at four
-        // reported 24 and put the argument over its own declared size.
+        // `packed_half3[3]` is 18 bytes. The stride rule that floors array alignment at four --
+        // what `air_metadata_size_align` applies -- would report 24 and put the argument over.
         let packed = AirType::Array {
             elem: Box::new(AirType::PackedVec {
                 scalar: AirScalar::Half,
@@ -522,7 +496,7 @@ mod tests {
         assert_eq!(air_metadata_extent(&packed), Some(18));
         assert_eq!(
             air_metadata_size_align(&packed, &|ty| ty.clone(), None),
-            Some((18, 2)),
+            Some((24, 4)),
         );
 
         // AIR spells a union by giving two members one offset. The struct reaches as far as its

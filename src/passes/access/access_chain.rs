@@ -788,30 +788,8 @@ pub(in crate::passes) fn expose_nullable_memory_bases(ctx: &mut Ctx, entry_idx: 
         })
         .collect();
 
-    // The arm is defined where the merge's PREDECESSOR is, not where the merge is, so substituting it
-    // into a use the merge dominated can leave the operand undefined on the other incoming path. The
-    // value argument for the substitution says nothing about availability, so ask dominance
-    // separately and leave the merge in place wherever the arm does not reach.
-    let dominance =
-        crate::passes::spirv_cfg::BlockDominance::of(&ctx.module.functions[entry_idx].blocks);
-    let definition_sites: HashMap<Word, (usize, usize)> = ctx.module.functions[entry_idx]
-        .blocks
-        .iter()
-        .enumerate()
-        .flat_map(|(block_index, block)| {
-            block.instructions.iter().enumerate().filter_map(
-                move |(instruction_index, instruction)| {
-                    Some((instruction.result_id?, (block_index, instruction_index)))
-                },
-            )
-        })
-        .collect();
-    for (block_index, block) in ctx.module.functions[entry_idx]
-        .blocks
-        .iter_mut()
-        .enumerate()
-    {
-        for (instruction_index, inst) in block.instructions.iter_mut().enumerate() {
+    for block in &mut ctx.module.functions[entry_idx].blocks {
+        for inst in &mut block.instructions {
             if !matches!(
                 inst.class.opcode,
                 Op::AccessChain
@@ -845,22 +823,9 @@ pub(in crate::passes) fn expose_nullable_memory_bases(ctx: &mut Ctx, entry_idx: 
             let Some(Operand::IdRef(base)) = inst.operands.first_mut() else {
                 continue;
             };
-            let Some(concrete) = concrete_arm.get(base) else {
-                continue;
-            };
-            // A parameter or module-scope arm has no definition site inside the body and is
-            // available everywhere.
-            if let Some(&(definition_block, definition_index)) = definition_sites.get(concrete) {
-                let available = if definition_block == block_index {
-                    definition_index < instruction_index
-                } else {
-                    dominance.dominates(definition_block, block_index)
-                };
-                if !available {
-                    continue;
-                }
+            if let Some(concrete) = concrete_arm.get(base) {
+                *base = *concrete;
             }
-            *base = *concrete;
         }
     }
 
@@ -1079,7 +1044,12 @@ pub(in crate::passes) fn decorate_ptr_access_chain_base_strides(ctx: &mut Ctx) {
     }
 }
 
-pub(in crate::passes) use crate::spirv_module::ptr_access_chain_allowed_storage;
+pub(in crate::passes) fn ptr_access_chain_allowed_storage(storage: StorageClass) -> bool {
+    matches!(
+        storage,
+        StorageClass::Workgroup | StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer
+    )
+}
 
 /// Walk a composite TYPE id through access-chain index operands (each an `IdRef` to an `OpConstant`),
 /// returning the innermost reached type id, or `None` if a step indexes a non-composite. This is the

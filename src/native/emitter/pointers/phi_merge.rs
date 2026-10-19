@@ -157,24 +157,6 @@ impl Emitter {
                     return Ok(address);
                 }
                 if self.bda_address_loads.contains(name) {
-                    // The load has not been lowered yet -- this arm is a forward reference from a
-                    // loop header -- so the id to reserve is the one `emit_load_resolved`'s
-                    // device-address branch will DEFINE: `bda_address_name(name)`, into which it
-                    // loads the eight address bytes. It deliberately leaves the pointer's own
-                    // result id undefined, so reserving `name` produced an `OpIAdd %ulong` over an
-                    // id nothing ever gave a value.
-                    //
-                    // Once the load HAS been lowered, `values[name]` is what its own lowering
-                    // decided this value is, and this branch must not second-guess it: a
-                    // `ptr addrspace(1)` load is also how an opaque texture handle comes out of an
-                    // argument buffer, and that one is a descriptor with no address at all. A load
-                    // that did lower as a device address never reaches here -- `raw_offsets[name]`
-                    // carries its `device_addr_base` and the branches above return it.
-                    if !self.values.contains_key(name) {
-                        let address = self.result_id(&bda_address_name(name), &LlType::Int(64))?;
-                        self.bda_address_values.insert(address);
-                        return Ok(address);
-                    }
                     let result_ty = self.tir_result_types.get(name).cloned().ok_or_else(|| {
                         format!("native emitter: BDA pointer load {name} has no result type")
                     })?;
@@ -555,8 +537,8 @@ impl Emitter {
     }
 
     /// Whether a pointer phi is a fully-RAW single-root induction: every arm is either a pointer
-    /// already raw-modeled under the template's root (same root + addrspace, modelable) or a
-    /// loop-carried step of the phi itself (`raw_induction_arm`). Such a phi is exactly the
+    /// already raw-modeled under the template's root (same root + addrspace, modelable) or the
+    /// loop-carried step — a forward GEP whose base is the phi itself. Such a phi is exactly the
     /// shape `emit_raw_pointer_phi` models (a byte/word index phi over one raw root), and the ONLY
     /// shape where the `network_pointees` defer must not steal the claim: the typed merge path has
     /// no way to express the network pointee against the root's raw block declaration.
@@ -566,69 +548,22 @@ impl Emitter {
         incoming: &[(LlValue, String)],
         template: &RawBufferOffset,
     ) -> bool {
-        let mut proving = HashSet::from([name.to_string()]);
-        incoming
-            .iter()
-            .all(|(value, _)| self.raw_induction_arm(name, value, template, &mut proving))
-    }
-
-    /// Whether one arm of a raw induction phi is a step of the SAME cursor.
-    ///
-    /// The simple shape is a self-recursive phi whose backedge is a forward GEP off itself. A
-    /// pointer walked by a NESTED loop is a CYCLE of phis instead: the outer header's carried
-    /// pointer is advanced by the inner loop, so its backedge arm is a GEP off the INNER header's
-    /// phi, whose own entry arm is the outer phi (a third phi in the latch closes the cycle when
-    /// the inner loop is also conditional). No arm of either phi is a GEP off that phi, so the
-    /// one-phi test left the whole cycle on `Private` placeholders. Every value in such a cycle
-    /// addresses the same root, and the typed merge path cannot express any of them -- their arms
-    /// materialize against the root's raw `{ [0 x i32] }` declaration -- so walking the cycle and
-    /// admitting all of them together is the only representation that keeps the accesses on the
-    /// buffer.
-    ///
-    /// A name already being proved counts as proved: that is the cycle closing, and the arms that
-    /// reach it are checked on their own way round.
-    ///
-    /// Measured over the corpus against the one-phi test: 24 of 14,579 sources change, 4 of them
-    /// ERROR -> OK (a phi merging a placeholder with a real `StorageBuffer` pointer has no common
-    /// type, so those did not merely read zero, they failed to construct), 20 emit more
-    /// `StorageBuffer` access chains in place of null-folded loads, and none regress.
-    fn raw_induction_arm(
-        &self,
-        phi: &str,
-        value: &LlValue,
-        template: &RawBufferOffset,
-        proving: &mut HashSet<String>,
-    ) -> bool {
-        if matches!(value, LlValue::Zero) {
-            return true;
-        }
-        let LlValue::Local(incoming_name) = value else {
-            return false;
-        };
-        if let Some(raw) = self.raw_offsets.get(incoming_name) {
-            return raw.root == template.root
-                && raw.addrspace == template.addrspace
-                && !raw.unmodelable;
-        }
-        if !proving.insert(incoming_name.clone()) {
-            return true;
-        }
-        if let Some(gep) = self.forward_geps.get(incoming_name) {
-            return self.raw_induction_arm(phi, &gep.base.value, template, proving);
-        }
-        if self
-            .forward_select_recurrence_gep(incoming_name, phi)
-            .is_some()
-        {
-            return true;
-        }
-        self.tir_phi_incomings
-            .get(incoming_name)
-            .is_some_and(|incoming| {
-                incoming
-                    .iter()
-                    .all(|(value, _)| self.raw_induction_arm(phi, value, template, proving))
-            })
+        incoming.iter().all(|(value, _)| {
+            let LlValue::Local(incoming_name) = value else {
+                return false;
+            };
+            if let Some(raw) = self.raw_offsets.get(incoming_name) {
+                return raw.root == template.root
+                    && raw.addrspace == template.addrspace
+                    && !raw.unmodelable;
+            }
+            self.forward_geps
+                .get(incoming_name)
+                .is_some_and(|gep| matches!(&gep.base.value, LlValue::Local(base) if base == name))
+                || self
+                    .forward_select_recurrence_gep(incoming_name, name)
+                    .is_some()
+        })
     }
 
     pub(in crate::native::emitter) fn emit_raw_pointer_phi(
@@ -668,9 +603,6 @@ impl Emitter {
         }
         let all_incoming_raw = incoming.iter().all(|(value, _)| match value {
             LlValue::Local(name) => self.raw_offsets.contains_key(name),
-            // A `null` arm is the root at offset 0 (see the arm loop below), which is raw and
-            // word-aligned by construction.
-            LlValue::Zero => true,
             _ => false,
         });
         // A raw phi can use word indices only when EVERY arm is word-aligned. Choosing the
@@ -680,11 +612,10 @@ impl Emitter {
         // only at a later access whose alignment proves it legal.
         let word_indexed = all_incoming_raw
             && incoming.iter().all(|(value, _)| {
-                matches!(value, LlValue::Zero)
-                    || matches!(value, LlValue::Local(name) if self
-                        .raw_offsets
-                        .get(name)
-                        .is_some_and(|raw| self.raw_pointer_word_aligned(raw)))
+                matches!(value, LlValue::Local(name) if self
+                    .raw_offsets
+                    .get(name)
+                    .is_some_and(|raw| self.raw_pointer_word_aligned(raw)))
             });
 
         let index_ty = LlType::Int(32);
@@ -738,15 +669,6 @@ impl Emitter {
                         )?
                     }
                 }
-                // A `null` arm is the loop-entry or unused-variant edge of a pointer the shader
-                // only dereferences on the OTHER edges: dereferencing null is undefined, so the
-                // index it contributes is unobservable and 0 is the representable choice. The
-                // nullness phi below keeps `p == null` answerable, which is what the shader
-                // actually asks. Refusing the arm instead collapsed the whole phi -- and every
-                // pointer downstream of it -- to a `Private` zero placeholder, so the loads on
-                // the LIVE edges answered zero too. Measured over the corpus: 40 sources change
-                // and the placeholder-load residue falls 79 -> 38, the single largest class of it.
-                LlValue::Zero => self.const_uint(0)?,
                 _ => return Ok(false),
             };
             let label_id = self.label_id(label)?;
@@ -766,12 +688,6 @@ impl Emitter {
             self.record_phi_edge_instructions(predecessor, edge_instructions);
         }
         instructions.push(Self::inst(Op::Phi, Some(result_type), Some(result), ops));
-        if incoming
-            .iter()
-            .any(|(value, _)| matches!(value, LlValue::Zero))
-        {
-            self.emit_pointer_nullness_phi(name, incoming, result_ty, instructions)?;
-        }
         self.pointer_storage
             .insert(name.to_string(), llvm_pointer_storage(*addrspace)?);
         self.pointer_pointees

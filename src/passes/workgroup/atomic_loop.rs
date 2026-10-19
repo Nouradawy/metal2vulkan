@@ -370,7 +370,7 @@ fn block_label_id(block: &Block) -> Option<Word> {
     block.label.as_ref().and_then(|label| label.result_id)
 }
 
-pub(in crate::passes::workgroup) fn id_ref_at(inst: &Instruction, index: usize) -> Option<Word> {
+fn id_ref_at(inst: &Instruction, index: usize) -> Option<Word> {
     match inst.operands.get(index) {
         Some(Operand::IdRef(id)) => Some(*id),
         _ => None,

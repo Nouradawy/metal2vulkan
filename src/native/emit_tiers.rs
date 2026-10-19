@@ -89,14 +89,17 @@ fn emit_vulkan_spirv_inner(
     entry_name: Option<&str>,
     buffer_layouts: Option<&HashMap<u32, meta::AirType>>,
 ) -> Result<crate::emit_sidecar::EmittedSpirv, crate::emit_sidecar::EmissionFailure> {
-    // Apply the shared pre-emit AIR-text lowering before parse. Alternate constructions see it
-    // because the production entry applies it before re-emission; this entry's copy is retained for
-    // direct callers, and already-lowered text is a no-op guard. See `super::lower_air_text`.
+    // Lower `air.simdgroup_async_copy_2d` (+ its event/wait pair) to an explicit strided tile copy
+    // before parse. Alternate constructions see this lowering because the production entry applies
+    // it before re-emission. This
+    // entry's copy is retained for direct callers; already-lowered text is a no-op guard. See
+    // `async_copy` and its structural regression tests. Floor-safe: only fires on async-copy modules,
+    // which fail the emitter outright otherwise.
     let retry_debug = crate::env_vars::retry_debug();
     if retry_debug {
         eprintln!("[retry-debug] native emit: AIR normalizations start");
     }
-    let san_ll = super::lower_air_text(san_ll);
+    let san_ll = async_copy::lower_simdgroup_async_copy(san_ll);
     // Scalarize any scalar/vector pointer-merge before parse (floor-safe: a no-op unless the module
     // carries a `<N x T>*`/`T*` merge the emitter rejects outright). See `vec_scalar_merge`.
     let san_ll = vec_scalar_merge::lower_vector_scalar_pointer_merge(&san_ll);
@@ -108,88 +111,16 @@ fn emit_vulkan_spirv_inner(
     if retry_debug {
         eprintln!("[retry-debug] native emit: AIR normalizations complete; typed parse start");
     }
-    // A descriptor-relative byte cursor lives in emitter state, not in an SSA value, and Logical
-    // addressing forbids handing the callee the derived pointer instead. The one representation
-    // that keeps the callee's accesses on the buffer is the one with no call boundary: splice the
-    // refused helper calls into their callers in the AIR text and emit that source instead.
-    //
-    // Emission raises the first refusal it reaches and stops, so one pass names one call site.
-    // Splicing it and re-emitting names the next, and each pass removes at least one call from an
-    // acyclic internal call graph, so the loop converges; only a module that already failed enters
-    // it, and the bound keeps the failure path from re-emitting without end.
-    let mut source = san_ll;
-    let mut spliced_calls = 0usize;
-    let mut first_failure = None;
-    for _ in 0..MAX_CURSOR_CALL_SPLICES {
-        let failure = match emit_lowered_air_text(
-            &source,
-            primitive_phi_metadata,
-            kern,
-            entry_name,
-            buffer_layouts,
-            // Splicing a multi-block helper into its caller enlarges the entry CFG exactly as the
-            // pointer-consumer inliner does; select the bounded whole-CFG constructor from that
-            // fact.
-            pointer_consumers.requires_relooper || spliced_calls > 0,
-        ) {
-            Ok(emitted) => return Ok(emitted),
-            Err(failure) => failure,
-        };
-        let Some(spliced) = (if failure.rejected.cursor_call_sites.is_empty() {
-            None
-        } else {
-            inline::inline_cursor_call_sites(&source, &failure.rejected.cursor_call_sites)
-        }) else {
-            // The first refusal is the fact worth reporting: it names the seam. A later error is a
-            // property of a source shape the module never had, so it only annotates that one.
-            return Err(match first_failure {
-                None => failure,
-                Some(error) => crate::emit_sidecar::EmissionFailure {
-                    error: format!(
-                        "{error}; with {spliced_calls} refused call(s) spliced: {}",
-                        failure.error
-                    ),
-                    rejected: failure.rejected,
-                },
-            });
-        };
-        spliced_calls += failure.rejected.cursor_call_sites.len();
-        first_failure.get_or_insert(failure.error);
-        if retry_debug {
-            eprintln!(
-                "[retry-debug] native emit: retrying with {spliced_calls} cursor call site(s) spliced"
-            );
-        }
-        source = spliced;
-    }
-    Err(crate::emit_sidecar::EmissionFailure::from_error(format!(
-        "native emitter: more than {MAX_CURSOR_CALL_SPLICES} helper calls carry a \
-         descriptor-relative byte cursor that cannot cross the call"
-    )))
-}
-
-/// How many refused helper calls one module may have spliced before the retry gives up. Measured
-/// over the 14579-source corpus: the deepest module needs 20, and no module reaches this bound.
-const MAX_CURSOR_CALL_SPLICES: usize = 32;
-
-/// Emit one already-lowered AIR module. Every text normalization has run; this is the parse,
-/// representation-selection, and emission tail that a retry over rewritten text repeats verbatim.
-fn emit_lowered_air_text(
-    san_ll: &str,
-    primitive_phi_metadata: bool,
-    kern: Option<&meta::KernMeta>,
-    entry_name: Option<&str>,
-    buffer_layouts: Option<&HashMap<u32, meta::AirType>>,
-    requires_relooper: bool,
-) -> Result<crate::emit_sidecar::EmittedSpirv, crate::emit_sidecar::EmissionFailure> {
-    let retry_debug = crate::env_vars::retry_debug();
-    let san_ll = san_ll.to_string();
     let mut parsed = if primitive_phi_metadata {
         LlModule::parse_with_primitive_phi_metadata_and_stage_meta(&san_ll, kern, entry_name)
     } else {
         LlModule::parse_with_stage_meta(&san_ll, kern, entry_name)
     }
-    .map_err(crate::emit_sidecar::EmissionFailure::from_error)?;
+    .map_err(|error| crate::emit_sidecar::EmissionFailure {
+        error,
+        ordinary_plan_rejected_functions: HashSet::new(),
+        ownership_plan_rejected_functions: HashSet::new(),
+    })?;
     let requires_device_addresses = requires_device_address_model(&parsed);
     if retry_debug {
         eprintln!(
@@ -245,9 +176,11 @@ fn emit_lowered_air_text(
             .filter_map(|inst| inst.value_call_error().as_deref())
             .find(|error| error.contains("unsupported indirect call through function pointer"))
         {
-            return Err(crate::emit_sidecar::EmissionFailure::from_error(
-                error.to_string(),
-            ));
+            return Err(crate::emit_sidecar::EmissionFailure {
+                error: error.to_string(),
+                ordinary_plan_rejected_functions: HashSet::new(),
+                ownership_plan_rejected_functions: HashSet::new(),
+            });
         }
     }
     if requires_device_addresses {
@@ -260,7 +193,7 @@ fn emit_lowered_air_text(
     if requires_device_addresses {
         emitter = emitter.with_bda_device_pointers();
     }
-    if requires_relooper {
+    if pointer_consumers.requires_relooper {
         emitter = emitter.with_relooper_feed();
     }
     let mut emitted = finalize_emission_outcome(emitter, buffer_layouts, &san_ll)?;
@@ -826,8 +759,13 @@ fn finalize_emission_outcome(
     buffer_layouts: Option<&HashMap<u32, meta::AirType>>,
     san_ll: &str,
 ) -> Result<crate::emit_sidecar::EmittedSpirv, crate::emit_sidecar::EmissionFailure> {
-    let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll)
-        .map_err(crate::emit_sidecar::EmissionFailure::from_error)?;
+    let air_data_layout = crate::layout::AirDataLayout::from_ir(san_ll).map_err(|error| {
+        crate::emit_sidecar::EmissionFailure {
+            error,
+            ordinary_plan_rejected_functions: HashSet::new(),
+            ownership_plan_rejected_functions: HashSet::new(),
+        }
+    })?;
     let (mut module, sidecar) =
         emitter.emit_with_sidecar(buffer_layouts, air_data_layout.as_ref())?;
     add_native_module_capabilities(&mut module);

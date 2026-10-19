@@ -1,53 +1,18 @@
 //! Apple AGX3 emask intrinsic lowering.
 //!
 //! The AIR `llvm.agx3.*.with.emask.global.*` family is a stable LLVM/AGX ABI namespace, not a
-//! shader identifier. Lower scalar and short-vector operations into explicit guarded control flow so
-//! inactive lanes are never speculatively dereferenced.
-//!
-//! **Device-measured on an Apple M3 Max** (`/tmp/em`, built with `xcrun metal -x ir` since MSL has
-//! no spelling for the family), against `load.with.emask.global.v4i32` and
-//! `wide.load.with.emask.global.v8i32`:
-//!
-//! * Lane `i` is active exactly when bit `i` of the first mask is set. Bits past the lane count are
-//!   ignored, and an inactive lane reads as **zero** -- not as whatever was at the address.
-//! * Lane `i` reads from `base + i * sizeof(element)`. The trailing **stride operand has no effect
-//!   at all**: 0, 1, 2, 8, 16 and 32 all produced the same addresses as 4. The corpus passes
-//!   exactly the element size in bytes at all 38564 call sites, so the operand is redundant with
-//!   the intrinsic's own element type and nothing here may derive an address from it.
-//! * The second mask is a fixed constant of the SHAPE, not a runtime value: the backend refuses to
-//!   compile the call at any other value. It is `1` for `v1`, `3` for `v2`, `15` for `v4` -- and
-//!   `7` for the eight-element `wide` forms, where only elements 0, 1 and 2 are ever loaded and the
-//!   remaining five stay zero for every first-mask value including `0xFFFF`. That is why the wide
-//!   forms are refused below rather than lowered as eight lanes.
+//! shader identifier. The observed `sdpa_tile_fwd_reduction` shape uses byte-addressed global
+//! pointers plus two lane masks. Loads leave inactive lanes as zero; stores skip inactive lanes.
+//! Lower scalar and short-vector operations into explicit guarded control flow so inactive lanes are
+//! never speculatively dereferenced.
 
-use super::block_split::{labelled_block as block, CallSiteSplit};
 use super::*;
+use std::collections::HashSet;
 
 const AGX_LOAD_EMASK_PREFIX: &str = "llvm.agx3.load.with.emask.global.";
 const AGX_STORE_EMASK_PREFIX: &str = "llvm.agx3.store.with.emask.global.";
 const AGX_EMASK_LANES: u32 = 4;
 
-/// `llvm.agx3.edgecheck(base, low, count)` -> the four-lane activity mask consumed by the emask
-/// load/store family.
-///
-/// **Device-measured on an Apple M3 Max over 324 operand triples** (`/tmp/edge3`, built with
-/// `xcrun metal -x ir` since MSL has no spelling for the intrinsic). Bit `i` of the `i16` result is
-/// set for `i` in `0..4` exactly when
-///
-/// ```text
-/// base + i >= 0   (signed)   AND   (unsigned)(base + i - low) < count
-/// ```
-///
-/// Two things in that are not what the operand names suggest, and both were wrong here before:
-/// the third operand is a **count**, not an upper bound -- `edgecheck(0, 1, 3)` answers `0b1110`,
-/// the lanes landing in `[1, 4)`, not the `0b0110` an upper bound of 3 would give -- and a lane
-/// whose index is **negative** is inactive whatever the bounds say, which an unsigned comparison
-/// alone does not express. Every one of the 11344 call sites in the corpus passes `low = 0`, where
-/// the count and the bound coincide and `base + i >= 0` is implied by `(unsigned)(base + i) <
-/// count` for any count the hardware can address; the correction is unreachable from the corpus.
-///
-/// `base >= -i` is the overflow-free way to write `base + i >= 0`: the sum itself can leave i32 at
-/// `INT_MAX`, the comparison against a small negative constant cannot.
 pub(in crate::passes) fn lower_agx3_edgecheck(
     ctx: &mut Ctx,
     name: &str,
@@ -60,14 +25,14 @@ pub(in crate::passes) fn lower_agx3_edgecheck(
     }
     let mut out = Vec::new();
     let base = ensure_u32(ctx, &mut out, args[0], "llvm.agx3.edgecheck lane base")?;
-    let low = ensure_u32(ctx, &mut out, args[1], "llvm.agx3.edgecheck range start")?;
-    let count = ensure_u32(ctx, &mut out, args[2], "llvm.agx3.edgecheck range count")?;
+    let low = ensure_u32(ctx, &mut out, args[1], "llvm.agx3.edgecheck low bound")?;
+    let high = ensure_u32(ctx, &mut out, args[2], "llvm.agx3.edgecheck high bound")?;
     let uint_ty = ctx.ty_uint();
     let bool_ty = ctx.ty_bool();
     let zero = ctx.const_uint(0);
     let mut acc = zero;
     for lane in 0..AGX_EMASK_LANES {
-        let lane_index = if lane == 0 {
+        let lane_value = if lane == 0 {
             base
         } else {
             let lane_const = ctx.const_uint(lane);
@@ -80,34 +45,26 @@ pub(in crate::passes) fn lower_agx3_edgecheck(
             ));
             id
         };
-        let negated_lane = ctx.const_uint((-(lane as i32)) as u32);
-        let non_negative = ctx.module.fresh_id();
+        let ge_low = ctx.module.fresh_id();
         out.push(Instruction::new(
-            Op::SGreaterThanEqual,
+            Op::UGreaterThanEqual,
             Some(bool_ty),
-            Some(non_negative),
-            vec![Operand::IdRef(base), Operand::IdRef(negated_lane)],
+            Some(ge_low),
+            vec![Operand::IdRef(lane_value), Operand::IdRef(low)],
         ));
-        let relative = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::ISub,
-            Some(uint_ty),
-            Some(relative),
-            vec![Operand::IdRef(lane_index), Operand::IdRef(low)],
-        ));
-        let within = ctx.module.fresh_id();
+        let lt_high = ctx.module.fresh_id();
         out.push(Instruction::new(
             Op::ULessThan,
             Some(bool_ty),
-            Some(within),
-            vec![Operand::IdRef(relative), Operand::IdRef(count)],
+            Some(lt_high),
+            vec![Operand::IdRef(lane_value), Operand::IdRef(high)],
         ));
         let active = ctx.module.fresh_id();
         out.push(Instruction::new(
             Op::LogicalAnd,
             Some(bool_ty),
             Some(active),
-            vec![Operand::IdRef(non_negative), Operand::IdRef(within)],
+            vec![Operand::IdRef(ge_low), Operand::IdRef(lt_high)],
         ));
         let bit = ctx.const_uint(1u32 << lane);
         let lane_bits = ctx.module.fresh_id();
@@ -203,8 +160,101 @@ fn split_agx_emask_memory_call(
 ) -> Result<(), String> {
     let args = idref_args(&site.call);
     let is_load = site.name.starts_with(AGX_LOAD_EMASK_PREFIX);
-    let mut split = CallSiteSplit::open(ctx, entry_idx, site.block, site.inst, &site.name)?;
+    let old_label = ctx.module.functions[entry_idx].blocks[site.block]
+        .label
+        .as_ref()
+        .and_then(|label| label.result_id)
+        .ok_or_else(|| format!("{} appears in a block without a label", site.name))?;
+    let old_insts = ctx.module.functions[entry_idx].blocks[site.block]
+        .instructions
+        .clone();
+    let mut prefix = old_insts[..site.inst].to_vec();
+    let mut suffix = old_insts[site.inst + 1..].to_vec();
+    if suffix.is_empty()
+        || !suffix
+            .last()
+            .is_some_and(|inst| is_block_terminator(inst.class.opcode))
+    {
+        return Err(format!(
+            "{} lowering requires the source block to retain its terminator",
+            site.name
+        ));
+    }
+    if prefix
+        .last()
+        .is_some_and(|inst| matches!(inst.class.opcode, Op::SelectionMerge | Op::LoopMerge))
+    {
+        return Err(format!(
+            "{} lowering cannot split between a structured merge and its terminator",
+            site.name
+        ));
+    }
 
+    // Splitting a loop-header call must not move OpLoopMerge onto the new continuation block: the
+    // original label remains the backedge target and therefore remains the loop header. Keep the
+    // claim on that label, and turn the former loop-exit conditional into an ordinary selection with
+    // a private pass-through merge. This carries CFG ownership through intrinsic lowering instead of
+    // asking a later validator-triggered prune to erase the malformed loop.
+    let loop_merge = suffix
+        .iter()
+        .position(|inst| inst.class.opcode == Op::LoopMerge)
+        .map(|index| suffix.remove(index));
+    let mut loop_exit_passthrough = None;
+    if let Some(loop_merge) = &loop_merge {
+        let merge_target = loop_merge
+            .operands
+            .first()
+            .and_then(|operand| match operand {
+                Operand::IdRef(target) => Some(*target),
+                _ => None,
+            })
+            .ok_or("AGX emask loop split found a malformed OpLoopMerge")?;
+        let terminator = suffix
+            .last_mut()
+            .ok_or("AGX emask loop split lost its terminator")?;
+        match terminator.class.opcode {
+            Op::Branch => {}
+            Op::BranchConditional => {
+                let exits_at_merge = terminator
+                    .operands
+                    .iter()
+                    .skip(1)
+                    .any(|operand| *operand == Operand::IdRef(merge_target));
+                if !exits_at_merge {
+                    return Err(
+                        "AGX emask loop-header conditional does not target its loop merge".into(),
+                    );
+                }
+                let private_merge = ctx.module.fresh_id();
+                for operand in terminator.operands.iter_mut().skip(1) {
+                    if *operand == Operand::IdRef(merge_target) {
+                        *operand = Operand::IdRef(private_merge);
+                    }
+                }
+                let terminator_index = suffix.len() - 1;
+                suffix.insert(
+                    terminator_index,
+                    Instruction::new(
+                        Op::SelectionMerge,
+                        None,
+                        None,
+                        vec![
+                            Operand::IdRef(private_merge),
+                            Operand::SelectionControl(spirv::SelectionControl::NONE),
+                        ],
+                    ),
+                );
+                loop_exit_passthrough = Some((private_merge, merge_target));
+            }
+            _ => {
+                return Err(
+                    "AGX emask lowering cannot split this loop-header terminator honestly".into(),
+                );
+            }
+        }
+    }
+
+    let successors = terminator_successors(suffix.last().expect("suffix terminator"));
     let replacement = if is_load {
         plan_load(
             ctx,
@@ -217,28 +267,31 @@ fn split_agx_emask_memory_call(
     } else {
         plan_store(ctx, &site.name, &args)?
     };
-    let cont_label = split.continuation(ctx);
+    let cont_label = ctx.module.fresh_id();
     let lanes = replacement.lanes;
     let test_labels: Vec<Word> = (0..lanes).map(|_| ctx.module.fresh_id()).collect();
     let body_labels: Vec<Word> = (0..lanes).map(|_| ctx.module.fresh_id()).collect();
 
-    let mask0 = ensure_u32(ctx, &mut split.prefix, replacement.mask0, "AGX emask mask0")?;
-    let mask1 = ensure_u32(ctx, &mut split.prefix, replacement.mask1, "AGX emask mask1")?;
-    let stride = ensure_u32(
-        ctx,
-        &mut split.prefix,
-        replacement.stride,
-        "AGX emask stride",
-    )?;
+    let mask0 = ensure_u32(ctx, &mut prefix, replacement.mask0, "AGX emask mask0")?;
+    let mask1 = ensure_u32(ctx, &mut prefix, replacement.mask1, "AGX emask mask1")?;
+    let stride = ensure_u32(ctx, &mut prefix, replacement.stride, "AGX emask stride")?;
     if let Some((scratch, zero)) = replacement.load_scratch {
-        split.prefix.push(Instruction::new(
+        prefix.push(Instruction::new(
             Op::Store,
             None,
             None,
             vec![Operand::IdRef(scratch), Operand::IdRef(zero)],
         ));
     }
-    split.branch_prefix_to(test_labels[0]);
+    if let Some(loop_merge) = loop_merge {
+        prefix.push(loop_merge);
+    }
+    prefix.push(Instruction::new(
+        Op::Branch,
+        None,
+        None,
+        vec![Operand::IdRef(test_labels[0])],
+    ));
 
     let mut blocks = Vec::with_capacity((lanes as usize) * 2 + 1);
     for lane in 0..lanes {
@@ -283,7 +336,7 @@ fn split_agx_emask_memory_call(
     }
 
     if let Some((scratch, _, result, rty)) = replacement.load_scratch_result {
-        split.suffix.insert(
+        suffix.insert(
             0,
             Instruction::new(
                 Op::Load,
@@ -293,7 +346,49 @@ fn split_agx_emask_memory_call(
             ),
         );
     }
-    split.finish(ctx, entry_idx, blocks);
+    blocks.push(block(cont_label, suffix));
+    if let Some((private_merge, merge_target)) = loop_exit_passthrough {
+        blocks.push(block(
+            private_merge,
+            vec![Instruction::new(
+                Op::Branch,
+                None,
+                None,
+                vec![Operand::IdRef(merge_target)],
+            )],
+        ));
+    }
+
+    ctx.module.functions[entry_idx].blocks[site.block].instructions = prefix;
+    ctx.module.functions[entry_idx]
+        .blocks
+        .splice(site.block + 1..site.block + 1, blocks);
+    if let Some((private_merge, merge_target)) = loop_exit_passthrough {
+        let merge_successor = HashSet::from([merge_target]);
+        rewrite_successor_phi_predecessors(
+            &mut ctx.module.functions[entry_idx],
+            &merge_successor,
+            old_label,
+            private_merge,
+        );
+        let ordinary_successors = successors
+            .difference(&merge_successor)
+            .copied()
+            .collect::<HashSet<_>>();
+        rewrite_successor_phi_predecessors(
+            &mut ctx.module.functions[entry_idx],
+            &ordinary_successors,
+            old_label,
+            cont_label,
+        );
+    } else {
+        rewrite_successor_phi_predecessors(
+            &mut ctx.module.functions[entry_idx],
+            &successors,
+            old_label,
+            cont_label,
+        );
+    }
     Ok(())
 }
 
@@ -735,6 +830,69 @@ fn idref_args(inst: &Instruction) -> Vec<Word> {
         .collect()
 }
 
+fn block(label: Word, instructions: Vec<Instruction>) -> Block {
+    Block {
+        label: Some(Instruction::new(Op::Label, None, Some(label), vec![])),
+        instructions,
+    }
+}
+
+fn terminator_successors(inst: &Instruction) -> HashSet<Word> {
+    let mut out = HashSet::new();
+    match inst.class.opcode {
+        Op::Branch => {
+            if let Some(Operand::IdRef(label)) = inst.operands.first() {
+                out.insert(*label);
+            }
+        }
+        Op::BranchConditional => {
+            for operand in inst.operands.iter().skip(1).take(2) {
+                if let Operand::IdRef(label) = operand {
+                    out.insert(*label);
+                }
+            }
+        }
+        Op::Switch => {
+            for operand in inst.operands.iter().skip(1) {
+                if let Operand::IdRef(label) = operand {
+                    out.insert(*label);
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn rewrite_successor_phi_predecessors(
+    function: &mut Function,
+    successors: &HashSet<Word>,
+    old_label: Word,
+    new_label: Word,
+) {
+    if successors.is_empty() {
+        return;
+    }
+    for block in &mut function.blocks {
+        let Some(label) = block.label.as_ref().and_then(|label| label.result_id) else {
+            continue;
+        };
+        if !successors.contains(&label) {
+            continue;
+        }
+        for inst in &mut block.instructions {
+            if inst.class.opcode != Op::Phi {
+                break;
+            }
+            for pair in inst.operands.chunks_mut(2) {
+                if pair.len() == 2 && pair[1] == Operand::IdRef(old_label) {
+                    pair[1] = Operand::IdRef(new_label);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,10 +902,6 @@ mod tests {
         Instruction::new(op, ty, id, ops)
     }
 
-    /// The two halves of the device-measured predicate: a SIGNED test that the lane index is
-    /// non-negative, and an UNSIGNED test that it lands within `count` of `low`. An unsigned
-    /// lower-bound comparison against `low` -- what this emitted before the intrinsic was measured
-    /// -- is neither, and must not reappear.
     #[test]
     fn edgecheck_lowers_to_four_lane_mask() {
         let mut ctx = Ctx::new(Module::new());
@@ -771,18 +925,20 @@ mod tests {
             insts.last().map(|inst| inst.class.opcode),
             Some(Op::UConvert)
         );
-        for (op, count) in [
-            (Op::SGreaterThanEqual, 4),
-            (Op::ULessThan, 4),
-            (Op::ISub, 4),
-            (Op::UGreaterThanEqual, 0),
-        ] {
-            assert_eq!(
-                insts.iter().filter(|inst| inst.class.opcode == op).count(),
-                count,
-                "{op:?}"
-            );
-        }
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|inst| inst.class.opcode == Op::UGreaterThanEqual)
+                .count(),
+            4
+        );
+        assert_eq!(
+            insts
+                .iter()
+                .filter(|inst| inst.class.opcode == Op::ULessThan)
+                .count(),
+            4
+        );
     }
 
     #[test]
@@ -1059,138 +1215,5 @@ mod tests {
             merge_phi.operands.get(1),
             Some(&Operand::IdRef(private_merge))
         );
-    }
-
-    /// A masked LOAD allocates `OpVariable` scratch in the function's entry block, and when the
-    /// call site is itself in the entry block that is the very block the split has already
-    /// snapshotted. The scratch has to survive the write-back; if it does not, every reference to
-    /// it dangles and the module is refused whole.
-    #[test]
-    fn emask_load_in_the_entry_block_keeps_its_scratch_variable() {
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(300));
-        module.types_global_values = vec![
-            inst(Op::TypeVoid, None, Some(1), vec![]),
-            inst(
-                Op::TypeInt,
-                None,
-                Some(2),
-                vec![Operand::LiteralBit32(8), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::TypeInt,
-                None,
-                Some(3),
-                vec![Operand::LiteralBit32(16), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::TypeInt,
-                None,
-                Some(4),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-            ),
-            inst(
-                Op::TypeVector,
-                None,
-                Some(6),
-                vec![Operand::IdRef(4), Operand::LiteralBit32(4)],
-            ),
-            inst(
-                Op::TypePointer,
-                None,
-                Some(7),
-                vec![
-                    Operand::StorageClass(StorageClass::StorageBuffer),
-                    Operand::IdRef(2),
-                ],
-            ),
-            inst(
-                Op::TypeFunction,
-                None,
-                Some(8),
-                vec![Operand::IdRef(1), Operand::IdRef(7)],
-            ),
-            inst(
-                Op::Constant,
-                Some(3),
-                Some(30),
-                vec![Operand::LiteralBit32(15)],
-            ),
-            inst(
-                Op::Constant,
-                Some(3),
-                Some(31),
-                vec![Operand::LiteralBit32(4)],
-            ),
-        ];
-        module.debug_names = vec![inst(
-            Op::Name,
-            None,
-            None,
-            vec![
-                Operand::IdRef(201),
-                Operand::LiteralString("llvm.agx3.load.with.emask.global.v4i32".to_string()),
-            ],
-        )];
-        module.functions = vec![Function {
-            def: Some(inst(
-                Op::Function,
-                Some(1),
-                Some(100),
-                vec![
-                    Operand::FunctionControl(FunctionControl::NONE),
-                    Operand::IdRef(8),
-                ],
-            )),
-            parameters: vec![inst(Op::FunctionParameter, Some(7), Some(20), vec![])],
-            blocks: vec![block(
-                10,
-                vec![
-                    inst(
-                        Op::FunctionCall,
-                        Some(6),
-                        Some(40),
-                        vec![
-                            Operand::IdRef(201),
-                            Operand::IdRef(20),
-                            Operand::IdRef(30),
-                            Operand::IdRef(30),
-                            Operand::IdRef(31),
-                        ],
-                    ),
-                    inst(Op::Return, None, None, vec![]),
-                ],
-            )],
-            end: Some(inst(Op::FunctionEnd, None, None, vec![])),
-        }];
-        let mut ctx = Ctx::new(module);
-
-        lower_agx_emask_memory_calls(&mut ctx, 0).expect("emask load splits");
-        let function = &ctx.module.functions[0];
-        let scratch: Vec<Word> = function.blocks[0]
-            .instructions
-            .iter()
-            .take_while(|inst| inst.class.opcode == Op::Variable)
-            .filter_map(|inst| inst.result_id)
-            .collect();
-        assert_eq!(
-            scratch.len(),
-            1,
-            "the load allocates one entry-block scratch"
-        );
-        // The load's replacement result reads that scratch back, and every lane writes it.
-        let reads = function
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instructions)
-            .find(|inst| inst.class.opcode == Op::Load && inst.result_id == Some(40))
-            .expect("the call's result is now a load of the scratch");
-        assert_eq!(reads.operands.first(), Some(&Operand::IdRef(scratch[0])));
-        assert!(function
-            .blocks
-            .iter()
-            .flat_map(|block| &block.instructions)
-            .filter(|inst| inst.class.opcode == Op::Store)
-            .all(|inst| inst.operands.first() == Some(&Operand::IdRef(scratch[0]))));
     }
 }

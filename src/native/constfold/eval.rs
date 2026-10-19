@@ -142,50 +142,23 @@ pub(in crate::native) fn forward_eval(
                     Op::ULessThan => ucmp_fold(
                         get(&lat, inst.operands.first()),
                         get(&lat, inst.operands.get(1)),
-                        Cmp::Lt,
+                        UCmp::Lt,
                     ),
                     Op::UGreaterThan => ucmp_fold(
                         get(&lat, inst.operands.first()),
                         get(&lat, inst.operands.get(1)),
-                        Cmp::Gt,
+                        UCmp::Gt,
                     ),
                     Op::ULessThanEqual => ucmp_fold(
                         get(&lat, inst.operands.first()),
                         get(&lat, inst.operands.get(1)),
-                        Cmp::Le,
+                        UCmp::Le,
                     ),
                     Op::UGreaterThanEqual => ucmp_fold(
                         get(&lat, inst.operands.first()),
                         get(&lat, inst.operands.get(1)),
-                        Cmp::Ge,
+                        UCmp::Ge,
                     ),
-                    // The signed twins of the four unsigned comparisons above. Leaving them out
-                    // left `OpSGreaterThan %uint_0 %uint_0` -- a comparison of one constant with
-                    // itself -- opaque, and with it every branch and select it fed.
-                    Op::SLessThan
-                    | Op::SGreaterThan
-                    | Op::SLessThanEqual
-                    | Op::SGreaterThanEqual => {
-                        let operand_width =
-                            inst.operands
-                                .iter()
-                                .take(2)
-                                .find_map(|operand| match operand {
-                                    Operand::IdRef(id) => widths.get(id).copied(),
-                                    _ => None,
-                                });
-                        scmp_fold(
-                            get(&lat, inst.operands.first()),
-                            get(&lat, inst.operands.get(1)),
-                            operand_width,
-                            match inst.class.opcode {
-                                Op::SLessThan => Cmp::Lt,
-                                Op::SGreaterThan => Cmp::Gt,
-                                Op::SLessThanEqual => Cmp::Le,
-                                _ => Cmp::Ge,
-                            },
-                        )
-                    }
                     Op::LogicalNot => match get(&lat, inst.operands.first()) {
                         Some(Lat::Const(a)) => Some(Lat::Const((a == 0) as i128)),
                         Some(Lat::Bottom) => Some(Lat::Bottom),

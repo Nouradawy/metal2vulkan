@@ -13,19 +13,13 @@
 //! // before (illegal): p = select(c, &bufB[i], &bufA[i]); v = load(p)
 //! // after  (legal):    vA = load(&bufA[i]); vB = load(&bufB[i]); v = select(c, vB, vA)
 //! ```
-//! The LOAD rewrite is byte-exact by construction: the SELECTED value is the exact load Apple
-//! performs, and the non-selected loads are discarded (device-buffer over-reads on Metal do not
-//! fault).
-//!
-//! The STORE rewrite is a branch-free read/modify/write: each candidate arm is loaded, the selected
-//! arm receives the new value, and the other is stored back unchanged. That is byte-exact for ONE
-//! invocation and NOT equivalent to Apple's store in general -- storing a value back is still a
-//! write, so an invocation that did not select an arm overwrites, with the pre-store value, the
-//! result of an invocation that did. The emitter hit exactly this and now guards each arm's store
-//! instead (`emitter::pointers::raw_select`); this pass runs after CFG structurization on a block
-//! list it cannot split, so it has no guard to emit and instead DECLINES whenever the arm an
-//! invocation stores into can differ between invocations. Opaque pointer uses, atomics, and pointer
-//! phis still make the pass BAIL so PSB handles those shapes as today.
+//! It is byte-exact by construction: the SELECTED value is the exact load Apple performs; the
+//! non-selected loads are discarded (device-buffer over-reads on Metal do not fault). For an ordinary
+//! store through the merge, it uses the emitter's established branch-free read/modify/write form: each
+//! candidate arm is loaded, the selected arm receives the new value, and the other is stored back
+//! unchanged. This keeps the operation in Logical StorageBuffer value space without introducing a new
+//! control-flow block after CFG structurization. Opaque pointer uses, atomics, and pointer phis still
+//! make the pass BAIL so PSB handles those shapes as today.
 //!
 //! Decides purely from IR structure (storage class, access-chain roots, the cross-binding property,
 //! and replayable consumer class) — never a shader name. Interface binding invokes it when concrete
@@ -791,98 +785,6 @@ fn rewrite_scalar_ptr_byte_loads(module: &mut Module) -> bool {
 /// Rewrite the cross-binding pointer-merge sub-graph(s) of `module` into the value domain (plain
 /// Logical `StorageBuffer`). Returns true if any rewrite was applied. Three stages: discover the
 /// lowerable closure, replay each closure load into the value domain (synthesis), then install it.
-/// Ids whose value can differ between the invocations of one dispatch: everything reachable forward
-/// from an `Input` variable. A load is varying when its POINTER is varying — the memory it reads is
-/// the same for every invocation, but the address is not.
-///
-/// Data-flow only, and that is sufficient here: a pointer merge that is a control-flow `OpPhi`
-/// already makes discovery bail, so the arm an invocation stores into is decided by `OpSelect`
-/// conditions and nothing else.
-fn invocation_varying_ids(module: &Module) -> HashSet<Word> {
-    let mut varying: HashSet<Word> = module
-        .types_global_values
-        .iter()
-        .filter(|inst| {
-            inst.class.opcode == Op::Variable
-                && matches!(
-                    inst.operands.first(),
-                    Some(Operand::StorageClass(StorageClass::Input))
-                )
-        })
-        .filter_map(|inst| inst.result_id)
-        .collect();
-    // Block order is not a dominance order for `OpPhi`, so iterate to a fixpoint. Every round
-    // strictly grows the set, so this terminates in at most one round per value.
-    loop {
-        let mut changed = false;
-        for function in &module.functions {
-            for block in &function.blocks {
-                for inst in &block.instructions {
-                    let Some(result) = inst.result_id else {
-                        continue;
-                    };
-                    if varying.contains(&result) {
-                        continue;
-                    }
-                    if inst
-                        .operands
-                        .iter()
-                        .any(|op| matches!(op, Operand::IdRef(id) if varying.contains(id)))
-                    {
-                        varying.insert(result);
-                        changed = true;
-                    }
-                }
-            }
-        }
-        if !changed {
-            return varying;
-        }
-    }
-}
-
-/// Whether the arm a store through `ptr` lands in can differ between invocations — the condition
-/// under which the branch-free read/modify/write store described in the module doc is a data race.
-fn store_arm_varies_by_invocation(
-    ptr: Word,
-    value_def: &HashMap<Word, Instruction>,
-    var_storage: &HashMap<Word, StorageClass>,
-    varying: &HashSet<Word>,
-) -> bool {
-    let mut seen: HashSet<Word> = HashSet::new();
-    let mut work = vec![ptr];
-    while let Some(id) = work.pop() {
-        if !seen.insert(id) || var_storage.contains_key(&id) {
-            continue;
-        }
-        let Some(def) = value_def.get(&id) else {
-            continue;
-        };
-        match def.class.opcode {
-            Op::Select => {
-                let Some(Operand::IdRef(condition)) = def.operands.first() else {
-                    return true;
-                };
-                if varying.contains(condition) {
-                    return true;
-                }
-                work.extend(def.operands.iter().skip(1).filter_map(|op| match op {
-                    Operand::IdRef(arm) => Some(*arm),
-                    _ => None,
-                }));
-            }
-            Op::Phi => return true,
-            Op::AccessChain | Op::InBoundsAccessChain | Op::PtrAccessChain | Op::CopyObject => {
-                if let Some(Operand::IdRef(base)) = def.operands.first() {
-                    work.push(*base);
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
 pub(super) fn rewrite_cross_binding_pointer_merges_to_values(module: &mut Module) -> bool {
     let Some(Discovery {
         type_defs,
@@ -1822,17 +1724,6 @@ pub(super) fn rewrite_cross_binding_pointer_merges_to_values(module: &mut Module
                         }
                     }
                 }
-            }
-        }
-        if !stores.is_empty() {
-            let varying = invocation_varying_ids(module);
-            if stores.iter().any(|(_, _, _, ptr, _, _)| {
-                store_arm_varies_by_invocation(*ptr, &value_def, &var_storage, &varying)
-            }) {
-                // Declining leaves the whole closure for PSB's device-address lowering. That costs
-                // a compute pipeline MoltenVK can create, and it is still the right trade against a
-                // store that races: measured over all 14,579 corpus sources, no module reaches this.
-                return false;
             }
         }
         for ptr in loads
@@ -2852,89 +2743,6 @@ mod tests {
             out.status.success(),
             "spirv-val failed: {}",
             String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    /// Give the two-buffer fixture the same store, but choose the arm from a per-invocation
-    /// builtin instead of a constant. The branch-free read/modify/write writes BOTH arms, so an
-    /// invocation that took the other arm would overwrite this one's result with the value it read
-    /// before the store. The pass has no guard to emit here, so it must decline and leave the whole
-    /// closure to PSB.
-    #[test]
-    fn store_through_a_merge_the_invocation_chooses_is_declined() {
-        let mut m = build_two_buffer_select();
-        m.types_global_values.push(inst(
-            Op::Constant,
-            Some(4),
-            Some(44),
-            vec![Operand::LiteralBit32(0)],
-        ));
-        // %45 = ptr Input uint, %46 = the builtin, %47 = its load, %48 = the derived condition.
-        m.types_global_values.push(inst(
-            Op::TypePointer,
-            None,
-            Some(45),
-            vec![
-                Operand::StorageClass(StorageClass::Input),
-                Operand::IdRef(3),
-            ],
-        ));
-        m.types_global_values.push(inst(
-            Op::Variable,
-            Some(45),
-            Some(46),
-            vec![Operand::StorageClass(StorageClass::Input)],
-        ));
-        let block = &mut m.functions[0].blocks[0];
-        block.instructions.retain(|i| i.result_id != Some(43));
-        block.instructions.insert(
-            0,
-            inst(Op::Load, Some(3), Some(47), vec![Operand::IdRef(46)]),
-        );
-        block.instructions.insert(
-            1,
-            inst(
-                Op::IEqual,
-                Some(9),
-                Some(48),
-                vec![Operand::IdRef(47), Operand::IdRef(10)],
-            ),
-        );
-        for instruction in block.instructions.iter_mut() {
-            if instruction.result_id == Some(42) {
-                instruction.operands[0] = Operand::IdRef(48);
-            }
-        }
-        let ret_pos = block
-            .instructions
-            .iter()
-            .position(|i| i.class.opcode == Op::Return)
-            .unwrap();
-        block.instructions.insert(
-            ret_pos,
-            inst(
-                Op::Store,
-                None,
-                None,
-                vec![Operand::IdRef(42), Operand::IdRef(44)],
-            ),
-        );
-        let before = m.clone();
-        assert!(
-            !rewrite_cross_binding_pointer_merges_to_values(&mut m),
-            "a store whose arm the invocation chooses must not be replayed in the value domain"
-        );
-        assert_eq!(
-            m.functions[0].blocks[0].instructions.len(),
-            before.functions[0].blocks[0].instructions.len(),
-            "declining must leave the module untouched"
-        );
-        assert!(
-            m.functions[0].blocks[0]
-                .instructions
-                .iter()
-                .any(|inst| inst.result_id == Some(42)),
-            "the pointer select survives for PSB to lower"
         );
     }
 

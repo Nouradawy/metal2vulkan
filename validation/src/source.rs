@@ -941,15 +941,6 @@ pub fn public_sources() -> Result<Vec<SourceRow>, String> {
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|extension| extension == "ll"))
-        // `<name>.air.ll` is the Metal half of a fixture whose AIR no MSL can spell: typed-pointer
-        // dialect, air64 triple, assembled by `xcrun metal -x ir`. The translator reads
-        // `<name>.ll`; this one is not a source of its own.
-        .filter(|path| {
-            !path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.ends_with(".air.ll"))
-        })
         .collect::<Vec<_>>();
     paths.sort();
     paths.into_iter().map(public_source_row).collect()

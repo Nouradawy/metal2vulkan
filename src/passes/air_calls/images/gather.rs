@@ -4,9 +4,7 @@ use super::*;
 
 /// Lower `air.gather_texture_2d.v4f32`: gather one selected component from the four neighboring
 /// texels around the sampled coordinate. AIR args observed in real AIR are
-/// `(texture, sampler, coord, i1 has_offset, offset, component, flags)`. `has_offset` is not a
-/// coordinate-mode flag and carries nothing this lowering needs -- the offset operand states its
-/// own value. Whether the coordinate is normalized or in texels is the sampler state's to say.
+/// `(texture, sampler, coord, normalized, offset, component, flags)`.
 pub(in crate::passes) fn lower_gather(
     ctx: &mut Ctx,
     name: &str,
@@ -24,10 +22,8 @@ pub(in crate::passes) fn lower_gather(
     }
     let samp = args[1];
     let mut img = resolve_image_value(ctx, args[0]);
-    if texture_operand_is_absent(ctx, img) {
-        if let Some(sampled_img) =
-            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Sampled)
-        {
+    if texture_operand_is_private_pointer(ctx, img) {
+        if let Some(sampled_img) = single_sampled_image_for_private_read(ctx, img) {
             img = sampled_img;
         } else {
             return lower_null_texture_result(ctx, res, rty);
@@ -43,19 +39,18 @@ pub(in crate::passes) fn lower_gather(
     } else {
         (None, args[4], args[5])
     };
+    let normalized = sample_uses_normalized_coords(ctx, arrayed, args);
     lower_gather_2d(
-        ctx, res, rty, img, dim, arrayed, samp, args[2], layer, offset, component, v4,
+        ctx, res, rty, img, dim, arrayed, samp, args[2], layer, offset, component, normalized, v4,
     )
 }
 
 /// Lower `air.gather_depth_2d[_array].v4f32`: gather the four neighboring depth texels around the
 /// coordinate. The harness binds `depth2d<float>` as a float color texture, so depth is component
 /// zero. The depth ABI sits one slot right of the color layout — `(texture, sampler, i32, coord,
-/// [layer,] i1, offset, i32 flags)`, no component operand. The `i1` is `true` at every call site
-/// the frontend emits, for pixel and normalized samplers alike and with or without an offset, so
-/// it names no coordinate domain and this lowering does not read it. Which domain the coordinate
-/// is in comes from the sampler, exactly as it does for the non-array and color forms, and
-/// `lower_gather_2d` is what decides between the reconstructed pixel footprint and `OpImageGather`.
+/// [layer,] i1 normalized, offset, i32 flags)`, no component operand. The array form uses Metal's
+/// explicit four-fetch pixel footprint; passing it through color gather's normalized
+/// `OpImageGather` coordinate is validator-clean but byte-wrong against Apple.
 pub(in crate::passes) fn lower_gather_depth(
     ctx: &mut Ctx,
     name: &str,
@@ -73,10 +68,8 @@ pub(in crate::passes) fn lower_gather_depth(
     }
     let samp = args[1];
     let mut img = resolve_image_value(ctx, args[0]);
-    if texture_operand_is_absent(ctx, img) {
-        if let Some(sampled_img) =
-            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Sampled)
-        {
+    if texture_operand_is_private_pointer(ctx, img) {
+        if let Some(sampled_img) = single_sampled_image_for_private_read(ctx, img) {
             img = sampled_img;
         } else {
             return lower_null_texture_result(ctx, res, rty);
@@ -85,18 +78,43 @@ pub(in crate::passes) fn lower_gather_depth(
     let (dim, _, _) = image_shape_or_recorded(ctx, img);
     let arrayed = name.starts_with("air.gather_depth_2d_array.");
     let coord = args[3];
-    let (layer, offset_index) = if arrayed {
+    let (layer, normalized_index, offset_index) = if arrayed {
         if args.len() < 8 {
             return Err("air.gather_depth array form missing layer/offset".into());
         }
-        (Some(args[4]), 6)
+        (Some(args[4]), 5, 6)
     } else {
-        (None, 5)
+        (None, 4, 5)
     };
+    let normalized = args
+        .get(normalized_index)
+        .and_then(|arg| const_bool_value(ctx, *arg))
+        .unwrap_or(true);
     let offset = args[offset_index];
     let component = ctx.const_uint(0);
+    if arrayed {
+        if let Some(sampler_state) = ctx.sampler_states.get(&samp).copied() {
+            // `gather_depth_2d_array`'s coord is in the pixel-footprint domain even though the
+            // adjacent boolean operand is true in captured AIR. Reconstructing the four texels is
+            // also what makes clamp-to-zero addressing match Metal at the normalized-image edges.
+            return lower_pixel_gather_2d(
+                ctx,
+                res,
+                rty,
+                img,
+                true,
+                sampler_state,
+                coord,
+                layer,
+                offset,
+                component,
+                v4,
+                vec![],
+            );
+        }
+    }
     lower_gather_2d(
-        ctx, res, rty, img, dim, arrayed, samp, coord, layer, offset, component, v4,
+        ctx, res, rty, img, dim, arrayed, samp, coord, layer, offset, component, normalized, v4,
     )
 }
 
@@ -113,6 +131,7 @@ pub(in crate::passes) fn lower_gather_2d(
     layer: Option<Word>,
     offset: Word,
     component: Word,
+    normalized: bool,
     v4: Word,
 ) -> Result<Vec<Instruction>, String> {
     if dim != Dim::Dim2D {
@@ -148,7 +167,7 @@ pub(in crate::passes) fn lower_gather_2d(
     }
 
     let si_ty = ctx.ty_sampled_image(img_ty);
-    let samp = valid_sampler_value(ctx, samp, &mut out)?;
+    let samp = valid_sampler_value(ctx, samp, &mut out, SamplerUse::Gather)?;
     let si = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::SampledImage,
@@ -160,8 +179,16 @@ pub(in crate::passes) fn lower_gather_2d(
     let mut coord_for_gather = build_gather_coord_2d(ctx, arrayed, coord, layer, &mut out)?;
     let (const_offset, dynamic_offset) = gather_const_or_dynamic_offset(ctx, offset)?;
     if let Some(offset) = dynamic_offset {
-        coord_for_gather =
-            apply_dynamic_sample_offset(ctx, img, arrayed, coord_for_gather, offset, 2, &mut out)?;
+        coord_for_gather = apply_dynamic_sample_offset(
+            ctx,
+            img,
+            arrayed,
+            coord_for_gather,
+            offset,
+            normalized,
+            2,
+            &mut out,
+        )?;
     }
 
     let color = ctx.module.fresh_id();
@@ -402,10 +429,24 @@ pub(in crate::passes) fn pixel_gather_fetch_offset(
     Ok((None, Some(shifted)))
 }
 
+/// What an image instruction does with the sampler operand [`valid_sampler_value`] resolves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::passes) enum SamplerUse {
+    Sample,
+    Gather,
+    DepthSample,
+    DepthCompare,
+    /// A cube texel read lowered as a nearest sample: Metal's `read` is sampler-less.
+    CubeRead,
+    /// A float LOD query.
+    LodQuery,
+}
+
 pub(in crate::passes) fn valid_sampler_value(
     ctx: &mut Ctx,
     samp: Word,
     out: &mut Vec<Instruction>,
+    usage: SamplerUse,
 ) -> Result<Word, String> {
     validate_runtime_sampler_specialization(ctx, samp)?;
     let sty = ctx.ty_sampler();
@@ -416,21 +457,24 @@ pub(in crate::passes) fn valid_sampler_value(
         return Err("air.sample_texture sampler operand is not a sampler".into());
     }
 
-    // A still-pointer-shaped sampler operand is a legal `OpSampledImage` operand in exactly one
-    // case: `air.get_read_sampler()`, whose result this same pass replaces with a load of the
-    // synthesized default resource (the type snapshot this query reads predates that rewrite). AIR
-    // declares no state for it and the sampler-less read that consumes it ignores the sampler, so
-    // materializing the default here is the same answer.
-    //
-    // Every other pointer-shaped operand — notably a select/phi over embedded `__air_sampler_state`
-    // globals that the native pointer-select fallback left as a private placeholder — names a
-    // sampler state the shader chose. Substituting the translator's nearest/clamp default there
-    // would sample with the wrong filter and address modes in a module that otherwise validates,
-    // binds and reflects cleanly, so refuse instead.
-    if !ctx.read_sampler_values.contains(&samp) {
-        return Err(
-            "sampler operand is a pointer whose exact sampler state was not recovered".into(),
-        );
+    // What is left is a pointer this pass cannot trace to a descriptor: a sampler selected between
+    // embedded `__air_sampler_state` globals (the native pointer-select fallback leaves a private
+    // placeholder), one loaded out of a by-value sampler array, or one whose aggregate carrier lost
+    // track of it. Substituting the translator's default read sampler keeps the module valid but
+    // samples with a filter, addressing mode and coordinate normalization nobody asked for -- it
+    // emptied every macOS 26 System Settings sidebar glyph, a CoreImage downsample reading past the
+    // edge through the default. So only the two uses whose Metal form has no sampler of its own may
+    // take it: a cube `read` lowered as a nearest sample, and an LOD query that needs a sampler only
+    // to form the operand pair. A real sample or gather refuses by name.
+    if !matches!(usage, SamplerUse::CubeRead | SamplerUse::LodQuery) {
+        let origin = value_inst(ctx, samp)
+            .map(|inst| format!("{:?}", inst.class.opcode))
+            .unwrap_or_else(|| "no defining instruction".to_string());
+        return Err(format!(
+            "{usage:?}: sampler operand %{samp} ({origin}) does not resolve to a Metal sampler \
+             argument or an AIR constexpr sampler state; the translator's default read sampler \
+             would change its filter, addressing and coordinate normalization"
+        ));
     }
     let var = ctx.default_read_sampler()?;
     let loaded = ctx.module.fresh_id();

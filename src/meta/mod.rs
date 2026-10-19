@@ -2,7 +2,6 @@
 //! each entry-function parameter to the role that the interface pass uses to synthesize Vulkan
 //! bindings, stage inputs, and stage outputs.
 
-use crate::passes::Stage;
 use std::collections::HashMap;
 
 mod embedded;
@@ -12,12 +11,8 @@ mod intersections;
 mod samplers;
 mod textures;
 mod types;
-use embedded::{
-    body_uses_texture_intrinsic, detect_embedded_arguments, detect_embedded_textures,
-    unsurfaced_embedded_resources, ArgumentBuffers,
-};
+use embedded::{body_uses_texture_intrinsic, detect_embedded_arguments, detect_embedded_textures};
 pub use embedded::{embedded_synthetic_texture_index, EmbeddedArgument, EmbeddedTexture};
-pub(crate) use function_constants::function_constants_without_a_supplied_value;
 pub use function_constants::{parse_function_constants, FunctionConstant};
 use globals::{location_index_with_static, static_init_int_global_values};
 pub(crate) use globals::{static_init_foldable_global_values, StaticIntValue};
@@ -67,20 +62,6 @@ pub enum FragRole {
     ViewportArrayIndex,
     /// `[[render_target_array_index]]` -> Input BuiltIn Layer (32-bit uint).
     RenderTargetArrayIndex,
-    /// `[[amplification_id]]` -> Input BuiltIn ViewIndex (32-bit uint).
-    ///
-    /// Metal vertex amplification and Vulkan multiview are the same feature: one draw rasterized
-    /// into several views, with the shader told which view it is running for. Metal spells that
-    /// index `[[amplification_id]]`; Vulkan spells it `gl_ViewIndex`. A pass with a single view
-    /// answers zero on both sides, so the mapping holds whether or not multiview is enabled.
-    AmplificationId,
-    /// `[[amplification_count]]` -> the count the render encoder set, bound as a constant.
-    ///
-    /// The count is a property of the draw, not of the stage that reads it: the same
-    /// `setVertexAmplificationCount:viewMappings:` answers a fragment and a vertex alike. Only the
-    /// vertex role was modelled, so a fragment declaring it fell to [`FragRole::Other`] and the
-    /// module was refused for a value the stage-input pass already knew how to bind.
-    AmplificationCount,
     /// `[[stage_in]]` interpolated input -> Input var at Location N (N = order among fragment_inputs).
     Varying(u32),
     /// `[[texture(n)]]` -> UniformConstant sampled image.
@@ -98,17 +79,6 @@ pub enum FragRole {
     /// A custom fragment `[[imageblock_data]]` projection. Its fields are mapped to the master
     /// imageblock layout by AIR user semantic, never by the source struct or argument name.
     ImageblockData,
-    /// A fact about the execution group this fragment's thread runs in. Only the facts that need no
-    /// threadgroup reach a fragment; see [`ExecutionGroupFact::needs_a_threadgroup`].
-    ExecutionGroup {
-        fact: ExecutionGroupFact,
-        lanes: u32,
-    },
-    /// A texture argument the variant this module describes declares no slot for, so no descriptor
-    /// exists for it. Metal reads zero through such a resource and stores nowhere; naming the role
-    /// is what lets the lowering tell that operand apart from a handle it merely lost track of.
-    /// See [`variant_texture_slot`].
-    VariantAbsentTexture,
     /// Anything we don't model.
     Other,
 }
@@ -224,6 +194,12 @@ pub struct FragMeta {
     /// Return-struct member index -> color attachment Location for actual `air.render_target`
     /// outputs. Non-color outputs such as `air.stencil` are deliberately absent.
     pub render_target_members: Vec<(u32, u32)>,
+    /// Return-struct member index -> dual-source blend index for `air.render_target` outputs whose
+    /// index is not 0 (`[[color(0), index(1)]]`, the second operand after the marker). Such an output
+    /// is the blend's second source for the same attachment, not an attachment of its own: Vulkan
+    /// spells it `Location N` + `Index 1`, and without the `Index` two outputs share location 0 and
+    /// the module is invalid (Dawn/Skia Graphite coverage blending).
+    pub render_target_dual_indices: Vec<(u32, u32)>,
     /// Return-struct member index -> AIR render-target type name (`float4`, `int4`, ...).
     pub render_target_type_names: HashMap<u32, String>,
     /// Return-struct member indices tagged as `air.depth` (`[[depth(...)]]`).
@@ -278,11 +254,6 @@ pub struct FragMeta {
     pub color_input_type_names: HashMap<u32, String>,
     pub embedded_textures: Vec<EmbeddedTexture>,
     pub embedded_arguments: Vec<EmbeddedArgument>,
-    /// Resource handles an argument buffer declares inside a nested `air.struct_type_info` member,
-    /// which the embedded-argument walk does not surface. Non-empty means every texture operation on
-    /// an unrecovered handle has to refuse rather than take the "resource is absent" path -- see
-    /// `embedded::unsurfaced_embedded_resources`.
-    pub unsurfaced_embedded_resources: Vec<String>,
 }
 
 /// One field in AIR's custom fragment-imageblock master layout.
@@ -375,6 +346,12 @@ impl FragMeta {
             .iter()
             .find_map(|(member, location)| (*member == member_idx).then_some(*location))
     }
+    pub fn render_target_dual_index_for_member(&self, member_idx: u32) -> u32 {
+        self.render_target_dual_indices
+            .iter()
+            .find_map(|(member, index)| (*member == member_idx).then_some(*index))
+            .unwrap_or(0)
+    }
     pub fn render_target_type_name(&self, member_idx: u32) -> Option<&str> {
         self.render_target_type_names
             .get(&member_idx)
@@ -411,6 +388,11 @@ pub enum VertRole {
     VertexId,
     /// `[[instance_id]]` -> Input BuiltIn InstanceIndex (32-bit uint).
     InstanceId,
+    /// `[[base_instance]]` -> Input BuiltIn BaseInstance (32-bit uint, `DrawParameters`). Metal's
+    /// `instance_id` already includes it, as Vulkan's `InstanceIndex` includes `firstInstance`.
+    BaseInstance,
+    /// `[[base_vertex]]` -> Input BuiltIn BaseVertex (32-bit uint, `DrawParameters`).
+    BaseVertex,
     /// Opaque Metal patch handle consumed only by the metadata-named control-point accessor.
     PatchControlPoints,
     /// Per-patch user input at the AIR location.
@@ -423,17 +405,6 @@ pub enum VertRole {
     /// through the translator's per-patch system-input locations.
     AmplificationId,
     AmplificationCount,
-    /// A fact about the execution group this vertex's thread runs in. See
-    /// [`FragRole::ExecutionGroup`].
-    ExecutionGroup {
-        fact: ExecutionGroupFact,
-        lanes: u32,
-    },
-    /// A texture argument the variant this module describes declares no slot for, so no descriptor
-    /// exists for it. Metal reads zero through such a resource and stores nowhere; naming the role
-    /// is what lets the lowering tell that operand apart from a handle it merely lost track of.
-    /// See [`variant_texture_slot`].
-    VariantAbsentTexture,
     Other,
 }
 
@@ -552,11 +523,6 @@ pub struct VertMeta {
     pub declared_descriptor_counts: HashMap<u32, u32>,
     pub embedded_textures: Vec<EmbeddedTexture>,
     pub embedded_arguments: Vec<EmbeddedArgument>,
-    /// Resource handles an argument buffer declares inside a nested `air.struct_type_info` member,
-    /// which the embedded-argument walk does not surface. Non-empty means every texture operation on
-    /// an unrecovered handle has to refuse rather than take the "resource is absent" path -- see
-    /// `embedded::unsurfaced_embedded_resources`.
-    pub unsurfaced_embedded_resources: Vec<String>,
     pub tessellation: Option<TessellationMeta>,
     /// Why an `air.patch` node the function does carry could not be decoded into
     /// [`VertMeta::tessellation`], if that happened.
@@ -666,23 +632,15 @@ pub enum KernRole {
     /// A Metal intersection-function table. Like visible tables, this is a link-time authored
     /// resource rather than a Vulkan descriptor.
     IntersectionFunctionTable(u32),
-    /// `[[threads_per_threadgroup]]` (`uint` or `uint3`) -> the size of the threadgroup this thread
-    /// actually runs in. Scalar params receive component .x.
+    /// `[[threads_per_threadgroup]]` or `[[dispatch_threads_per_threadgroup]]` (`uint` or `uint3`)
+    /// -> the execution local size. Scalar params receive `64`; vector params receive `(64, 1, 1)`
+    /// for the current harness.
     ///
-    /// This is the EXECUTING size, which a decomposed exact-thread dispatch makes smaller in a tail
-    /// region: `KernelDispatchPlan` gives each region its own `LocalSize`, so the fact follows the
-    /// region's specialized local size rather than the one the dispatch asked for.
+    /// Metal distinguishes the two only under `dispatchThreads:`, where a final partial threadgroup
+    /// reports a smaller `threads_per_threadgroup` than the size the dispatch asked for. Vulkan has
+    /// no partial workgroups — `vkCmdDispatch` issues whole ones — so both AIR roles denote the same
+    /// value here, and the declared local size is that value.
     ThreadsPerThreadgroup,
-    /// `[[dispatch_threads_per_threadgroup]]` (`uint` or `uint3`) -> the threadgroup size the
-    /// dispatch ASKED FOR, which a short final threadgroup does not change.
-    ///
-    /// It is a separate role from [`KernRole::ThreadsPerThreadgroup`] because the two differ exactly
-    /// where this translator emulates `dispatchThreads:`. A ten-thread grid in groups of four gives
-    /// Metal `threads_per_threadgroup == 2` and `dispatch_threads_per_threadgroup == 4` in the last
-    /// group, and `KernelDispatchPlan` reproduces that split by specializing the tail region's local
-    /// size to two -- so aliasing the two roles reports the tail size for both. The requested size is
-    /// `TransformOptions::kernel_local_size`, which is the same value the plan decomposes.
-    DispatchThreadsPerThreadgroup,
     /// `[[thread_position_in_threadgroup]]` (`uint` or `uint3`) -> LocalInvocationId.
     /// Scalar params receive component .x; vector params receive the full v3uint.
     ThreadPositionInThreadgroup,
@@ -698,12 +656,18 @@ pub enum KernRole {
     ThreadgroupPositionInGrid,
     /// `[[thread_index_in_threadgroup]]` (`uint`) -> LocalInvocationIndex.
     ThreadIndexInThreadgroup,
-    /// One fact about the AIR execution group this thread runs in, over a group `lanes` threads
-    /// wide. See [`ExecutionGroupFact`] and [`AIR_EXECUTION_GROUPS`].
-    ExecutionGroup {
-        fact: ExecutionGroupFact,
-        lanes: u32,
-    },
+    /// `[[thread_index_in_quadgroup]]` (`uint`) -> lane within the current 4-wide quadgroup.
+    ThreadIndexInQuadgroup,
+    /// `[[quadgroup_index_in_threadgroup]]` (`uint`) -> quadgroup number within the threadgroup.
+    QuadgroupIndexInThreadgroup,
+    /// `[[thread_index_in_simdgroup]]` (`uint`) -> lane within the current 32-wide simdgroup.
+    ThreadIndexInSimdgroup,
+    /// `[[simdgroup_index_in_threadgroup]]` (`uint`) -> simdgroup number within the threadgroup.
+    SimdgroupIndexInThreadgroup,
+    /// `[[threads_per_simdgroup]]` (`uint`) -> the AIR simdgroup width.
+    ThreadsPerSimdgroup,
+    /// `[[simdgroups_per_threadgroup]]` (`uint`) -> number of 32-wide AIR simdgroups in the local size.
+    SimdgroupsPerThreadgroup,
     /// `[[thread_position_in_grid]]` (`uint` or `uint3`) -> GlobalInvocationId.
     /// Scalar params receive component .x; vector params receive the full v3uint.
     ThreadPositionInGrid,
@@ -711,11 +675,6 @@ pub enum KernRole {
     /// by `air.location_index`; Vulkan lowering needs an explicit per-invocation data ABI and must
     /// not silently bind it to zero.
     StageInput(u32),
-    /// A texture argument the variant this module describes declares no slot for, so no descriptor
-    /// exists for it. Metal reads zero through such a resource and stores nowhere; naming the role
-    /// is what lets the lowering tell that operand apart from a handle it merely lost track of.
-    /// See [`variant_texture_slot`].
-    VariantAbsentTexture,
     Other,
 }
 
@@ -736,10 +695,6 @@ pub struct KernMeta {
     /// content, and its writes have to land back there. Private scratch is neither, so the marker
     /// cannot be dropped.
     pub aliased_implicit_imageblock_params: Vec<u32>,
-    /// The render-target planes an aliased explicit imageblock's members resolve to, keyed by the
-    /// same parameter index. One derivation, read by reflection (which must declare a descriptor
-    /// for every plane) and by the emitter (which must fill the cell from them and write it back).
-    pub aliased_implicit_imageblock_planes: HashMap<u32, Vec<AliasedImageblockPlane>>,
     /// Every attribute on the `!air.kernel` root this stage has no model for, as it reads in AIR.
     /// Mirrors [`FragMeta::unmodelled_stage_attributes`].
     pub unmodelled_stage_attributes: Vec<String>,
@@ -785,11 +740,6 @@ pub struct KernMeta {
     /// Every resource-handle member carried by an `air.indirect_buffer`, including handles whose
     /// concrete kind is supplied by an authored manifest and verified from its AIR use.
     pub embedded_arguments: Vec<EmbeddedArgument>,
-    /// Resource handles an argument buffer declares inside a nested `air.struct_type_info` member,
-    /// which the embedded-argument walk does not surface. Non-empty means every texture operation on
-    /// an unrecovered handle has to refuse rather than take the "resource is absent" path -- see
-    /// `embedded::unsurfaced_embedded_resources`.
-    pub unsurfaced_embedded_resources: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -800,117 +750,6 @@ pub struct ImplicitImageblockAttachment {
     pub format: TextureFormat,
     pub reads: bool,
     pub writes: bool,
-}
-
-/// One member of an explicit imageblock that `air.alias_implicit_imageblock` aliases onto the
-/// implicit imageblock, resolved to the render-target plane it names.
-///
-/// The alias says the explicit layout IS the implicit layout, and the implicit layout is the colour
-/// attachments in order, so member `i` in declaration order is attachment `i`. Nothing else in AIR
-/// states the mapping: `air.struct_type_info` gives each member a source name (`color`, `depth`,
-/// `customParams`), and those are names the shader author chose, not attachment indices -- a member
-/// typed and named `depth` is still colour attachment 2 when it is declared third.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct AliasedImageblockPlane {
-    /// Colour attachment index, which is the member's position in declaration order.
-    pub attachment: u32,
-    /// The member's byte offset inside the imageblock cell.
-    pub offset: u32,
-    pub format: TextureFormat,
-    /// The `air.load/store.implicit_imageblock.<suffix>` family that carries this texel type.
-    pub intrinsic_suffix: &'static str,
-}
-
-/// Resolve an aliased explicit imageblock's members to the render-target planes they alias, or
-/// state why they cannot be resolved.
-///
-/// `Ok(None)` means the parameter declares no member layout at all. An unsupported member type is
-/// an error rather than a silently dropped plane: dropping one would stage that member in
-/// threadgroup memory while its siblings reached the attachments, which is the exact silence the
-/// alias marker exists to prevent.
-pub fn aliased_imageblock_planes(
-    layout: &AirType,
-) -> Result<Option<Vec<AliasedImageblockPlane>>, String> {
-    let AirType::Struct(members) = layout else {
-        return Ok(None);
-    };
-    if members.is_empty() {
-        return Ok(None);
-    }
-    let mut planes = Vec::with_capacity(members.len());
-    for (index, member) in members.iter().enumerate() {
-        let (format, intrinsic_suffix) = match &member.ty {
-            AirType::Scalar(AirScalar::Half) => (TextureFormat::R16f, "f16"),
-            AirType::Vec {
-                scalar: AirScalar::Half,
-                lanes: 2,
-            } => (TextureFormat::Rg16f, "v2f16"),
-            AirType::Vec {
-                scalar: AirScalar::Half,
-                lanes: 4,
-            } => (TextureFormat::Rgba16f, "v4f16"),
-            AirType::Scalar(AirScalar::Float) => (TextureFormat::R32f, "f32"),
-            AirType::Vec {
-                scalar: AirScalar::Float,
-                lanes: 4,
-            } => (TextureFormat::Rgba32f, "v4f32"),
-            AirType::Scalar(AirScalar::UInt) => (TextureFormat::R32ui, "i32"),
-            other => {
-                return Err(format!(
-                    "aliased imageblock member {index} has type {other:?}, which no implicit \
-                     imageblock plane format represents"
-                ))
-            }
-        };
-        planes.push(AliasedImageblockPlane {
-            attachment: index as u32,
-            offset: member.offset,
-            format,
-            intrinsic_suffix,
-        });
-    }
-    Ok(Some(planes))
-}
-
-impl KernRole {
-    /// The Metal BUFFER-TABLE slot this role occupies, or `None` for a role that occupies none.
-    ///
-    /// This is the set [`KernMeta::stage_input_bindings`] must not allocate a synthetic slot on top
-    /// of. Written as an exhaustive match rather than a list with a `_ => None` tail: a role added
-    /// later that names a buffer-table index has to answer here, and the cost of forgetting is a
-    /// synthetic stage-input descriptor decorated with a real buffer's binding.
-    ///
-    /// Deliberately conservative at both ends. The function-table and acceleration-structure roles
-    /// reserve their slot even where they reflect with no descriptor of their own, because they
-    /// still name a Metal buffer-table index the pipeline binds; reserving one nothing reads costs a
-    /// synthetic slot, sharing one costs a wrong read. `StageInput` answers `None` on purpose --
-    /// its own `u32` is the AIR attribute location, which is what the synthetic slot exists to
-    /// stand in for.
-    pub fn buffer_table_slot(&self) -> Option<u32> {
-        match self {
-            Self::Buffer(slot)
-            | Self::AccelerationStructureShadow(slot)
-            | Self::PrimitiveAccelerationStructure(slot)
-            | Self::PrimitiveAccelerationStructureShadow(slot)
-            | Self::VisibleFunctionTable(slot)
-            | Self::IntersectionFunctionTable(slot) => Some(*slot),
-            Self::Texture(_)
-            | Self::Sampler(_)
-            | Self::StageInput(_)
-            | Self::ThreadsPerThreadgroup
-            | Self::DispatchThreadsPerThreadgroup
-            | Self::ThreadPositionInThreadgroup
-            | Self::ThreadgroupsPerGrid
-            | Self::ThreadsPerGrid
-            | Self::ThreadgroupPositionInGrid
-            | Self::ThreadIndexInThreadgroup
-            | Self::ExecutionGroup { .. }
-            | Self::ThreadPositionInGrid
-            | Self::VariantAbsentTexture
-            | Self::Other => None,
-        }
-    }
 }
 
 impl KernMeta {
@@ -945,34 +784,31 @@ impl KernMeta {
     /// Metal supplies stage-input data through ordinary buffer-table slots selected by the pipeline
     /// descriptor. Vulkan exposes the same arrays as read-only storage buffers. Keeping allocation
     /// here makes reflection and lowering consume one ABI decision instead of duplicating it.
-    ///
-    /// Allocation walks the stage inputs in PARAMETER-INDEX order, not in the order the AIR argument
-    /// list happens to name them. The two coincide in all 14553 kernel argument lists of the local
-    /// corpus, so ordering them costs nothing today; what it buys is that this ABI is a function of
-    /// the entry's signature rather than of a metadata layout no other decision depends on. A
-    /// producer that emitted the same kernel with its argument nodes reordered would otherwise hand
-    /// a consumer different slots for the same shader.
     pub fn stage_input_bindings(&self) -> HashMap<u32, u32> {
         let mut occupied = self
             .roles
             .iter()
-            .filter_map(|(_, role)| role.buffer_table_slot())
+            .filter_map(|(_, role)| match role {
+                KernRole::Buffer(binding)
+                | KernRole::AccelerationStructureShadow(binding)
+                | KernRole::PrimitiveAccelerationStructure(binding)
+                | KernRole::PrimitiveAccelerationStructureShadow(binding)
+                | KernRole::VisibleFunctionTable(binding)
+                | KernRole::IntersectionFunctionTable(binding) => Some(*binding),
+                _ => None,
+            })
             .collect::<std::collections::HashSet<_>>();
-        let mut stage_inputs = self
-            .roles
-            .iter()
-            .filter(|(_, role)| matches!(role, KernRole::StageInput(_)))
-            .map(|(param_index, _)| *param_index)
-            .collect::<Vec<_>>();
-        stage_inputs.sort_unstable();
         let mut next = 0u32;
         let mut bindings = HashMap::new();
-        for param_index in stage_inputs {
+        for (param_index, role) in &self.roles {
+            if !matches!(role, KernRole::StageInput(_)) {
+                continue;
+            }
             while occupied.contains(&next) {
                 next = next.saturating_add(1);
             }
             occupied.insert(next);
-            bindings.insert(param_index, next);
+            bindings.insert(*param_index, next);
         }
         bindings
     }
@@ -1074,21 +910,15 @@ fn parse_air_kernel_meta_with_nodes(
         let Some(mut first) = fc_promoted_role(&strs, promote_fc_buffers) else {
             continue;
         };
-        // The one demotion the promotion set cannot state: a wrapped texture this variant declares
-        // no slot for has no binding to promote it to. See [`variant_texture_slot`].
-        let texture_slot = variant_texture_slot(node, idx, nodes, &static_int_globals);
-        if primary_role(&strs) == Some("texture") && texture_slot.is_none() {
-            first = VARIANT_ABSENT_TEXTURE_ROLE;
+        if primary_role(&strs) == Some("texture") && resource_location(node, idx) == u32::MAX {
+            first = "function_constant";
         }
-        let first = present_gated_buffer_role(first, &strs, node, nodes, &static_int_globals);
-        let first = present_system_value_role(first, node, nodes, &static_int_globals);
-        if let Some(declared) = unmodelled_declared_role(
-            |role| air_input_role_is_modelled(Stage::Kernel, role),
-            node,
-            nodes,
-            &static_int_globals,
-        ) {
-            unmodelled_input_params.push((idx, declared));
+        if let Some(declared) = declared_role(&strs) {
+            if !KERNEL_INPUT_ROLES.contains(&declared)
+                && metadata_enabled_by_default(node, nodes, &static_int_globals)
+            {
+                unmodelled_input_params.push((idx, declared.to_string()));
+            }
         }
         let role = match first {
             "buffer" | "indirect_buffer" => {
@@ -1129,7 +959,7 @@ fn parse_air_kernel_meta_with_nodes(
                 if let Some(name) = arg_type_name(node) {
                     texture_type_names.insert(idx, name);
                 }
-                let loc = texture_slot.unwrap_or_else(|| resource_location(node, idx));
+                let loc = resource_location(node, idx);
                 top_level_texture_locations.push(loc);
                 KernRole::Texture(loc)
             }
@@ -1160,13 +990,20 @@ fn parse_air_kernel_meta_with_nodes(
                 KernRole::Other
             }
             "sampler" => KernRole::Sampler(resource_location(node, idx)),
-            "threads_per_threadgroup" => KernRole::ThreadsPerThreadgroup,
-            "dispatch_threads_per_threadgroup" => KernRole::DispatchThreadsPerThreadgroup,
+            "threads_per_threadgroup" | "dispatch_threads_per_threadgroup" => {
+                KernRole::ThreadsPerThreadgroup
+            }
             "thread_position_in_threadgroup" => KernRole::ThreadPositionInThreadgroup,
             "threadgroups_per_grid" => KernRole::ThreadgroupsPerGrid,
             "threads_per_grid" => KernRole::ThreadsPerGrid,
             "threadgroup_position_in_grid" => KernRole::ThreadgroupPositionInGrid,
             "thread_index_in_threadgroup" => KernRole::ThreadIndexInThreadgroup,
+            "thread_index_in_quadgroup" => KernRole::ThreadIndexInQuadgroup,
+            "quadgroup_index_in_threadgroup" => KernRole::QuadgroupIndexInThreadgroup,
+            "thread_index_in_simdgroup" => KernRole::ThreadIndexInSimdgroup,
+            "simdgroup_index_in_threadgroup" => KernRole::SimdgroupIndexInThreadgroup,
+            "threads_per_simdgroup" => KernRole::ThreadsPerSimdgroup,
+            "simdgroups_per_threadgroup" => KernRole::SimdgroupsPerThreadgroup,
             "thread_position_in_grid" => KernRole::ThreadPositionInGrid,
             "stage_in" => {
                 if let Some(name) = arg_type_name(node) {
@@ -1174,16 +1011,7 @@ fn parse_air_kernel_meta_with_nodes(
                 }
                 KernRole::StageInput(resource_location(node, idx))
             }
-            VARIANT_ABSENT_TEXTURE_ROLE => KernRole::VariantAbsentTexture,
-            // The specializer's spelling of the same fact. Once a VALUE is supplied,
-            // `specialize_function_constant_metadata` rewrites the resolved-off wrapper, and past
-            // that rewrite the wrapped role is unreadable -- so the demotion above never runs and
-            // this is the only place the fact survives.
-            _ if declares_disabled_texture(&strs) => KernRole::VariantAbsentTexture,
-            other => stage_execution_group_role(Stage::Kernel, other).map_or(
-                KernRole::Other,
-                |(fact, lanes)| KernRole::ExecutionGroup { fact, lanes },
-            ),
+            _ => KernRole::Other,
         };
         roles.push((idx, role));
     }
@@ -1191,44 +1019,21 @@ fn parse_air_kernel_meta_with_nodes(
     // intrinsics. Gated purely on AIR structure/semantics — the `air.indirect_argument` →
     // `air.texture` marker chain plus stable AIR intrinsic families — so it cannot key on any shader
     // name. The body must actually use a texture intrinsic for us to surface it.
-    let argument_buffers = ArgumentBuffers::new(indirect_buffer_struct_refs);
     let embedded_textures = if body_uses_texture_intrinsic(ll) {
-        detect_embedded_textures(nodes, &argument_buffers, &top_level_texture_locations)
+        detect_embedded_textures(
+            nodes,
+            &indirect_buffer_struct_refs,
+            &top_level_texture_locations,
+        )
     } else {
         vec![]
     };
-    let embedded_arguments = detect_embedded_arguments(nodes, &argument_buffers);
-    let unsurfaced = unsurfaced_embedded_resources(nodes, &argument_buffers);
-    let mut implicit_imageblock_attachments = detect_implicit_imageblock_attachments(ll)?;
-    // An aliased explicit imageblock reaches the same planes the implicit intrinsics do, and the
-    // module the emitter builds for it loads and stores every one. Reflection has to declare those
-    // descriptors from here or a consumer builds a set layout missing the bindings the module it
-    // was handed reads.
-    let mut aliased_implicit_imageblock_planes = HashMap::new();
-    for param in &aliased_implicit_imageblock_params {
-        let Some(layout) = imageblock_layouts.get(param) else {
-            continue;
-        };
-        let Some(planes) = aliased_imageblock_planes(layout).ok().flatten() else {
-            continue;
-        };
-        for plane in &planes {
-            implicit_imageblock_attachments.push(ImplicitImageblockAttachment {
-                attachment: plane.attachment,
-                data_rate: 0,
-                max_index: Some(0),
-                format: plane.format,
-                reads: true,
-                writes: true,
-            });
-        }
-        aliased_implicit_imageblock_planes.insert(*param, planes);
-    }
+    let embedded_arguments = detect_embedded_arguments(nodes, &indirect_buffer_struct_refs);
+    let implicit_imageblock_attachments = detect_implicit_imageblock_attachments(ll)?;
     Some(KernMeta {
         roles,
         unmodelled_input_params,
         aliased_implicit_imageblock_params,
-        aliased_implicit_imageblock_planes,
         unmodelled_stage_attributes,
         max_work_group_size,
         function_constant_buffer_locations,
@@ -1245,7 +1050,6 @@ fn parse_air_kernel_meta_with_nodes(
         stage_input_type_names,
         embedded_textures,
         embedded_arguments,
-        unsurfaced_embedded_resources: unsurfaced,
     })
 }
 
@@ -1812,6 +1616,17 @@ fn render_target_location(
     declared_slot(body, "air.render_target", fallback, static_int_globals)
 }
 
+/// The dual-source blend index of an `air.render_target` output: the operand after the color slot
+/// (`!"air.render_target", i32 0, i32 1` is `[[color(0), index(1)]]`). Absent means 0; a
+/// function-constant global this module does not initialize also reads 0, the plain output.
+fn render_target_dual_index(body: &str, static_int_globals: &HashMap<String, u32>) -> u32 {
+    match marker_operands(body, "air.render_target").into_iter().nth(1).flatten() {
+        Some(LocationOperand::Literal(index)) => index,
+        Some(LocationOperand::Global(global)) => static_int_globals.get(&global).copied().unwrap_or(0),
+        None => 0,
+    }
+}
+
 fn address_space(body: &str) -> Option<u32> {
     i32_after_marker(body, "air.address_space")
 }
@@ -1841,55 +1656,19 @@ fn primary_role(strs: &[String]) -> Option<&str> {
         .find(|s| *s != "function_constant")
 }
 
-/// The role marker a declaration carries, read POSITIONALLY past an `air.function_constant`
-/// wrapper, or `None` when it carries none.
+/// The role marker an argument node declares, or `None` when it declares none.
 ///
-/// The wrapper is the operand PAIR `!"air.function_constant", !PREDICATE`; the role, when there is
-/// one, is the operand that follows the predicate. Both other readings of this node are wrong here:
-///
-/// - Scanning for "the first `air.` marker that is not the wrapper" reads a BARE function-constant
-///   parameter's own `air.arg_type_name` as though it were a role. That parameter *is* the function
-///   constant -- there is no role behind the wrapper at all -- and the positional read answers
-///   `None` for it, because the operand after its predicate is not an `air.` marker.
-/// - Asking [`fc_promoted_role`] answers `None` for every gated role the emitter does not PROMOTE,
-///   and that is precisely the set this predicate exists to name. A gated `air.amplification_id` on
-///   a fragment entry was classified `Other`, bound to a zero and never reported -- in a module that
-///   validated, bound and reflected as though nothing were missing. Whether the gate is on is a
-///   DIFFERENT question (see [`unmodelled_declared_role`]), not a reason to stop reading.
-///
-/// Measured: every one of the 14000-odd function-constant-wrapped argument and return nodes across
-/// the 14579 local corpus sources carries a real role marker in that position, and none carries a
-/// qualifier -- [`ARGUMENT_IDENTITY_MARKERS`] is what answers the role-less parameter whichever way
-/// AIR spells its wrapper.
-fn declared_role(body: &str) -> Option<String> {
-    let role_name = |operand: &str| {
-        operand
-            .strip_prefix("!\"air.")
-            .and_then(|rest| rest.strip_suffix('"'))
-            .map(str::to_string)
-    };
-    let mut operands = split_metadata_operands(body).into_iter();
-    let first = operands.find_map(|operand| role_name(&operand))?;
-    if first != "function_constant" {
-        return (first != "function_constant_disabled").then_some(first);
+/// A bare `!"air.function_constant"` parameter *is* the function constant: there is no role marker
+/// behind the wrapper, so reading past it lands on the node's own type/name qualifiers and reports
+/// `arg_type_name` as though it were a role. [`fc_promoted_role`] already models this — it collapses
+/// a gated argument to the wrapper unless the role is one the emitter binds anyway — so the two
+/// stay consistent by sharing it.
+fn declared_role(strs: &[String]) -> Option<&str> {
+    match fc_promoted_role(strs, true)? {
+        "function_constant" | "function_constant_disabled" => None,
+        role => Some(role),
     }
-    // The predicate the wrapper gates on. A wrapper carrying none gates nothing and wraps nothing.
-    operands.next().filter(|operand| {
-        operand.strip_prefix('!').is_some_and(|rest| {
-            !rest.is_empty() && rest.chars().all(|character| character.is_ascii_digit())
-        })
-    })?;
-    operands
-        .next()
-        .as_deref()
-        .and_then(role_name)
-        .filter(|role| !ARGUMENT_IDENTITY_MARKERS.contains(&role.as_str()))
 }
-
-/// The two markers that name an argument's C-level identity rather than its role. Every argument
-/// node carries both whatever else it declares, so one of them sitting where a role would sit means
-/// the declaration has no role: it is the bare function constant itself.
-const ARGUMENT_IDENTITY_MARKERS: &[&str] = &["arg_name", "arg_type_name"];
 
 fn function_constant_gate_global(body: &str, nodes: &HashMap<u32, String>) -> Option<String> {
     if role_strings(body).first().map(String::as_str) != Some("function_constant") {
@@ -1906,178 +1685,6 @@ fn function_constant_gate_global(body: &str, nodes: &HashMap<u32, String>) -> Op
                 .collect::<String>();
             (name.len() > 1).then_some(name)
         })
-}
-
-/// True when the node's `air.function_constant` gate is one this module's own static initializers
-/// drive to ZERO -- the argument is absent from the variant this module describes.
-///
-/// This is deliberately NOT [`metadata_enabled_by_default`] negated. That predicate answers "may
-/// this declaration be present", so an UNRESOLVED gate is false for it. Here the question is the
-/// opposite one -- "did the variant the initializers describe leave this argument out" -- and an
-/// unresolved gate is no evidence of that.
-fn function_constant_gate_disabled(
-    body: &str,
-    nodes: &HashMap<u32, String>,
-    static_int_globals: &HashMap<String, u32>,
-) -> bool {
-    function_constant_gate_global(body, nodes)
-        .and_then(|global| static_int_globals.get(&global).copied())
-        == Some(0)
-}
-
-/// True when the node's `air.function_constant` gate is one this module's own static initializers
-/// drive NONZERO -- the argument is PRESENT in the variant this module describes.
-///
-/// The mirror of [`function_constant_gate_disabled`], and it has to be a separate question from
-/// [`metadata_enabled_by_default`] for the same reason that one is: an UNRESOLVED gate reads as
-/// "may be present" there, and "may be present" is not evidence of presence any more than it is
-/// evidence of absence. Only the resolved-nonzero case is.
-fn function_constant_gate_enabled(
-    body: &str,
-    nodes: &HashMap<u32, String>,
-    static_int_globals: &HashMap<String, u32>,
-) -> bool {
-    function_constant_gate_global(body, nodes)
-        .and_then(|global| static_int_globals.get(&global).copied())
-        .is_some_and(|value| value != 0)
-}
-
-/// The role a gated BUFFER argument carries once the module's own initializers have answered
-/// whether it is there.
-///
-/// [`FC_PROMOTED_RESOURCE_ROLES`] deliberately omits `buffer`: a gated buffer whose gate this
-/// module cannot resolve may or may not be bound, and the "possibly-absent -> Private zero
-/// placeholder" default is the honest answer for it. But that argument is about an UNRESOLVED gate,
-/// and it was being applied to a resolved-ON one too. A gate this module's own static initializers
-/// drive nonzero states that the variant this module describes DOES carry the buffer -- the same
-/// evidence standard [`function_constant_gate_disabled`] uses to drop a descriptor in the other
-/// direction -- and binding a definitely-present buffer to a Private zero sends its every store
-/// into per-invocation scratch.
-///
-/// It also settles a split reading: the fragment decode reaches the wrapped role through
-/// [`primary_role`], so a gated buffer on a fragment entry has always been a buffer, while kernel
-/// and vertex read it through [`gated_role`] and left it a placeholder. One declaration, two
-/// classifications.
-///
-/// The remaining half of that split -- a gated-OFF buffer, which the fragment still binds and the
-/// other two still drop -- stays, and stays deliberately. Making the fragment agree costs 490
-/// buffer bindings and 1060 loads across 100 corpus modules and rescues nothing; a gated-off
-/// argument declaring a LITERAL slot is Metal's spelling of mutually exclusive alternatives, and
-/// no gated fragment buffer in the corpus declares anything else. Measured in
-/// `a_fragment_gated_buffer_keeps_its_literal_slot_whichever_way_the_gate_resolves`.
-fn present_gated_buffer_role<'a>(
-    role: &'a str,
-    strs: &'a [String],
-    body: &str,
-    nodes: &HashMap<u32, String>,
-    static_int_globals: &HashMap<String, u32>,
-) -> &'a str {
-    if role != "function_constant" || primary_role(strs) != Some("buffer") {
-        return role;
-    }
-    if function_constant_gate_enabled(body, nodes, static_int_globals) {
-        "buffer"
-    } else {
-        role
-    }
-}
-
-/// The Metal texture slot an argument node declares FOR THE VARIANT THIS MODULE DESCRIBES, or
-/// `None` when it declares none and the argument therefore has no descriptor to bind.
-///
-/// Two spellings mean "no slot", and reading only the first of them decorated two textures with one
-/// descriptor in 250 of the 14579 local corpus sources:
-///
-/// - `air.location_index` resolving to `-1`: AIR states outright that specialization has not
-///   assigned a binding yet.
-/// - A slot supplied by a function-constant global on an argument whose own gate the module's
-///   initializers drive to zero. Metal compiles `[[texture(fc_expr)]]` into a RUNNING SUM over the
-///   arguments the pipeline enables, so the global holds this argument's slot only when this
-///   argument is one of them. For an argument the variant leaves out, the same global holds
-///   wherever the sum stopped -- which is a LIVE argument's slot. One corpus fragment shader put
-///   seventeen differently-shaped textures on `Binding 38` that way, and a kernel put a
-///   `texture2d<float, write>` and a 128-element `array_ref` on `Binding 480`. Reflection then
-///   asks a consumer to bind two different textures to one Metal index, and the emitted module
-///   aliases descriptors whose only correct reading is the one the shader is not compiled for.
-///
-/// An argument gated off but declaring a LITERAL slot keeps it: `[[texture(0), function_constant(a)]]`
-/// beside `[[texture(0), function_constant(!a)]]` is Metal's own way of spelling mutually exclusive
-/// typed alternatives, the slot is stated rather than summed, and the alternatives are never live
-/// together.
-fn variant_texture_slot(
-    body: &str,
-    fallback: u32,
-    nodes: &HashMap<u32, String>,
-    static_int_globals: &HashMap<String, u32>,
-) -> Option<u32> {
-    let slot = location_index_with_static(body, fallback, static_int_globals);
-    if slot == u32::MAX {
-        return None;
-    }
-    let summed_by_function_constant = matches!(
-        location_operands(body).map(|operands| operands.index),
-        Some(LocationOperand::Global(_))
-    );
-    if summed_by_function_constant
-        && function_constant_gate_disabled(body, nodes, static_int_globals)
-    {
-        return None;
-    }
-    Some(slot)
-}
-
-/// The role marker a texture argument carries once [`variant_texture_slot`] has found the variant
-/// declares no slot for it. It is deliberately not `"texture"` and deliberately not
-/// `"function_constant"`: the first would ask for a descriptor that does not exist, and the second
-/// throws away which argument was demoted, which is the only thing that tells an absent resource
-/// apart from a handle the lowering merely lost.
-/// True when this declaration is a TEXTURE the variant this module describes leaves out, spelled
-/// the way [`specialize_function_constant_metadata`] spells it.
-///
-/// Two spellings state that one fact. `air.function_constant` beside a gate this module's own
-/// static initializers drive to zero is what an unspecialized module carries, and
-/// [`variant_texture_slot`] demotes it. Once a VALUE is supplied, the specializer rewrites that
-/// same node to `air.function_constant_disabled`, after which the wrapped role is not readable at
-/// all -- [`declared_role`] answers `None` for it by design, because a disabled declaration
-/// declares nothing. That is right for the interface and wrong for the operand: the argument still
-/// reaches the body, still binds to a Private placeholder, and is still the absent resource. Naming
-/// only the first spelling is what left every function-constant-specialized translation reaching
-/// the recovery in `recovered_image_for_private_operand` that the unspecialized one no longer does.
-///
-/// The role is read POSITIONALLY: `role_strings` skips the wrapper's `!PREDICATE` operand, so the
-/// marker after the wrapper is the role. `texture` is never an [`ARGUMENT_IDENTITY_MARKERS`] entry,
-/// so this cannot mistake a bare function-constant parameter for one.
-fn declares_disabled_texture(strs: &[String]) -> bool {
-    strs.first().map(String::as_str) == Some("function_constant_disabled")
-        && strs.get(1).map(String::as_str) == Some("texture")
-}
-
-const VARIANT_ABSENT_TEXTURE_ROLE: &str = "variant_absent_texture";
-
-/// The role a declaration carries that this stage's emitter does NOT model, or `None` when the
-/// role is one it models -- or when the variant this module describes leaves the declaration out.
-///
-/// Reporting the role is what turns an unsupported entry parameter or return member into an honest
-/// `FALLBACK` instead of a silently dropped input. The four callers (kernel, fragment and vertex
-/// entry parameters, and fragment return members) differ only in which role list is theirs, so the
-/// rule -- including which gates excuse a refusal -- is stated once here.
-///
-/// The excusing predicate is [`function_constant_gate_disabled`] and deliberately NOT
-/// `!metadata_enabled_by_default`. Those two are not complements. `metadata_enabled_by_default`
-/// answers "may this declaration be present", so an UNRESOLVED gate reads as "absent" for it --
-/// and an unmodelled role behind a gate we could not evaluate is still unmodelled. Suppressing the
-/// refusal there is precisely the case where the emitter goes on to bind a zero for a parameter the
-/// pipeline may well have supplied a value for. Only a gate this module's own static initializers
-/// drive to zero is evidence that the variant left the declaration out.
-fn unmodelled_declared_role(
-    is_modelled: impl Fn(&str) -> bool,
-    body: &str,
-    nodes: &HashMap<u32, String>,
-    static_int_globals: &HashMap<String, u32>,
-) -> Option<String> {
-    let declared = declared_role(body)?;
-    (!is_modelled(&declared) && !function_constant_gate_disabled(body, nodes, static_int_globals))
-        .then_some(declared)
 }
 
 fn metadata_enabled_by_default(
@@ -2129,51 +1736,14 @@ pub(crate) fn specialize_function_constant_metadata(ll: &str) -> String {
     output
 }
 
-/// The wrapped roles `fc_promoted_role` looks past an `air.function_constant` wrapper for. One list
-/// rather than one match arm each: separate arms are what let `sampler` go missing next to
-/// `texture`, while the two are declared together and used through each other.
-///
-/// **A role belongs here when promoting it changes the emitted MODULE, not only reflection.** The
-/// standing justification for keeping a gated descriptor is that the resource-using arm may be
-/// enabled later — but an argument whose uses fold away leaves an unreferenced variable that
-/// `module_cleanup` removes, and reflection then asks a consumer to create and bind a descriptor no
-/// instruction touches. Measured over the 2880-source sample against the corpus:
-///
-/// - `stage_in`: 12 kernel modules, +24 reflected `KernelStageInput` AND +24 module descriptors.
-///   The parameters were `OpUndef` — the kernel read nothing where the runtime had a vertex stream.
-/// - `indirect_buffer`: 28 modules, +225 reflected bindings and **0** module bindings. Deliberately
-///   NOT here; promoting it buys a consumer nothing but descriptors to satisfy.
-/// - `buffer`: 147 modules, +499 reflected bindings and +132 module bindings -- but 14 module
-///   bindings LOST, and one source of 14579 stops translating at all ("owned Store violates its
-///   pointer-pointee and value-type contract"). Promoted only under the caller's `promote_buffers`,
-///   for the reason below -- and, unconditionally but only on the evidence of a resolved-ON gate,
-///   by [`present_gated_buffer_role`], which is the subset of that widening that costs nothing.
-///
-/// `texture`, `sampler` and `imageblock` are already wrapper-neutral: stripping the wrapper from
-/// every one of them corpus-wide changes no module and no reflected field.
-const FC_PROMOTED_RESOURCE_ROLES: &[&str] = &[
-    "imageblock",
-    "intersection_function_table",
-    "sampler",
-    "stage_in",
-    "texture",
-    "visible_function_table",
-];
-
 /// Like `primary_role`, but only looks past the `air.function_constant` wrapper when the wrapped
-/// resource is one of [`FC_PROMOTED_RESOURCE_ROLES`], or a BUFFER (the latter only when
+/// resource is a TEXTURE, IMAGEBLOCK, FUNCTION TABLE, or BUFFER (the latter only when
 /// `promote_buffers` is set).
 /// An imageblock has no descriptor binding to promote; recognizing its stable ABI marker merely keeps
 /// its metadata-described cell type available to the native emitter. A wrapped texture with a real
 /// location remains a descriptor even when its predicate defaults false: SPIR-V specialization may
 /// enable the resource-using arm, and substituting another texture or erasing the binding would be
 /// semantically wrong. A `-1` location remains absent until AIR specialization assigns a binding.
-/// A wrapped SAMPLER is the same argument in the other descriptor band, and the two are declared
-/// together — a gated `texture2d` is sampled through a gated `sampler`. Collapsing only the sampler
-/// left the sample with no state to reach: its parameter never became a descriptor, so the operand
-/// stayed pointer-shaped into image lowering. The fragment decode has always read the wrapped role
-/// directly and so already promoted it; kernel and vertex read it through here and did not, which is
-/// the same declaration classified two ways.
 /// Promoting a wrapped BUFFER binds it as a
 /// REAL StorageBuffer instead of the "possibly-absent → Private zero placeholder" default; on the
 /// DEFAULT path this regresses byte-conformant goldens (a genuinely-absent fc buffer must stay Private,
@@ -2184,43 +1754,18 @@ const FC_PROMOTED_RESOURCE_ROLES: &[&str] = &[
 /// byte-wrong; keeping them real StorageBuffer lets the FC prune + PSB lower the merge byte-correctly).
 /// Dispatching on stable AIR ABI markers, not shader names.
 fn fc_promoted_role(strs: &[String], promote_buffers: bool) -> Option<&str> {
-    match gated_role(strs, |role| {
-        FC_PROMOTED_RESOURCE_ROLES.contains(&role) || air_role_is_system_value(role)
-    }) {
-        // Only the `fc_promote_psb` retry asks for the extra role, so it is spelled as one extra
-        // question rather than a second copy of the list that can drift from the first.
-        Some("function_constant") if promote_buffers => gated_role(strs, |role| role == "buffer"),
-        other => other,
-    }
-}
-
-/// The role marker an interface node declares, resolving an `air.function_constant` wrapper against
-/// the roles the reading stage models.
-///
-/// Every stage decode asks this one question — "a gated declaration: which role is it?" — and the
-/// answer has to be the SAME for the same declaration, because a stage interface is matched across
-/// stages by position and by `Location`, not by name. Each decode used to answer it its own way:
-/// the fragment lists read the role past the wrapper unconditionally, the vertex output list read
-/// it through a resource allowlist that named no output role at all. So one gated member of one
-/// Metal varying struct was a varying on the fragment side and nothing on the vertex side, and
-/// every later varying in that struct landed on a different `Location` in the two modules — a
-/// silent read of the wrong interpolant, in two modules that each validate.
-///
-/// `modelled` answers "does the caller lower this role", asked of the caller's own lowering table,
-/// so a role the stage handles cannot go missing from a second hand-maintained copy of that list.
-/// A wrapper with anything else behind it
-/// — an unmodelled role, or a BARE function constant whose next marker is its own
-/// `air.arg_type_name` — stays the wrapper. `air.function_constant_disabled` (an
-/// AIR-specialized-off predicate) is never a role: it is not the wrapper this looks past.
-fn gated_role(strs: &[String], modelled: impl Fn(&str) -> bool) -> Option<&str> {
     let first = strs.first().map(String::as_str)?;
-    if first != "function_constant" {
-        return Some(first);
+    if first == "function_constant" {
+        return Some(match primary_role(strs) {
+            Some("texture") => "texture",
+            Some("imageblock") => "imageblock",
+            Some("visible_function_table") => "visible_function_table",
+            Some("intersection_function_table") => "intersection_function_table",
+            Some("buffer") if promote_buffers => "buffer",
+            _ => first,
+        });
     }
-    Some(match primary_role(strs) {
-        Some(role) if modelled(role) => role,
-        _ => first,
-    })
+    Some(first)
 }
 
 fn string_after_marker(body: &str, marker: &str) -> Option<String> {
@@ -2432,8 +1977,7 @@ pub(crate) fn parse_air_fragment_meta_with_entry(ll: &str) -> (Option<FragMeta>,
 /// Any other enabled role lands in [`FragMeta::unmodelled_input_params`] and is rejected at
 /// emission. `render_target` appears here because an `air.render_target` in the *input* list is
 /// framebuffer fetch (`[[color(n)]]`), not an output.
-/// The AIR entry-parameter roles that name a SPIR-V builtin rather than a bound resource, across
-/// every stage. The execution-group family answers for itself -- see [`air_role_is_system_value`].
+/// The fragment entry-parameter roles that name a SPIR-V builtin rather than a bound resource.
 ///
 /// A resource keeps its descriptor whether or not its function constant is on: the pipeline layout
 /// has to match what the application binds either way. A system value does not. When its constant
@@ -2441,68 +1985,22 @@ pub(crate) fn parse_air_fragment_meta_with_entry(ll: &str) -> (Option<FragMeta>,
 /// point interface — and, for `viewport_array_index` and `render_target_array_index`, a device
 /// capability in the module — for a value the shader cannot read.
 ///
-/// The converse is the half that went missing for two stages. The fragment decode reads the role
-/// past its wrapper unconditionally and consults this list only to drop the gated-OFF ones; the
-/// kernel and vertex decodes asked `fc_promoted_role`, which collapses every role it does not
-/// PROMOTE back to the wrapper -- gated-ON builtins included. Those bound a zero for a value the
-/// pipeline had, which is the same silent read the list exists to prevent, from the other side.
-pub const AIR_SYSTEM_VALUE_ROLES: &[&str] = &[
-    "amplification_count",
-    "amplification_id",
+/// The vertex and kernel decodes already drop a gated-off system value, because `fc_promoted_role`
+/// collapses everything but a promoted resource back to the wrapper. The fragment decode reads the
+/// role past the wrapper unconditionally, so this list is how it makes the same distinction.
+pub const FRAGMENT_SYSTEM_VALUE_ROLES: &[&str] = &[
     "barycentric_coord",
-    "dispatch_threads_per_threadgroup",
     "front_facing",
-    "instance_id",
-    "patch_id",
     "point_coord",
     "position",
-    "position_in_patch",
     "primitive_id",
     "render_target_array_index",
     "sample_id",
     "sample_mask_in",
-    "thread_index_in_threadgroup",
-    "thread_position_in_grid",
-    "thread_position_in_threadgroup",
-    "threadgroup_position_in_grid",
-    "threadgroups_per_grid",
-    "threads_per_grid",
-    "threads_per_threadgroup",
-    "vertex_id",
     "viewport_array_index",
 ];
 
-/// Whether an AIR entry-parameter role names a system value. See [`AIR_SYSTEM_VALUE_ROLES`]; the
-/// execution-group family is decoded from the marker's shape rather than listed, so it is asked
-/// rather than enumerated and a group added to [`AIR_EXECUTION_GROUPS`] needs no second entry here.
-pub fn air_role_is_system_value(role: &str) -> bool {
-    AIR_SYSTEM_VALUE_ROLES.contains(&role) || execution_group_role(role).is_some()
-}
-
-/// The role a stage should classify a declaration as, once a gated-OFF system value is accounted
-/// for: that parameter is ABSENT, and binding a zero for it is what Metal defines. Blanked rather
-/// than dropped so the caller's own `match` falls through to its unmodelled arm.
-///
-/// One statement of the rule for all three stages. It is only about system values: a RESOURCE keeps
-/// its descriptor whichever way its gate goes, because the pipeline layout has to match what the
-/// application binds either way.
-fn present_system_value_role<'a>(
-    role: &'a str,
-    body: &str,
-    nodes: &HashMap<u32, String>,
-    static_int_globals: &HashMap<String, u32>,
-) -> &'a str {
-    if air_role_is_system_value(role)
-        && !metadata_enabled_by_default(body, nodes, static_int_globals)
-    {
-        return "";
-    }
-    role
-}
-
 pub const FRAGMENT_INPUT_ROLES: &[&str] = &[
-    "amplification_count",
-    "amplification_id",
     "barycentric_coord",
     "buffer",
     "fragment_input",
@@ -2527,6 +2025,8 @@ pub const FRAGMENT_INPUT_ROLES: &[&str] = &[
 pub const VERTEX_INPUT_ROLES: &[&str] = &[
     "amplification_count",
     "amplification_id",
+    "base_instance",
+    "base_vertex",
     "buffer",
     "indirect_buffer",
     "instance_id",
@@ -2543,11 +2043,6 @@ pub const VERTEX_INPUT_ROLES: &[&str] = &[
 ];
 
 /// The kernel entry-parameter roles the emitter models. See [`FRAGMENT_INPUT_ROLES`].
-///
-/// The execution-group family is NOT listed here. Its members are decoded from the marker's shape by
-/// [`execution_group_role`], and [`air_input_role_is_modelled`] asks that decoder rather than a
-/// second spelling of the same family -- a member could otherwise have a lowering and still be
-/// refused for want of a line in a list.
 pub const KERNEL_INPUT_ROLES: &[&str] = &[
     "buffer",
     "dispatch_threads_per_threadgroup",
@@ -2556,121 +2051,24 @@ pub const KERNEL_INPUT_ROLES: &[&str] = &[
     "instance_acceleration_structure",
     "intersection_function_table",
     "primitive_acceleration_structure",
+    "quadgroup_index_in_threadgroup",
     "sampler",
+    "simdgroup_index_in_threadgroup",
+    "simdgroups_per_threadgroup",
     "stage_in",
     "texture",
+    "thread_index_in_quadgroup",
+    "thread_index_in_simdgroup",
     "thread_index_in_threadgroup",
     "thread_position_in_grid",
     "thread_position_in_threadgroup",
     "threadgroup_position_in_grid",
     "threadgroups_per_grid",
     "threads_per_grid",
+    "threads_per_simdgroup",
     "threads_per_threadgroup",
     "visible_function_table",
 ];
-
-/// Whether the emitter models `role` on an entry parameter of `stage`.
-///
-/// The stage's own inventory, plus the execution-group facts that stage can answer. Those are read
-/// off the marker's shape, so the family needs no entry in any inventory and cannot end up listed
-/// for one stage and forgotten for another -- which is how it started, listed for the kernel alone
-/// while a fragment declaring `[[thread_index_in_simdgroup]]` was refused outright.
-pub fn air_input_role_is_modelled(stage: Stage, role: &str) -> bool {
-    let inventory = match stage {
-        Stage::Fragment => FRAGMENT_INPUT_ROLES,
-        Stage::Vertex => VERTEX_INPUT_ROLES,
-        Stage::Kernel => KERNEL_INPUT_ROLES,
-    };
-    inventory.contains(&role) || stage_execution_group_role(stage, role).is_some()
-}
-
-/// Metal's execution groups inside a threadgroup, and how many threads each holds.
-///
-/// A quadgroup is four threads and a simdgroup thirty-two, and EVERY role in the family --
-/// a lane's index inside its group, its group's index inside the threadgroup, how many groups the
-/// threadgroup holds, and the group's own width -- is one derivation over that single number.
-/// Spelling the family out per group is what left `air.quadgroups_per_threadgroup` with no arm at
-/// all beside `air.simdgroups_per_threadgroup`, so a kernel declaring it read a zero where the
-/// hardware had a count.
-pub const AIR_EXECUTION_GROUPS: &[(&str, u32)] = &[("quadgroup", 4), ("simdgroup", 32)];
-
-/// One fact an entry parameter can ask about the execution group its thread runs in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ExecutionGroupFact {
-    /// `[[thread_index_in_simdgroup]]`, `[[thread_index_in_quadgroup]]`: this lane's index inside
-    /// its own group.
-    ThreadIndexInGroup,
-    /// `[[simdgroup_index_in_threadgroup]]`, `[[quadgroup_index_in_threadgroup]]`: which group
-    /// inside the threadgroup this lane belongs to.
-    GroupIndexInThreadgroup,
-    /// `[[simdgroups_per_threadgroup]]`, `[[quadgroups_per_threadgroup]]`: how many whole groups the
-    /// threadgroup's local size divides into.
-    GroupsPerThreadgroup,
-    /// `[[threads_per_simdgroup]]`: the group's width.
-    ThreadsPerGroup,
-}
-
-impl ExecutionGroupFact {
-    /// Whether a shader stage has to be dispatched as a threadgroup grid for this fact to mean
-    /// anything.
-    ///
-    /// A lane's index inside its group and the group's own width are facts about the GROUP: every
-    /// stage runs its threads in execution groups, and this translator states both off
-    /// `SubgroupLocalInvocationId` and the group's width, neither of which mentions a workgroup.
-    /// The other two are facts about the THREADGROUP the groups divide -- which one this thread's
-    /// group is, and how many the local size holds -- and only a compute grid has one, so a
-    /// fragment or vertex entry declaring them is refused rather than answered with a zero.
-    pub fn needs_a_threadgroup(self) -> bool {
-        match self {
-            Self::ThreadIndexInGroup | Self::ThreadsPerGroup => false,
-            Self::GroupIndexInThreadgroup | Self::GroupsPerThreadgroup => true,
-        }
-    }
-}
-
-/// The execution-group fact an AIR role marker names and the group's width, or `None` when the
-/// marker names no execution group.
-///
-/// Read from the marker's SHAPE against [`AIR_EXECUTION_GROUPS`] rather than from an arm per
-/// (group, fact) pair, so a member of the family cannot be modelled for one group and missing for
-/// the other. The four shapes are exhaustive over the family and unambiguous: no marker outside it
-/// matches one and then names a group in the table.
-///
-/// The answer carries no stage in it -- a Metal simdgroup is the same thirty-two threads whichever
-/// entry declares it. [`ExecutionGroupFact::needs_a_threadgroup`] is where a stage enters.
-///
-/// `dispatch_` is Metal's "what the dispatch asked for" spelling, and it is stripped here only so a
-/// member of THIS family cannot be modelled under one spelling and missing under the other. It does
-/// not follow that the two spellings denote one value: for the threadgroup they do not, which is why
-/// `air.dispatch_threads_per_threadgroup` is its own [`KernRole::DispatchThreadsPerThreadgroup`].
-/// No group in [`AIR_EXECUTION_GROUPS`] is the threadgroup, so that role never reaches this decode.
-pub fn execution_group_role(marker: &str) -> Option<(ExecutionGroupFact, u32)> {
-    let marker = marker.strip_prefix("dispatch_").unwrap_or(marker);
-    let (fact, group) = if let Some(group) = marker.strip_prefix("thread_index_in_") {
-        (ExecutionGroupFact::ThreadIndexInGroup, group)
-    } else if let Some(group) = marker.strip_suffix("_index_in_threadgroup") {
-        (ExecutionGroupFact::GroupIndexInThreadgroup, group)
-    } else if let Some(group) = marker.strip_suffix("s_per_threadgroup") {
-        (ExecutionGroupFact::GroupsPerThreadgroup, group)
-    } else if let Some(group) = marker.strip_prefix("threads_per_") {
-        (ExecutionGroupFact::ThreadsPerGroup, group)
-    } else {
-        return None;
-    };
-    let lanes = AIR_EXECUTION_GROUPS
-        .iter()
-        .find_map(|&(name, lanes)| (name == group).then_some(lanes))?;
-    Some((fact, lanes))
-}
-
-/// The execution-group fact a stage models, if this marker names one it can answer.
-///
-/// One statement of "does this stage lower that marker", shared by the inventory that decides what
-/// to refuse and by all three decodes. See [`ExecutionGroupFact::needs_a_threadgroup`].
-fn stage_execution_group_role(stage: Stage, marker: &str) -> Option<(ExecutionGroupFact, u32)> {
-    execution_group_role(marker)
-        .filter(|(fact, _)| stage == Stage::Kernel || !fact.needs_a_threadgroup())
-}
 
 /// The fragment return-member roles the emitter lowers.
 ///
@@ -2685,82 +2083,6 @@ pub const FRAGMENT_OUTPUT_ROLES: &[&str] = &[
     "sample_mask",
     "imageblock_data",
 ];
-
-/// What a vertex return member is once its role marker is read. The `Varying` case still needs its
-/// location, which the decode assigns positionally, so this names the arm rather than the value.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum VertexOutputKind {
-    Position,
-    PointSize,
-    ClipDistance,
-    ViewportArrayIndex,
-    RenderTargetArrayIndex,
-    Varying,
-}
-
-impl VertexOutputKind {
-    /// Whether this member is a SPIR-V builtin rather than a user varying.
-    ///
-    /// The two answer the gating question differently, exactly as they do on an entry parameter
-    /// list (see [`AIR_SYSTEM_VALUE_ROLES`]): a varying keeps its slot whatever its predicate
-    /// says, because the stage consuming the same struct keeps it too, while a builtin the shader
-    /// cannot have written is absent. `Position` is not a gated case — a vertex shader without a
-    /// clip position is not a vertex shader, and AIR does not gate it.
-    fn is_system_value(self) -> bool {
-        !matches!(self, Self::Varying | Self::Position)
-    }
-}
-
-/// The vertex return-member roles the emitter lowers, and what each one lowers to. See
-/// [`FRAGMENT_OUTPUT_ROLES`] for the fragment side of the same contract.
-///
-/// One table, not a role list beside a `match`: this is BOTH the set an `air.function_constant`
-/// wrapper is resolved against and the mapping the decode applies, so a role cannot be lowered
-/// without being promoted past the wrapper, or promoted without being lowered. Those were two
-/// spellings of one fact, and they disagreed — the wrapper list named no output role at all, so a
-/// gated `air.vertex_output` was a varying to the fragment decode reading the same declaration and
-/// nothing to this one, which renumbered every later varying in the struct on one side only.
-const VERTEX_OUTPUT_ROLES: &[(&str, VertexOutputKind)] = &[
-    ("clip_distance", VertexOutputKind::ClipDistance),
-    ("point_size", VertexOutputKind::PointSize),
-    ("position", VertexOutputKind::Position),
-    (
-        "render_target_array_index",
-        VertexOutputKind::RenderTargetArrayIndex,
-    ),
-    ("vertex_output", VertexOutputKind::Varying),
-    ("viewport_array_index", VertexOutputKind::ViewportArrayIndex),
-];
-
-/// The roles the VERTEX entry-parameter decode reads past an `air.function_constant` wrapper: the
-/// shared resource band, plus the two stage-input roles this stage owns.
-///
-/// A stage input is not a resource, but promoting it is the same argument the resource band already
-/// makes. SPIR-V specialization may enable the arm that reads it, and an argument that never became
-/// an input variable reads `OpUndef` instead of the attribute the application bound and reflection
-/// asked for — silently, in a module that validates. It is also what the fragment decode answers for
-/// the mirror-image `air.fragment_input`, and one declaration must not be classified two ways.
-/// All 573 gated `air.vertex_input` arguments in 89 of 14579 local corpus sources carry a real
-/// `air.location_index`, and none collides with another attribute in its own module.
-///
-/// Stated as one promotion set rather than as patches applied to the resource classifier's answer
-/// afterwards, which is how `patch_input` came to be corrected at the call site while `vertex_input`
-/// was not corrected at all.
-fn vertex_input_gated_role(strs: &[String]) -> Option<&str> {
-    gated_role(strs, |role| {
-        FC_PROMOTED_RESOURCE_ROLES.contains(&role)
-            || air_role_is_system_value(role)
-            || matches!(role, "patch_input" | "vertex_input")
-    })
-}
-
-/// The [`VertexOutputKind`] a vertex return-member role marker names, if the emitter lowers it.
-fn vertex_output_kind(role: &str) -> Option<VertexOutputKind> {
-    VERTEX_OUTPUT_ROLES
-        .iter()
-        .find(|(name, _)| *name == role)
-        .map(|(_, kind)| *kind)
-}
 
 fn parse_air_fragment_meta_with_nodes(
     ll: &str,
@@ -2848,19 +2170,37 @@ fn parse_air_fragment_meta_with_nodes(
                 .enumerate()
                 .filter_map(|(i, r)| {
                     let node = nodes.get(&r)?;
-                    let role = unmodelled_declared_role(
-                        |role| FRAGMENT_OUTPUT_ROLES.contains(&role),
-                        node,
-                        nodes,
-                        &static_int_globals,
-                    )?;
-                    Some((i as u32, role))
+                    let roles = role_strings(node);
+                    let role = declared_role(&roles)?;
+                    (!FRAGMENT_OUTPUT_ROLES.contains(&role)
+                        && metadata_enabled_by_default(node, nodes, &static_int_globals))
+                    .then(|| (i as u32, role.to_string()))
                 })
                 .collect()
         })
         .unwrap_or_default();
+    let render_target_dual_indices: Vec<(u32, u32)> = nodes
+        .get(&out_ref)
+        .map(|c| {
+            refs_in(c)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, r)| {
+                    let node = nodes.get(&r)?;
+                    let is_render_target = primary_role(&role_strings(node)) == Some("render_target");
+                    let index = render_target_dual_index(node, &static_int_globals);
+                    (is_render_target
+                        && index != 0
+                        && metadata_enabled_by_default(node, nodes, &static_int_globals))
+                    .then_some((i as u32, index))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Attachments only: a dual-source second output writes the same attachment as its index-0 twin.
     let render_target_indices: Vec<u32> = render_target_members
         .iter()
+        .filter(|(member, _)| !render_target_dual_indices.iter().any(|(m, _)| m == member))
         .map(|(_, location)| *location)
         .collect();
     let n_render_targets = render_target_indices.len() as u32;
@@ -2924,116 +2264,109 @@ fn parse_air_fragment_meta_with_nodes(
         let Some(role_str) = primary_role(&strs) else {
             continue;
         };
-        let texture_slot = variant_texture_slot(node, idx, nodes, &static_int_globals);
-        let role_str = present_system_value_role(role_str, node, nodes, &static_int_globals);
-        if let Some(declared) = unmodelled_declared_role(
-            |role| air_input_role_is_modelled(Stage::Fragment, role),
-            node,
-            nodes,
-            &static_int_globals,
-        ) {
-            unmodelled_input_params.push((idx, declared));
+        // A gated-off system value is absent; falling through to `Other` binds a zero for it.
+        let role_str = if FRAGMENT_SYSTEM_VALUE_ROLES.contains(&role_str)
+            && !metadata_enabled_by_default(node, nodes, &static_int_globals)
+        {
+            ""
+        } else {
+            role_str
+        };
+        if let Some(declared) = declared_role(&strs) {
+            if !FRAGMENT_INPUT_ROLES.contains(&declared)
+                && metadata_enabled_by_default(node, nodes, &static_int_globals)
+            {
+                unmodelled_input_params.push((idx, declared.to_string()));
+            }
         }
-        let role =
-            match role_str {
-                "position" => FragRole::Position,
-                "point_coord" => FragRole::PointCoord,
-                "front_facing" => FragRole::FrontFacing,
-                "barycentric_coord" => FragRole::BarycentricCoord {
-                    no_perspective: VaryingInterpolation::from_role_strings(&strs).no_perspective,
-                },
-                "primitive_id" => FragRole::PrimitiveId,
-                "sample_id" => FragRole::SampleId,
-                "sample_mask_in" => FragRole::SampleMaskIn,
-                "viewport_array_index" => FragRole::ViewportArrayIndex,
-                "render_target_array_index" => FragRole::RenderTargetArrayIndex,
-                "amplification_id" => FragRole::AmplificationId,
-                "amplification_count" => FragRole::AmplificationCount,
-                "fragment_input" => {
-                    let l = varying_loc;
-                    varying_loc += 1;
-                    if let Some(name) = arg_type_name(node) {
-                        varying_types.insert(l, name);
-                    }
-                    if let Some(name) = arg_name(node) {
-                        varying_names.insert(l, name);
-                    }
-                    if let Some(semantic) = string_after_marker(node, "air.fragment_input") {
-                        varying_user_semantics.insert(l, semantic);
-                    }
-                    varying_interpolation.insert(l, VaryingInterpolation::from_role_strings(&strs));
-                    FragRole::Varying(l)
+        let role = match role_str {
+            "position" => FragRole::Position,
+            "point_coord" => FragRole::PointCoord,
+            "front_facing" => FragRole::FrontFacing,
+            "barycentric_coord" => FragRole::BarycentricCoord {
+                no_perspective: VaryingInterpolation::from_role_strings(&strs).no_perspective,
+            },
+            "primitive_id" => FragRole::PrimitiveId,
+            "sample_id" => FragRole::SampleId,
+            "sample_mask_in" => FragRole::SampleMaskIn,
+            "viewport_array_index" => FragRole::ViewportArrayIndex,
+            "render_target_array_index" => FragRole::RenderTargetArrayIndex,
+            "fragment_input" => {
+                let l = varying_loc;
+                varying_loc += 1;
+                if let Some(name) = arg_type_name(node) {
+                    varying_types.insert(l, name);
                 }
-                "texture" => match texture_slot {
-                    Some(slot) => {
-                        if let Some(name) = arg_type_name(node) {
-                            texture_type_names.insert(idx, name);
-                        }
-                        FragRole::Texture(slot)
-                    }
-                    // A texture this variant declares no slot for has no binding to report. See
-                    // [`variant_texture_slot`].
-                    None => FragRole::VariantAbsentTexture,
-                },
-                "sampler" => {
-                    FragRole::Sampler(location_index_with_static(node, idx, &static_int_globals))
+                if let Some(name) = arg_name(node) {
+                    varying_names.insert(l, name);
                 }
-                "visible_function_table" => FragRole::VisibleFunctionTable(
-                    location_index_with_static(node, idx, &static_int_globals),
-                ),
-                "intersection_function_table" => FragRole::IntersectionFunctionTable(
-                    location_index_with_static(node, idx, &static_int_globals),
-                ),
-                "buffer" | "indirect_buffer" => {
-                    if role_str == "indirect_buffer" {
-                        if let Some(sref) = struct_info_ref(node) {
-                            indirect_buffer_struct_refs.push((
-                                idx,
-                                location_index_with_static(node, idx, &static_int_globals),
-                                sref,
-                            ));
-                        }
-                    }
-                    // Populate address space / declared size ONLY when the IR actually carries them
-                    // (no invented default), so reflection never reports a guessed value.
-                    if let Some(space) =
-                        address_space(node).or_else(|| param_address_spaces.get(&idx).copied())
-                    {
-                        buffer_address_spaces.insert(idx, space);
-                    }
-                    if let Some(size) = i32_after_marker(node, "air.arg_type_size")
-                        .or_else(|| i32_after_marker(node, "air.buffer_size"))
-                    {
-                        buffer_type_sizes.insert(idx, size);
-                    }
-                    if let Some(size) = i32_after_marker(node, "air.buffer_size") {
-                        buffer_object_sizes.insert(idx, size);
-                    }
-                    if let Some(name) = arg_type_name(node) {
-                        buffer_type_names.insert(idx, name);
-                    }
-                    if let Some(access) = declared_buffer_access(node) {
-                        buffer_accesses.insert(idx, access);
-                    }
-                    FragRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
+                if let Some(semantic) = string_after_marker(node, "air.fragment_input") {
+                    varying_user_semantics.insert(l, semantic);
                 }
-                // an air.render_target in the INPUT list = framebuffer fetch ([[color(n)]]).
-                "render_target" => {
-                    let location = render_target_location(node, idx, &static_int_globals);
-                    if let Some(name) = arg_type_name(node) {
-                        color_input_type_names.insert(location, name);
-                    }
-                    FragRole::ColorInput(location)
+                varying_interpolation.insert(l, VaryingInterpolation::from_role_strings(&strs));
+                FragRole::Varying(l)
+            }
+            "texture" if location_index_with_static(node, idx, &static_int_globals) != u32::MAX => {
+                if let Some(name) = arg_type_name(node) {
+                    texture_type_names.insert(idx, name);
                 }
-                "imageblock_data" => FragRole::ImageblockData,
-                // The specializer's spelling of a texture this variant leaves out. The wrapped
-                // role is unreadable past it, so this is the only place the fact survives.
-                _ if declares_disabled_texture(&strs) => FragRole::VariantAbsentTexture,
-                other => stage_execution_group_role(Stage::Fragment, other).map_or(
-                    FragRole::Other,
-                    |(fact, lanes)| FragRole::ExecutionGroup { fact, lanes },
-                ),
-            };
+                FragRole::Texture(location_index_with_static(node, idx, &static_int_globals))
+            }
+            "sampler" => {
+                FragRole::Sampler(location_index_with_static(node, idx, &static_int_globals))
+            }
+            "visible_function_table" => FragRole::VisibleFunctionTable(location_index_with_static(
+                node,
+                idx,
+                &static_int_globals,
+            )),
+            "intersection_function_table" => FragRole::IntersectionFunctionTable(
+                location_index_with_static(node, idx, &static_int_globals),
+            ),
+            "buffer" | "indirect_buffer" => {
+                if role_str == "indirect_buffer" {
+                    if let Some(sref) = struct_info_ref(node) {
+                        indirect_buffer_struct_refs.push((
+                            idx,
+                            location_index_with_static(node, idx, &static_int_globals),
+                            sref,
+                        ));
+                    }
+                }
+                // Populate address space / declared size ONLY when the IR actually carries them
+                // (no invented default), so reflection never reports a guessed value.
+                if let Some(space) =
+                    address_space(node).or_else(|| param_address_spaces.get(&idx).copied())
+                {
+                    buffer_address_spaces.insert(idx, space);
+                }
+                if let Some(size) = i32_after_marker(node, "air.arg_type_size")
+                    .or_else(|| i32_after_marker(node, "air.buffer_size"))
+                {
+                    buffer_type_sizes.insert(idx, size);
+                }
+                if let Some(size) = i32_after_marker(node, "air.buffer_size") {
+                    buffer_object_sizes.insert(idx, size);
+                }
+                if let Some(name) = arg_type_name(node) {
+                    buffer_type_names.insert(idx, name);
+                }
+                if let Some(access) = declared_buffer_access(node) {
+                    buffer_accesses.insert(idx, access);
+                }
+                FragRole::Buffer(location_index_with_static(node, idx, &static_int_globals))
+            }
+            // an air.render_target in the INPUT list = framebuffer fetch ([[color(n)]]).
+            "render_target" => {
+                let location = render_target_location(node, idx, &static_int_globals);
+                if let Some(name) = arg_type_name(node) {
+                    color_input_type_names.insert(location, name);
+                }
+                FragRole::ColorInput(location)
+            }
+            "imageblock_data" => FragRole::ImageblockData,
+            _ => FragRole::Other,
+        };
         roles.push((idx, role));
     }
     let top_level_texture_locations = roles
@@ -3043,7 +2376,6 @@ fn parse_air_fragment_meta_with_nodes(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let argument_buffers = ArgumentBuffers::new(indirect_buffer_struct_refs);
     Some(FragMeta {
         roles,
         unmodelled_stage_attributes,
@@ -3056,6 +2388,7 @@ fn parse_air_fragment_meta_with_nodes(
         varying_interpolation,
         n_render_targets,
         render_target_members,
+        render_target_dual_indices,
         render_target_type_names,
         depth_members,
         depth_qualifier,
@@ -3074,12 +2407,15 @@ fn parse_air_fragment_meta_with_nodes(
         declared_descriptor_counts,
         color_input_type_names,
         embedded_textures: if body_uses_texture_intrinsic(ll) {
-            detect_embedded_textures(nodes, &argument_buffers, &top_level_texture_locations)
+            detect_embedded_textures(
+                nodes,
+                &indirect_buffer_struct_refs,
+                &top_level_texture_locations,
+            )
         } else {
             Vec::new()
         },
-        embedded_arguments: detect_embedded_arguments(nodes, &argument_buffers),
-        unsurfaced_embedded_resources: unsurfaced_embedded_resources(nodes, &argument_buffers),
+        embedded_arguments: detect_embedded_arguments(nodes, &indirect_buffer_struct_refs),
     })
 }
 
@@ -3153,22 +2489,19 @@ fn parse_air_vertex_meta_with_nodes(
     for r in refs_in(nodes.get(&out_ref)?) {
         let Some(node) = nodes.get(&r) else { continue };
         let strs = role_strings(node);
-        let Some(first) = gated_role(&strs, |role| vertex_output_kind(role).is_some()) else {
+        let Some(first) = fc_promoted_role(&strs, false) else {
             continue;
         };
-        let kind = vertex_output_kind(first).filter(|kind| {
-            // A gated builtin the shader cannot have written is absent. Declaring it anyway puts a
-            // variable in the entry-point interface -- and, for `Layer` and `ViewportIndex`, a
-            // device capability in the module -- for a value nothing produces.
-            !kind.is_system_value() || metadata_enabled_by_default(node, nodes, &static_int_globals)
-        });
-        let role = match kind {
-            Some(VertexOutputKind::Position) => VertOutRole::Position,
-            Some(VertexOutputKind::PointSize) => VertOutRole::PointSize,
-            Some(VertexOutputKind::ClipDistance) => VertOutRole::ClipDistance,
-            Some(VertexOutputKind::ViewportArrayIndex) => VertOutRole::ViewportArrayIndex,
-            Some(VertexOutputKind::RenderTargetArrayIndex) => VertOutRole::RenderTargetArrayIndex,
-            Some(VertexOutputKind::Varying) => {
+        let role = match first {
+            "function_constant" | "function_constant_disabled" => {
+                VertOutRole::FunctionConstantDisabled
+            }
+            "position" => VertOutRole::Position,
+            "point_size" => VertOutRole::PointSize,
+            "clip_distance" => VertOutRole::ClipDistance,
+            "viewport_array_index" => VertOutRole::ViewportArrayIndex,
+            "render_target_array_index" => VertOutRole::RenderTargetArrayIndex,
+            "vertex_output" => {
                 let l = location_index_with_static(node, out_loc, &static_int_globals);
                 out_loc += 1;
                 if let Some(name) = arg_type_name(node) {
@@ -3182,18 +2515,7 @@ fn parse_air_vertex_meta_with_nodes(
                 }
                 VertOutRole::Varying(l)
             }
-            // The member is in the return struct but nothing writes it: an unresolved wrapper over
-            // a role this stage does not lower, an AIR-specialized-off predicate, or a builtin the
-            // filter above ruled absent.
-            None if matches!(first, "function_constant" | "function_constant_disabled")
-                || vertex_output_kind(first).is_some() =>
-            {
-                VertOutRole::FunctionConstantDisabled
-            }
-            // A role no vertex output lowering models. Reported, not skipped: AIR states an output
-            // because the shader writes it, so a member nothing knows how to write is a value that
-            // silently disappears.
-            None => VertOutRole::Other,
+            _ => VertOutRole::Other,
         };
         if strs.iter().any(|s| s == "invariant") {
             invariant_outputs.push(output_roles.len() as u32);
@@ -3240,24 +2562,23 @@ fn parse_air_vertex_meta_with_nodes(
         if let Some(count) = declared_descriptor_count(node) {
             declared_descriptor_counts.insert(idx, count);
         }
-        let Some(mut first) = vertex_input_gated_role(&strs) else {
+        let Some(mut first) = fc_promoted_role(&strs, false) else {
             continue;
         };
-        // The one demotion the promotion set cannot state: a wrapped texture this variant declares
-        // no slot for has no binding to promote it to. See [`variant_texture_slot`].
-        let texture_slot = variant_texture_slot(node, idx, nodes, &static_int_globals);
-        if primary_role(&strs) == Some("texture") && texture_slot.is_none() {
-            first = VARIANT_ABSENT_TEXTURE_ROLE;
+        if primary_role(&strs) == Some("texture")
+            && location_index_with_static(node, idx, &static_int_globals) == u32::MAX
+        {
+            first = "function_constant";
         }
-        let first = present_gated_buffer_role(first, &strs, node, nodes, &static_int_globals);
-        let first = present_system_value_role(first, node, nodes, &static_int_globals);
-        if let Some(declared) = unmodelled_declared_role(
-            |role| air_input_role_is_modelled(Stage::Vertex, role),
-            node,
-            nodes,
-            &static_int_globals,
-        ) {
-            unmodelled_input_params.push((idx, declared));
+        if primary_role(&strs) == Some("patch_input") {
+            first = "patch_input";
+        }
+        if let Some(declared) = declared_role(&strs) {
+            if !VERTEX_INPUT_ROLES.contains(&declared)
+                && metadata_enabled_by_default(node, nodes, &static_int_globals)
+            {
+                unmodelled_input_params.push((idx, declared.to_string()));
+            }
         }
         let role =
             match first {
@@ -3307,9 +2628,7 @@ fn parse_air_vertex_meta_with_nodes(
                     if let Some(name) = arg_type_name(node) {
                         texture_type_names.insert(idx, name);
                     }
-                    VertRole::Texture(texture_slot.unwrap_or_else(|| {
-                        location_index_with_static(node, idx, &static_int_globals)
-                    }))
+                    VertRole::Texture(location_index_with_static(node, idx, &static_int_globals))
                 }
                 "sampler" => {
                     VertRole::Sampler(location_index_with_static(node, idx, &static_int_globals))
@@ -3322,6 +2641,8 @@ fn parse_air_vertex_meta_with_nodes(
                 ),
                 "vertex_id" => VertRole::VertexId,
                 "instance_id" => VertRole::InstanceId,
+                "base_instance" => VertRole::BaseInstance,
+                "base_vertex" => VertRole::BaseVertex,
                 "patch_control_point_input" => {
                     let refs = refs_in(node);
                     let function = refs
@@ -3356,16 +2677,7 @@ fn parse_air_vertex_meta_with_nodes(
                 "patch_id" => VertRole::PatchId,
                 "amplification_id" => VertRole::AmplificationId,
                 "amplification_count" => VertRole::AmplificationCount,
-                VARIANT_ABSENT_TEXTURE_ROLE => VertRole::VariantAbsentTexture,
-                // The specializer's spelling of the same fact. Once a VALUE is supplied,
-                // `specialize_function_constant_metadata` rewrites the resolved-off wrapper, and past
-                // that rewrite the wrapped role is unreadable -- so the demotion above never runs and
-                // this is the only place the fact survives.
-                _ if declares_disabled_texture(&strs) => VertRole::VariantAbsentTexture,
-                other => stage_execution_group_role(Stage::Vertex, other).map_or(
-                    VertRole::Other,
-                    |(fact, lanes)| VertRole::ExecutionGroup { fact, lanes },
-                ),
+                _ => VertRole::Other,
             };
         roles.push((idx, role));
     }
@@ -3376,7 +2688,6 @@ fn parse_air_vertex_meta_with_nodes(
             _ => None,
         })
         .collect::<Vec<_>>();
-    let argument_buffers = ArgumentBuffers::new(indirect_buffer_struct_refs);
     Some(VertMeta {
         roles,
         unmodelled_input_params,
@@ -3401,12 +2712,15 @@ fn parse_air_vertex_meta_with_nodes(
         texture_type_names,
         declared_descriptor_counts,
         embedded_textures: if body_uses_texture_intrinsic(ll) {
-            detect_embedded_textures(nodes, &argument_buffers, &top_level_texture_locations)
+            detect_embedded_textures(
+                nodes,
+                &indirect_buffer_struct_refs,
+                &top_level_texture_locations,
+            )
         } else {
             Vec::new()
         },
-        embedded_arguments: detect_embedded_arguments(nodes, &argument_buffers),
-        unsurfaced_embedded_resources: unsurfaced_embedded_resources(nodes, &argument_buffers),
+        embedded_arguments: detect_embedded_arguments(nodes, &indirect_buffer_struct_refs),
         undecoded_patch_shape,
         unmodelled_stage_attributes,
         tessellation: patch_shape.map(|(domain, control_point_count)| {

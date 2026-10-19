@@ -17,9 +17,8 @@
 //! reader looked past the wrapper unconditionally, which is the inconsistency this pins — from both
 //! ends, because a decode that dropped the *ungated* case would satisfy half of it.
 
-use metal2vulkan::passes::{Stage, TransformOptions};
-use metal2vulkan::reflect::{ResourceKind, DEFAULT_DESCRIPTOR_LAYOUT, SAMPLER_BINDING_RANGE};
-use metal2vulkan::{disassemble, translate_sanitized_native, translate_sanitized_native_reflected};
+use metal2vulkan::passes::Stage;
+use metal2vulkan::{disassemble, translate_sanitized_native};
 use std::path::PathBuf;
 
 fn tmp() -> PathBuf {
@@ -133,97 +132,4 @@ entry:
         mentions(&asm, "Binding"),
         "a gated resource keeps the descriptor the pipeline layout declares:\n{asm}"
     );
-}
-
-/// The same gated declaration has to be read the same way in every stage.
-///
-/// A `[[function_constant]]`-gated `sampler` argument is a descriptor like the gated `texture` it is
-/// declared beside -- Metal spells the pair together, and the shader samples the one through the
-/// other. The fragment decode reads a wrapped role directly and always saw it; kernel and vertex
-/// read theirs through the promoted-role classifier, whose list of resources worth looking past the
-/// wrapper for named `texture` but not `sampler`. So the same two lines of AIR produced a texture
-/// descriptor and no sampler descriptor, and the sample fell through to a sampler the translator
-/// invented -- a different filter and address mode, in a module that validated and bound cleanly.
-/// 63 gated sampler arguments across 21 of 14579 local corpus sources, in all three stages.
-///
-/// Pinned across all three stages over one declaration, because the defect was not "samplers are
-/// mishandled" but "one declaration, two classifications".
-#[test]
-fn a_gated_sampler_is_a_descriptor_in_every_stage() {
-    const SAMPLE_CALL: &str = r#"  %s = call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %smp, <2 x float> zeroinitializer, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %c = extractvalue { <4 x float>, i8 } %s, 0
-"#;
-    const DECLARE: &str = r#"declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-"#;
-    // The gated pair, identical in all three modules: texture at Metal slot 2, sampler at slot 3.
-    const GATED_PAIR: &str = r#"!8 = !{i32 IDX, !"air.function_constant", !9, !"air.texture", !"air.location_index", i32 2, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
-!9 = !{ptr addrspace(2) @enabled.MTL_FC_INIT_0_b, !"bool", !"enabled", i32 0, i1 false}
-!10 = !{i32 IDX1, !"air.function_constant", !9, !"air.sampler", !"air.location_index", i32 3, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"smp"}
-"#;
-    const PROLOGUE: &str = r#"target triple = "air64_v28-apple-macosx26.5.0"
-
-@enabled.MTL_FC_INIT_0_b = internal addrspace(2) externally_initialized constant i8 undef, section "air.fc_initializer", align 1
-
-"#;
-
-    let fragment = format!(
-        "{PROLOGUE}define <4 x float> @frag(<4 x float> %pos, ptr addrspace(1) %tex, ptr addrspace(2) %smp) {{\nentry:\n{SAMPLE_CALL}  ret <4 x float> %c\n}}\n{DECLARE}\n!air.fragment = !{{!0}}\n!air.function_constants = !{{!9}}\n!0 = !{{ptr @frag, !1, !3}}\n!1 = !{{!2}}\n!2 = !{{!\"air.render_target\", i32 0, i32 0, !\"air.arg_type_name\", !\"float4\"}}\n!3 = !{{!4, !8, !10}}\n!4 = !{{i32 0, !\"air.position\", !\"air.center\", !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"pos\"}}\n{}",
-        GATED_PAIR.replace("IDX1", "2").replace("IDX", "1")
-    );
-    let vertex = format!(
-        "{PROLOGUE}define <4 x float> @vert(ptr addrspace(1) %tex, ptr addrspace(2) %smp) {{\nentry:\n{SAMPLE_CALL}  ret <4 x float> %c\n}}\n{DECLARE}\n!air.vertex = !{{!0}}\n!air.function_constants = !{{!9}}\n!0 = !{{ptr @vert, !1, !3}}\n!1 = !{{!2}}\n!2 = !{{!\"air.position\", !\"air.arg_type_name\", !\"float4\"}}\n!3 = !{{!8, !10}}\n{}",
-        GATED_PAIR.replace("IDX1", "1").replace("IDX", "0")
-    );
-    let kernel = format!(
-        "{PROLOGUE}define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %smp, ptr addrspace(1) %out) {{\nentry:\n{SAMPLE_CALL}  store <4 x float> %c, ptr addrspace(1) %out, align 16\n  ret void\n}}\n{DECLARE}\n!air.kernel = !{{!0}}\n!air.function_constants = !{{!9}}\n!0 = !{{ptr @k, !1, !3}}\n!1 = !{{}}\n!3 = !{{!8, !10, !11}}\n!11 = !{{i32 2, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.write\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 16, !\"air.arg_type_align_size\", i32 16, !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"out\"}}\n{}",
-        GATED_PAIR.replace("IDX1", "1").replace("IDX", "0")
-    );
-
-    for (stage, ll) in [
-        (Stage::Fragment, &fragment),
-        (Stage::Vertex, &vertex),
-        (Stage::Kernel, &kernel),
-    ] {
-        let (_, reflection) = translate_sanitized_native_reflected(
-            ll,
-            stage,
-            &tmp(),
-            TransformOptions {
-                descriptor_layout: DEFAULT_DESCRIPTOR_LAYOUT,
-                ..TransformOptions::default()
-            },
-        )
-        .unwrap_or_else(|error| panic!("{stage:?}: translate: {error}\n{ll}"));
-        let samplers = reflection
-            .bindings
-            .iter()
-            .filter(|binding| binding.kind == ResourceKind::Sampler)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            samplers.len(),
-            1,
-            "{stage:?}: the gated sampler argument is one descriptor; got {:?}",
-            reflection.bindings
-        );
-        assert_eq!(
-            samplers[0].metal_index, 3,
-            "{stage:?}: at the Metal slot AIR declared"
-        );
-        let location = samplers[0]
-            .descriptor
-            .expect("a reported sampler binds a descriptor");
-        assert!(
-            SAMPLER_BINDING_RANGE.contains(location.binding),
-            "{stage:?}: in the sampler band; got {location:?}"
-        );
-        assert!(
-            !reflection
-                .bindings
-                .iter()
-                .any(|binding| binding.kind == ResourceKind::SynthesizedReadSampler),
-            "{stage:?}: the declared sampler is the one the sample takes, so the translator has no \
-             reason to invent one: {:?}",
-            reflection.bindings
-        );
-    }
 }

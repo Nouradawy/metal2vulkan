@@ -3,6 +3,14 @@ use crate::native::cfg::BodyBlock;
 use crate::native::tir::{TirFunction, TirOpcode, TirOperand, TirTerminator};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FastSumLeaf {
+    Addend,
+    Positive,
+    Negative,
+    Difference,
+}
+
 fn ordinary_cfg_shape_key(blocks: &[BodyBlock]) -> String {
     // `structured_plan` rejection is a control-flow property. Keep value opcodes out of this key so
     // type-specialized helper bodies with the same block graph share the rejection fact; each body
@@ -43,6 +51,47 @@ fn ordinary_cfg_shape_key(blocks: &[BodyBlock]) -> String {
         key.push(';');
     }
     key
+}
+
+fn sixteen_leaf_cancellation_order(shape: &[FastSumLeaf]) -> Option<&'static [usize; 16]> {
+    use FastSumLeaf::{Addend as A, Difference as D, Negative as N, Positive as P};
+
+    match shape {
+        [P, P, A, P, N, N, N, N, N, D, N, D, P, D, D, A] => {
+            Some(&[13, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 0, 14, 15])
+        }
+        [A, P, P, N, N, N, N, D, N, D, N, D, P, D, P, D] => {
+            Some(&[12, 1, 2, 3, 0, 5, 6, 7, 8, 9, 10, 11, 4, 13, 14, 15])
+        }
+        [P, P, A, N, N, N, P, P, N, D, N, D, N, D, D, A] => {
+            Some(&[0, 15, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 1])
+        }
+        [A, P, N, N, N, P, P, D, N, D, N, D, N, D, P, D] => {
+            Some(&[0, 12, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 1, 13, 14, 15])
+        }
+        [P, N, A, N, P, P, N, N, P, D, P, D, N, D, D, A] => {
+            Some(&[3, 15, 2, 0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 1])
+        }
+        [A, N, N, P, P, N, N, D, P, D, P, D, N, D, N, D] => {
+            Some(&[14, 1, 2, 0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 3, 15])
+        }
+        [P, N, A, N, P, N, P, P, N, D, P, D, N, D, D, A] => {
+            Some(&[3, 1, 2, 0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+        }
+        [A, N, N, P, N, P, P, D, N, D, P, D, N, D, N, D] => {
+            Some(&[1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+        }
+        [A, N, N, P, N, P, P, N, D, P, D, N, D, N, D, D] => {
+            Some(&[1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+        }
+        [P, N, A, P, N, P, N, N, P, D, N, D, P, D, D, A] => {
+            Some(&[0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 1])
+        }
+        [A, N, P, N, P, N, N, D, P, D, N, D, P, D, N, D] => {
+            Some(&[0, 12, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 1, 13, 14, 15])
+        }
+        _ => None,
+    }
 }
 
 fn bda_forward_address_values(
@@ -358,6 +407,9 @@ impl Emitter {
     pub(super) fn emit_function(&mut self, f: &LlFunction) -> Result<(), String> {
         self.values.clear();
         self.fast_float_products.clear();
+        self.fast_grouped_sums.clear();
+        self.fast_partitioned_sums.clear();
+        self.fast_grouped_sum_boundaries.clear();
         self.fast_contract_adds.clear();
         self.fast_uncontracted_sums.clear();
         self.construct_tree_active = false;
@@ -426,7 +478,6 @@ impl Emitter {
         self.param_values.clear();
         self.inline_parameter_substitutions.clear();
         self.raw_offsets.clear();
-        self.symbolic_buffer_addresses.clear();
         self.int_alignments.clear();
         self.unmodeled_pointers.clear();
         for global in &self.ir.globals.clone() {
@@ -559,9 +610,25 @@ impl Emitter {
         let bool_type = (!nullness_params.is_empty())
             .then(|| self.type_id(&LlType::Bool))
             .transpose()?;
+        let raw_cursor_params = f
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| {
+                self.function_param_raw_cursors
+                    .contains(&(f.name.clone(), *index))
+            })
+            .map(|(_, (name, _))| name.clone())
+            .collect::<Vec<_>>();
+        let cursor_type = (!raw_cursor_params.is_empty())
+            .then(|| self.type_id(&LlType::Int(32)))
+            .transpose()?;
         let mut function_param_types = param_types.clone();
         if let Some(bool_type) = bool_type {
             function_param_types.extend(std::iter::repeat_n(bool_type, nullness_params.len()));
+        }
+        if let Some(cursor_type) = cursor_type {
+            function_param_types.extend(std::iter::repeat_n(cursor_type, raw_cursor_params.len()));
         }
         let fn_ty = self.function_type_id(ret_id, &function_param_types);
 
@@ -622,7 +689,7 @@ impl Emitter {
                     && self
                         .concrete_vector_workgroup_raw_param_pointee(&f.name, param_index, name)
                         .is_some();
-                if self.is_raw_buffer_param(name) {
+                if self.raw_buffer_params.contains(name) {
                     let pointee = if addrspace == 3 {
                         self.concrete_vector_workgroup_raw_param_pointee(&f.name, param_index, name)
                             .unwrap_or_else(raw_workgroup_array_type)
@@ -644,12 +711,8 @@ impl Emitter {
                 {
                     self.pointer_pointees.insert(name.clone(), pointee);
                 }
-                if self.is_raw_buffer_param(name) && !concrete_workgroup_raw_param {
-                    let mut raw = self
-                        .raw_call_param_offsets
-                        .get(&(f.name.clone(), name.clone()))
-                        .cloned()
-                        .unwrap_or_else(|| RawBufferOffset::root(name.clone(), addrspace));
+                if self.raw_buffer_params.contains(name) && !concrete_workgroup_raw_param {
+                    let mut raw = RawBufferOffset::root(name.clone(), addrspace);
                     raw.root = shared_raw_roots
                         .get(name)
                         .cloned()
@@ -682,6 +745,33 @@ impl Emitter {
                 vec![],
             ));
             self.record_pointer_nullness(name, id);
+        }
+        for name in raw_cursor_params {
+            let id = self.fresh();
+            params.push(Self::inst(
+                Op::FunctionParameter,
+                cursor_type,
+                Some(id),
+                vec![],
+            ));
+            // The pointer operand is the caller's raw root; its byte cursor arrives here. Fold it
+            // into the parameter's raw offset so every access through the parameter (and every
+            // GEP derived from it) addresses the caller's actual location.
+            let cursor = raw_cursor_value_name(&name);
+            self.values.insert(cursor.clone(), (id, LlType::Int(32)));
+            let raw = self.raw_offsets.get_mut(&name).ok_or_else(|| {
+                format!(
+                    "native emitter: raw cursor parameter {name} of @{} has no raw buffer offset",
+                    f.name
+                )
+            })?;
+            raw.dyn_terms.push((
+                TypedValue {
+                    ty: LlType::Int(32),
+                    value: LlValue::Local(cursor),
+                },
+                1,
+            ));
         }
 
         // T5/T8 keystone: seed every block's typed carrier from its lines at SPLIT time — BEFORE
@@ -1028,21 +1118,10 @@ impl Emitter {
                 // local: it exists only to preserve typed instructions and source edges until that
                 // selected constructor runs, so cloning/refunneling it here would duplicate the
                 // over-budget ownership work without changing the chosen representation.
-                if body_blocks.len() > crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS {
-                    self.branch_merges_by_header =
-                        infer_bounded_branch_merges_by_header(&body_blocks);
-                    self.branch_merges.clear();
-                    self.loop_merges.clear();
-                } else if crate::native::cfg::loop_forest_is_empty(&body_blocks) {
-                    self.branch_merges = infer_branch_merges(&body_blocks);
-                    self.loop_merges.clear();
-                } else {
-                    self.branch_merges_by_header =
-                        infer_bounded_branch_merges_by_header(&body_blocks);
-                    self.branch_merges.clear();
-                    self.loop_merges.clear();
-                }
-                self.switch_merges = infer_switch_merges_bounded(&body_blocks);
+                self.branch_merges_by_header = infer_bounded_branch_merges_by_header(&body_blocks);
+                self.branch_merges.clear();
+                self.loop_merges.clear();
+                self.switch_merges = infer_direct_switch_merges(&body_blocks);
             } else if body_blocks.len() > crate::native::cfg::CROSS_ARM_EDGE_MAX_BLOCKS {
                 // The ordinary and construct-tree planners have both rejected this large CFG. Building
                 // heuristic branch/loop transitive-closure maps here can exceed the memory budget before
@@ -1080,7 +1159,7 @@ impl Emitter {
                         infer_bounded_branch_merges_by_header(&body_blocks);
                     self.branch_merges.clear();
                     self.loop_merges.clear();
-                    self.switch_merges = infer_switch_merges_bounded(&body_blocks);
+                    self.switch_merges = infer_direct_switch_merges(&body_blocks);
                 }
             } else {
                 self.branch_merges = infer_branch_merges(&body_blocks);
@@ -1173,6 +1252,312 @@ impl Emitter {
                     Some((result.clone(), (local(&lhs.value), local(&rhs.value))))
                 })
                 .collect::<HashMap<_, _>>();
+            let fast_add_values = tir
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .filter(|inst| inst.fast_math() && inst.opcode == "fadd")
+                .filter_map(|inst| {
+                    let result = inst.result.as_ref()?;
+                    let operands = self.tir_inst_typed_operands(inst)?;
+                    let [lhs, rhs] = operands.as_slice() else {
+                        return None;
+                    };
+                    Some((result.clone(), (lhs.clone(), rhs.clone())))
+                })
+                .collect::<HashMap<_, _>>();
+            let fast_sum_values = tir
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .filter(|inst| inst.fast_math() && matches!(inst.opcode.as_str(), "fadd" | "fsub"))
+                .filter_map(|inst| {
+                    let result = inst.result.as_ref()?;
+                    let operands = self.tir_inst_typed_operands(inst)?;
+                    let [lhs, rhs] = operands.as_slice() else {
+                        return None;
+                    };
+                    Some((
+                        result.clone(),
+                        (inst.opcode == "fsub", lhs.clone(), rhs.clone()),
+                    ))
+                })
+                .collect::<HashMap<_, _>>();
+            let nested_fast_adds = fast_sum_values
+                .values()
+                .flat_map(|(_, lhs, rhs)| [lhs, rhs])
+                .filter_map(|value| match &value.value {
+                    LlValue::Local(name) if fast_add_values.contains_key(name) => {
+                        Some(name.clone())
+                    }
+                    _ => None,
+                })
+                .collect::<HashSet<_>>();
+            let mut stored_fast_adds = HashSet::new();
+            for inst in tir
+                .blocks
+                .iter()
+                .flat_map(|block| &block.insts)
+                .filter(|inst| inst.opcode == "store")
+            {
+                inst.visit_uses(|name| {
+                    if fast_add_values.contains_key(name) {
+                        stored_fast_adds.insert(name.to_string());
+                    }
+                });
+            }
+            fn collect_fast_sum_terms(
+                value: &TypedValue,
+                negate: bool,
+                sums: &HashMap<String, (bool, TypedValue, TypedValue)>,
+                visiting: &mut HashSet<String>,
+                terms: &mut Vec<(TypedValue, bool)>,
+            ) -> bool {
+                let LlValue::Local(name) = &value.value else {
+                    terms.push((value.clone(), negate));
+                    return true;
+                };
+                let Some((subtract, lhs, rhs)) = sums.get(name) else {
+                    terms.push((value.clone(), negate));
+                    return true;
+                };
+                if *subtract {
+                    terms.push((value.clone(), negate));
+                    return true;
+                }
+                if !visiting.insert(name.clone()) {
+                    return false;
+                }
+                let valid = collect_fast_sum_terms(lhs, negate, sums, visiting, terms)
+                    && collect_fast_sum_terms(rhs, negate ^ subtract, sums, visiting, terms);
+                visiting.remove(name);
+                valid
+            }
+            fn literal_is_negative(value: &TypedValue) -> Option<bool> {
+                match (&value.ty, &value.value) {
+                    (LlType::Float, LlValue::Float(value)) => Some(value.is_sign_negative()),
+                    (LlType::Float, LlValue::Hex(bits)) => Some(bits >> 63 != 0),
+                    (LlType::Half, LlValue::HalfBits(bits)) => Some(bits >> 15 != 0),
+                    (LlType::BFloat, LlValue::BFloatBits(bits)) => Some(bits >> 15 != 0),
+                    (_, LlValue::SignedInt(value)) => Some(*value < 0),
+                    (_, LlValue::Int(_) | LlValue::Zero) => Some(false),
+                    _ => None,
+                }
+            }
+            let leaf_shape = |term: &TypedValue, negate: bool| {
+                let LlValue::Local(name) = &term.value else {
+                    return Some(FastSumLeaf::Addend);
+                };
+                let Some((lhs, rhs)) = fast_products.get(name) else {
+                    return Some(FastSumLeaf::Addend);
+                };
+                if [lhs, rhs].into_iter().any(|operand| {
+                    matches!(&operand.value, LlValue::Local(name) if fast_sum_values.get(name).is_some_and(|(subtract, _, _)| *subtract))
+                }) {
+                    return Some(FastSumLeaf::Difference);
+                }
+                let coefficient_negative =
+                    [lhs, rhs].into_iter().find_map(literal_is_negative)? ^ negate;
+                Some(if coefficient_negative {
+                    FastSumLeaf::Negative
+                } else {
+                    FastSumLeaf::Positive
+                })
+            };
+            for (root, (lhs, rhs)) in &fast_add_values {
+                if nested_fast_adds.contains(root) {
+                    continue;
+                }
+                let mut terms = Vec::new();
+                let mut visiting = HashSet::new();
+                if !collect_fast_sum_terms(lhs, false, &fast_sum_values, &mut visiting, &mut terms)
+                    || !collect_fast_sum_terms(
+                        rhs,
+                        false,
+                        &fast_sum_values,
+                        &mut visiting,
+                        &mut terms,
+                    )
+                    || !(5..10).contains(&terms.len())
+                {
+                    continue;
+                }
+                let shape = terms
+                    .iter()
+                    .map(|(term, negate)| leaf_shape(term, *negate))
+                    .collect::<Option<Vec<_>>>();
+                let stored_source_tree = stored_fast_adds.contains(root)
+                    && shape.as_deref().is_some_and(|shape| {
+                        shape.len() == 7
+                            && shape
+                                .iter()
+                                .filter(|leaf| matches!(leaf, FastSumLeaf::Addend))
+                                .count()
+                                == 1
+                            && shape
+                                .iter()
+                                .filter(|leaf| matches!(leaf, FastSumLeaf::Difference))
+                                .count()
+                                == 2
+                    });
+                if stored_source_tree {
+                    continue;
+                }
+                let mut positive = Vec::new();
+                let mut negative = Vec::new();
+                let mut supported = true;
+                for (term, negate) in terms {
+                    let product = match &term.value {
+                        LlValue::Local(name) => fast_products.get(name),
+                        _ => None,
+                    };
+                    let sign = if let Some((a, b)) = product {
+                        let literals = [a, b]
+                            .into_iter()
+                            .filter_map(literal_is_negative)
+                            .collect::<Vec<_>>();
+                        if literals.len() != 1 {
+                            supported = false;
+                            break;
+                        }
+                        negate ^ literals[0]
+                    } else {
+                        negate
+                    };
+                    if sign {
+                        negative.push((term, negate));
+                    } else {
+                        positive.push((term, negate));
+                    }
+                }
+                let mut moved_accumulator = false;
+                if let Some(position) = positive.iter().position(|(term, _)| match &term.value {
+                    LlValue::Local(name) => {
+                        !fast_products.contains_key(name) && !fast_sum_values.contains_key(name)
+                    }
+                    _ => true,
+                }) {
+                    if position > 1 {
+                        let accumulator = positive.remove(position);
+                        positive.insert(1, accumulator);
+                        moved_accumulator = true;
+                    }
+                }
+                if supported && positive.len() >= 2 && negative.len() >= 2 {
+                    for (term, _) in positive.iter().chain(&negative) {
+                        let LlValue::Local(name) = &term.value else {
+                            continue;
+                        };
+                        if fast_sum_values
+                            .get(name)
+                            .is_some_and(|(subtract, _, _)| *subtract)
+                        {
+                            self.fast_grouped_sum_boundaries.insert(name.clone());
+                        }
+                    }
+                    self.fast_grouped_sums
+                        .insert(root.clone(), (positive, negative, moved_accumulator));
+                }
+            }
+            for (root, (lhs, rhs)) in &fast_add_values {
+                if nested_fast_adds.contains(root) {
+                    continue;
+                }
+                let mut terms = Vec::new();
+                let mut visiting = HashSet::new();
+                if !collect_fast_sum_terms(lhs, false, &fast_sum_values, &mut visiting, &mut terms)
+                    || !collect_fast_sum_terms(
+                        rhs,
+                        false,
+                        &fast_sum_values,
+                        &mut visiting,
+                        &mut terms,
+                    )
+                    || !matches!(terms.len(), 10 | 16)
+                {
+                    continue;
+                }
+                if terms.len() == 16 {
+                    let Some(shape) = terms
+                        .iter()
+                        .map(|(term, negate)| leaf_shape(term, *negate))
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        continue;
+                    };
+                    let Some(order) = sixteen_leaf_cancellation_order(&shape) else {
+                        continue;
+                    };
+                    let ordered = order
+                        .iter()
+                        .map(|index| terms[*index].0.clone())
+                        .collect::<Vec<_>>();
+                    self.fast_partitioned_sums
+                        .insert(root.clone(), vec![ordered]);
+                    continue;
+                }
+                let signs = terms
+                    .iter()
+                    .map(|(term, negate)| {
+                        let LlValue::Local(name) = &term.value else {
+                            return None;
+                        };
+                        let (lhs, rhs) = fast_products.get(name)?;
+                        [lhs, rhs]
+                            .into_iter()
+                            .find_map(literal_is_negative)
+                            .map(|negative| negative ^ negate)
+                    })
+                    .collect::<Vec<_>>();
+                let difference_products = terms
+                    .iter()
+                    .map(|(term, _)| {
+                        let LlValue::Local(name) = &term.value else {
+                            return false;
+                        };
+                        fast_products.get(name).is_some_and(|(lhs, rhs)| {
+                            [lhs, rhs].into_iter().any(|operand| {
+                                matches!(&operand.value, LlValue::Local(name) if fast_sum_values.get(name).is_some_and(|(subtract, _, _)| *subtract))
+                            })
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let accumulator_real_tree = difference_products.as_slice()
+                    == [
+                        false, false, false, false, false, false, true, false, true, true,
+                    ];
+                // Preserve the partitions selected by each typed cancellation topology. These
+                // predicates use only leaf operation kind and coefficient sign: direct products,
+                // products of source differences, and product differences retain distinct rounding
+                // boundaries independently of symbols and exact coefficient values.
+                let partitions: &[usize] = match signs.as_slice() {
+                    [Some(false), Some(false), _, Some(true), ..] => &[2, 6],
+                    [Some(false), Some(true), _, Some(true), ..] => &[1, 4],
+                    [None, Some(true), Some(true), Some(false), ..] if accumulator_real_tree => {
+                        &[2]
+                    }
+                    [None, Some(false), Some(true), Some(true), ..] if accumulator_real_tree => {
+                        &[3]
+                    }
+                    _ => continue,
+                };
+                let mut groups = Vec::with_capacity(partitions.len() + 1);
+                let mut start = 0;
+                for end in partitions
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once(terms.len()))
+                {
+                    groups.push(
+                        terms[start..end]
+                            .iter()
+                            .map(|(term, _)| term.clone())
+                            .collect(),
+                    );
+                    start = end;
+                }
+                self.fast_partitioned_sums.insert(root.clone(), groups);
+            }
             const EXPLICIT_FMA_CHAIN_MIN_TERMS: usize = 10;
             for result in fast_add_operands.keys() {
                 let mut chain = Vec::new();

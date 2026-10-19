@@ -5,7 +5,7 @@
 //! later rewrite cannot serialize a module that relies on `spirv-val` to discover broken ownership
 //! or typing.
 
-use crate::dominators::{build_predecessors, dominance, dominates_interval};
+use super::dominators::{build_predecessors, dominance, dominates_interval};
 use crate::spirv_module::{is_block_terminator, Function, Instruction, Operand};
 use spirv::{Op, Word};
 use std::collections::{HashMap, HashSet};
@@ -161,17 +161,6 @@ impl OwnedCfg {
             constructs,
             switches,
         })
-    }
-
-    /// The label id of a block, for a verdict that has to point a reader at a disassembly.
-    ///
-    /// `labels` is label -> index because every other caller asks that way; a verdict asks the
-    /// other way exactly twice, so it searches rather than the struct carrying a second map.
-    fn block_label(&self, block: usize) -> String {
-        self.labels
-            .iter()
-            .find_map(|(label, index)| (*index == block).then_some(format!("%{label}")))
-            .unwrap_or_else(|| format!("block {block}"))
     }
 
     fn dominates(&self, dominator: usize, node: usize) -> bool {
@@ -572,26 +561,14 @@ impl OwnedCfg {
             };
             if definition.block == block {
                 if definition.instruction >= instruction_index {
-                    return Err(format!(
-                        "native emitter: owned SSA value is used before its definition: {:?}{} \
-                         reads %{id}, which block {} defines below it",
-                        instruction.class.opcode,
-                        describe_result(instruction),
-                        self.block_label(block)
-                    ));
+                    return Err(
+                        "native emitter: owned SSA value is used before its definition".to_string(),
+                    );
                 }
             } else if self.flow_reachable[block] && !self.flow_dominates(definition.block, block) {
-                // Name the value, the consumer, and both blocks. The phase that breaks dominance is
-                // typically several phases upstream of the one that reports it, and without the id
-                // the only way to find it is to bisect the pipeline by hand.
-                return Err(format!(
-                    "native emitter: owned SSA definition does not dominate its use: {:?}{} in \
-                     block {} reads %{id}, which is defined in block {}",
-                    instruction.class.opcode,
-                    describe_result(instruction),
-                    self.block_label(block),
-                    self.block_label(definition.block)
-                ));
+                return Err(
+                    "native emitter: owned SSA definition does not dominate its use".to_string(),
+                );
             }
         }
         Ok(())
@@ -1788,27 +1765,16 @@ fn owned_function_call_contract_error(
             "native emitter: owned OpFunctionCall disagrees with its function type".to_string(),
         );
     }
-    for (position, (argument, parameter_type)) in arguments.iter().zip(parameter_types).enumerate()
-    {
+    for (argument, parameter_type) in arguments.iter().zip(parameter_types) {
         let (Operand::IdRef(argument), Operand::IdRef(parameter_type)) = (argument, parameter_type)
         else {
             return Err("native emitter: owned OpFunctionCall has malformed operands".to_string());
         };
         if value_types.get(argument) != Some(parameter_type) {
-            // Name the argument and both types, the same shape the same-type and access-chain
-            // contracts use. The opcode alone does not say which of a helper's arguments is wrong.
-            let described = match value_types.get(argument) {
-                Some(argument_type) => format!(
-                    "%{argument}, of type {}",
-                    describe_owned_id(*argument_type, definitions)
-                ),
-                None => format!("%{argument}, which has no value type"),
-            };
-            return Err(format!(
-                "native emitter: owned OpFunctionCall argument type disagrees with its function \
-                 type: argument {position} is {described}, but the parameter type is {}",
-                describe_owned_id(*parameter_type, definitions)
-            ));
+            return Err(
+                "native emitter: owned OpFunctionCall argument type disagrees with its function type"
+                    .to_string(),
+            );
         }
     }
     Ok(())
@@ -2557,49 +2523,8 @@ fn owned_memory_type_error(
         _ => return None,
     };
     if !valid {
-        // Name the pointer, what it points at, and the value type that disagrees. The opcode alone
-        // does not say which of a module's thousands of loads is wrong, and this verdict is the one
-        // the retry cascade reports when raw construction also fails -- the same reasoning as the
-        // same-type-class verdict above, rendered through the same `describe_owned_id`.
-        let describe_operand = |index: usize| match instruction.operands.get(index) {
-            Some(Operand::IdRef(id)) => match value_types.get(id) {
-                Some(ty) => format!("%{id}, of type {}", describe_owned_id(*ty, definitions)),
-                None => format!("%{id}, which has no value type"),
-            },
-            Some(operand) => format!("{operand:?}, which is not a value"),
-            None => "nothing -- the operand is missing".to_string(),
-        };
-        let describe_pointee = |index: usize| match pointer_pointee(index) {
-            Some(pointee) => describe_owned_id(pointee, definitions),
-            None => "no pointee -- it is not a pointer".to_string(),
-        };
-        let detail = match instruction.class.opcode {
-            Op::Load => format!(
-                "pointer {}, points at {}, but the result type is {}",
-                describe_operand(0),
-                describe_pointee(0),
-                match instruction.result_type {
-                    Some(result_type) => describe_owned_id(result_type, definitions),
-                    None => "absent".to_string(),
-                }
-            ),
-            Op::Store => format!(
-                "pointer {}, points at {}, but the stored value is {}",
-                describe_operand(0),
-                describe_pointee(0),
-                describe_operand(1)
-            ),
-            _ => format!(
-                "the target {}, points at {}, and the source {}, points at {}",
-                describe_operand(0),
-                describe_pointee(0),
-                describe_operand(1),
-                describe_pointee(1)
-            ),
-        };
         return Some(format!(
-            "native emitter: owned {:?} violates its pointer-pointee and value-type contract: \
-             {detail}",
+            "native emitter: owned {:?} violates its pointer-pointee and value-type contract",
             instruction.class.opcode
         ));
     }
@@ -2842,24 +2767,17 @@ fn owned_pointer_construction_error(
         | Op::AtomicFAddEXT
         | Op::AtomicFMinEXT
         | Op::AtomicFMaxEXT => {
-            if let Some((
-                storage @ (spirv::StorageClass::Private | spirv::StorageClass::Function),
-                _,
-            )) = operand_type(0).and_then(|ty| pointer_type_shape(ty, definitions))
-            {
-                // Name the pointer and the class it is in. Both classes reach here for different
-                // reasons -- a `Private` one is usually an unmodelled placeholder that leaked into
-                // an atomic, a `Function` one an alloca the atomic lowering did not promote -- and
-                // the shared wording cannot be told apart without the operand.
-                let pointer = match instruction.operands.first() {
-                    Some(Operand::IdRef(pointer)) => describe_owned_id(*pointer, definitions),
-                    _ => "an operand that is not a value".to_string(),
-                };
-                return Some(format!(
-                    "native emitter: owned {:?} pointer {pointer} has the non-atomic storage \
-                     class {storage:?}",
-                    instruction.class.opcode
-                ));
+            if matches!(
+                operand_type(0).and_then(|ty| pointer_type_shape(ty, definitions)),
+                Some((
+                    spirv::StorageClass::Private | spirv::StorageClass::Function,
+                    _
+                ))
+            ) {
+                return Some(
+                    "native emitter: owned atomic pointer has a non-atomic storage class"
+                        .to_string(),
+                );
             }
         }
         Op::ConstantNull if logical => {
@@ -2916,15 +2834,6 @@ struct OwnedAccessChainFailure {
 /// kinds that do not survive as a short literal are dropped rather than debug-printed, so the
 /// rendering stays one line, and a long operand list is elided: a wide `OpTypeStruct` or a phi with
 /// many arms would otherwise bury the sentence the message is trying to say.
-/// ` %N` when an instruction has a result id, and nothing when it does not, so a verdict can name
-/// the consumer without a second sentence for the store/branch case.
-fn describe_result(instruction: &Instruction) -> String {
-    instruction
-        .result_id
-        .map(|result| format!(" %{result}"))
-        .unwrap_or_default()
-}
-
 fn describe_owned_id(id: Word, definitions: &HashMap<Word, &Instruction>) -> String {
     /// Enough operands to recognize a type or an instruction by, and few enough to read.
     const SHOWN_OPERANDS: usize = 8;
@@ -3486,23 +3395,6 @@ fn owned_sample_operation_error(
             )
         })
     };
-    // `Grad` supplies the explicit derivatives Metal's `gradient2d(dPdx, dPdy)` carries: one float
-    // vector per spatial axis of the image, with the array layer excluded on both.
-    let grad_valid = |dx: Word, dy: Word| {
-        let shape = |value: Word| {
-            value_types
-                .get(&value)
-                .and_then(|ty| numeric_type_shape(*ty, definitions))
-        };
-        matches!(
-            (spatial_lanes, shape(dx), shape(dy)),
-            (
-                Some(spatial_lanes),
-                Some((Op::TypeFloat, 32, dx_lanes)),
-                Some((Op::TypeFloat, 32, dy_lanes)),
-            ) if dx_lanes == spatial_lanes && dy_lanes == spatial_lanes
-        )
-    };
     let tail = if instruction.class.opcode == Op::ImageGather {
         instruction.operands.get(3..)
     } else {
@@ -3516,19 +3408,6 @@ fn owned_sample_operation_error(
                 [Operand::ImageOperands(spirv::ImageOperands::CONST_OFFSET), Operand::IdRef(offset)],
             ),
         ) => offset_valid(*offset),
-        // `Bias` is Metal's `sample(..., bias(b))`: one scalar float shifting the level the
-        // derivatives give, so it rides the implicit-LOD instruction the way `Lod` rides the
-        // explicit one. SPIR-V accepts it nowhere else.
-        (
-            Op::ImageSampleImplicitLod,
-            Some([Operand::ImageOperands(spirv::ImageOperands::BIAS), Operand::IdRef(bias)]),
-        ) => lod_valid(*bias),
-        (
-            Op::ImageSampleImplicitLod,
-            Some([Operand::ImageOperands(mask), Operand::IdRef(bias), Operand::IdRef(offset)]),
-        ) if *mask == (spirv::ImageOperands::BIAS | spirv::ImageOperands::CONST_OFFSET) => {
-            lod_valid(*bias) && offset_valid(*offset)
-        }
         (
             Op::ImageSampleExplicitLod,
             Some([Operand::ImageOperands(spirv::ImageOperands::LOD), Operand::IdRef(lod)]),
@@ -3538,20 +3417,6 @@ fn owned_sample_operation_error(
             Some([Operand::ImageOperands(mask), Operand::IdRef(lod), Operand::IdRef(offset)]),
         ) if *mask == (spirv::ImageOperands::LOD | spirv::ImageOperands::CONST_OFFSET) => {
             lod_valid(*lod) && offset_valid(*offset)
-        }
-        (
-            Op::ImageSampleExplicitLod,
-            Some(
-                [Operand::ImageOperands(spirv::ImageOperands::GRAD), Operand::IdRef(dx), Operand::IdRef(dy)],
-            ),
-        ) => grad_valid(*dx, *dy),
-        (
-            Op::ImageSampleExplicitLod,
-            Some(
-                [Operand::ImageOperands(mask), Operand::IdRef(dx), Operand::IdRef(dy), Operand::IdRef(offset)],
-            ),
-        ) if *mask == (spirv::ImageOperands::GRAD | spirv::ImageOperands::CONST_OFFSET) => {
-            grad_valid(*dx, *dy) && offset_valid(*offset)
         }
         _ => false,
     };
@@ -3849,30 +3714,14 @@ fn owned_value_instruction_error(
         let Some(result_type) = instruction.result_type else {
             return Ok(());
         };
-        if let Some((position, operand)) = instruction
+        if instruction
             .operands
             .iter()
-            .enumerate()
-            .find(|(_, operand)| operand_type(operand) != Some(result_type))
+            .any(|operand| operand_type(operand) != Some(result_type))
         {
-            // Name the operand that disagrees and both types. A module that reaches this check has
-            // hundreds of same-class instructions and the opcode alone does not say which one to
-            // look at; `describe_owned_id` renders the same shape the access-chain contract uses.
-            let described = match operand {
-                Operand::IdRef(value) => match value_types.get(value) {
-                    Some(operand_type) => format!(
-                        "%{value}, of type {}",
-                        describe_owned_id(*operand_type, definitions)
-                    ),
-                    None => format!("%{value}, which has no value type"),
-                },
-                operand => format!("{operand:?}, which is not a value"),
-            };
             return Err(format!(
-                "native emitter: owned {:?} operands do not match its result type: operand \
-                 {position} is {described}, but the result type is {}",
-                instruction.class.opcode,
-                describe_owned_id(result_type, definitions)
+                "native emitter: owned {:?} operands do not match its result type",
+                instruction.class.opcode
             ));
         }
         let scalar_opcode = scalar_type_shape(result_type, definitions).map(|(opcode, _)| opcode);
@@ -4040,15 +3889,10 @@ fn owned_value_instruction_error(
         if !is_pointer(source_type) && !is_pointer(result_type) {
             let source_shape = numeric_type_shape(source_type, definitions);
             let result_shape = numeric_type_shape(result_type, definitions);
-            // An `OpBitcast` whose source and result types are the SAME id is a no-op, not an
-            // error: `spirv-val --target-env vulkan1.2` accepts it. Distinct AIR types share one
-            // SPIR-V storage type here -- `BFloat` interns as `Int(16)`, and an illegal integer
-            // width interns as its legal container (`storage_type` in `emitter/types.rs`) -- so a
-            // `bitcast <4 x bfloat> to <4 x i16>` reaches this check with one id on both sides.
-            // Only a NUMERIC shape is accepted, so a struct/array source and result still fail
-            // below on their absent shape.
             let valid = match (source_shape, result_shape) {
-                (Some((_, source_width, source_lanes)), Some((_, result_width, result_lanes))) => {
+                (Some((_, source_width, source_lanes)), Some((_, result_width, result_lanes)))
+                    if source_type != result_type =>
+                {
                     if source_lanes == result_lanes {
                         source_width == result_width
                     } else {
@@ -4266,11 +4110,6 @@ fn owned_value_instruction_error(
                     .to_string(),
             );
         }
-        // A pointer-typed result is not exempt from "both objects match Result Type" -- it is
-        // checked by `owned_pointer_construction_error`, which applies the same predicate and then
-        // goes on to the cross-root rule Logical addressing adds on top of it. Repeating it here
-        // only preempts that arm's more specific verdict with this one's generic wording; measured
-        // 0 of 14,579 corpus sources and 0 of 136 public fixtures change status either way.
         let result_is_pointer = definitions
             .get(&result_type)
             .is_some_and(|definition| definition.class.opcode == Op::TypePointer);
@@ -4283,24 +4122,6 @@ fn owned_value_instruction_error(
         }
     }
     Ok(())
-}
-
-/// The capability a scalar type of `width` bits demands, or `None` when the width is the one every
-/// Vulkan implementation has. `Op::TypeInt`/`Op::TypeFloat` only.
-///
-/// One table, read in both directions: the owned-module check below refuses a module that declares
-/// such a type without the capability, and `passes::drop_unused_scalar_width_capabilities` drops
-/// the capability from a module that declares no such type. Two derivations of one fact is how a
-/// declared-but-unused `Int8` survived in 656 of the 14,579 corpus sources, so there is one.
-pub(crate) fn scalar_width_capability(opcode: Op, width: u32) -> Option<spirv::Capability> {
-    match (opcode, width) {
-        (Op::TypeInt, 8) => Some(spirv::Capability::Int8),
-        (Op::TypeInt, 16) => Some(spirv::Capability::Int16),
-        (Op::TypeInt, 64) => Some(spirv::Capability::Int64),
-        (Op::TypeFloat, 16) => Some(spirv::Capability::Float16),
-        (Op::TypeFloat, 64) => Some(spirv::Capability::Float64),
-        _ => None,
-    }
 }
 
 fn vector_type_shape(ty: Word, definitions: &HashMap<Word, &Instruction>) -> Option<(Word, u32)> {
@@ -5110,16 +4931,6 @@ fn owned_module_environment_error(module: &crate::spirv_module::Module) -> Resul
                     continue;
                 }
                 if requirement.extensions.is_empty() {
-                    // An enumerant the grammar gates on CAPABILITIES ALONE -- no core version, no
-                    // extension of its own -- is available exactly when one of them is declared,
-                    // which the check above already settled. The extension that introduced the
-                    // capability is required by the capability, not by this operand. Every
-                    // `FPFastMathMode` bit past `AllowContract` is spelled that way, and demanding
-                    // a core version of them refused 25 corpus modules whose float instructions
-                    // withhold a relaxation the SPIR-V 1.4 core grammar has no word for.
-                    if !requirement.capabilities.is_empty() {
-                        continue;
-                    }
                     return Err(format!(
                         "native emitter: owned {:?} operand is unavailable in SPIR-V {}.{}",
                         instruction.class.opcode, version.0, version.1
@@ -5146,34 +4957,35 @@ fn owned_module_environment_error(module: &crate::spirv_module::Module) -> Resul
         {
             return Err("native emitter: owned OpTypeInt has invalid signedness".to_string());
         }
-        let width = match (instruction.class.opcode, instruction.operands.as_slice()) {
-            (Op::TypeInt, [Operand::LiteralBit32(width), Operand::LiteralBit32(_)])
-            | (Op::TypeFloat, [Operand::LiteralBit32(width)]) => Some(*width),
-            (Op::TypeInt, _) => {
-                return Err(
-                    "native emitter: owned OpTypeInt has an unsupported scalar width".to_string(),
-                );
-            }
-            (Op::TypeFloat, _) => {
-                return Err(
-                    "native emitter: owned OpTypeFloat has an unsupported scalar width".to_string(),
-                );
-            }
-            _ => None,
-        };
-        if let Some(width) = width {
-            if !matches!(
-                (instruction.class.opcode, width),
-                (Op::TypeInt, 8 | 16 | 32 | 64) | (Op::TypeFloat, 16 | 32 | 64)
-            ) {
-                return Err(format!(
-                    "native emitter: owned {:?} has an unsupported scalar width",
-                    instruction.class.opcode
-                ));
-            }
-        }
         let required_scalar_capability =
-            width.and_then(|width| scalar_width_capability(instruction.class.opcode, width));
+            match (instruction.class.opcode, instruction.operands.as_slice()) {
+                (Op::TypeInt, [Operand::LiteralBit32(8), Operand::LiteralBit32(_)]) => {
+                    Some(spirv::Capability::Int8)
+                }
+                (Op::TypeInt, [Operand::LiteralBit32(16), Operand::LiteralBit32(_)]) => {
+                    Some(spirv::Capability::Int16)
+                }
+                (Op::TypeInt, [Operand::LiteralBit32(32), Operand::LiteralBit32(_)]) => None,
+                (Op::TypeInt, [Operand::LiteralBit32(64), Operand::LiteralBit32(_)]) => {
+                    Some(spirv::Capability::Int64)
+                }
+                (Op::TypeInt, _) => {
+                    return Err(
+                        "native emitter: owned OpTypeInt has an unsupported scalar width"
+                            .to_string(),
+                    );
+                }
+                (Op::TypeFloat, [Operand::LiteralBit32(16)]) => Some(spirv::Capability::Float16),
+                (Op::TypeFloat, [Operand::LiteralBit32(32)]) => None,
+                (Op::TypeFloat, [Operand::LiteralBit32(64)]) => Some(spirv::Capability::Float64),
+                (Op::TypeFloat, _) => {
+                    return Err(
+                        "native emitter: owned OpTypeFloat has an unsupported scalar width"
+                            .to_string(),
+                    );
+                }
+                _ => None,
+            };
         if required_scalar_capability.is_some_and(|capability| !capabilities.contains(&capability))
         {
             return Err(format!(
@@ -7053,17 +6865,6 @@ mod tests {
         ));
         assert!(owned_module_failure(&valid_bitcast).is_none());
 
-        // Identity bitcast: `Some(16)` is `vec2<int32>` and id 21 is an Undef of that same type.
-        // `bitcast <4 x bfloat> to <4 x i16>` arrives in exactly this shape because BFloat interns
-        // as its Int(16) storage, and `spirv-val --target-env vulkan1.2` accepts it.
-        let identity_bitcast = module_with_composite_instruction(Instruction::new(
-            Op::Bitcast,
-            Some(16),
-            Some(40),
-            vec![Operand::IdRef(21)],
-        ));
-        assert!(owned_module_failure(&identity_bitcast).is_none());
-
         let valid_shift = module_with_composite_instruction(Instruction::new(
             Op::ShiftLeftLogical,
             Some(16),
@@ -8306,42 +8107,31 @@ mod tests {
 
     #[test]
     fn owned_module_enforces_memory_type_contracts() {
-        // Each verdict names the pointer, what it points at, and the value type that disagrees.
-        // A module reaching this check has thousands of loads and the opcode alone does not say
-        // which one to look at -- and this is the verdict the retry cascade reports when raw
-        // construction fails too, so it is often the only thing a reader gets.
-        for (instruction, expected) in [
-            (
-                Instruction::new(Op::Load, Some(15), Some(40), vec![Operand::IdRef(33)]),
-                "native emitter: owned Load violates its pointer-pointee and value-type contract: \
-                 pointer %33, of type %14 (TypePointer Function %12), points at %12 \
-                 (TypeInt 32 0), but the result type is %15 (TypeFloat 32)",
+        let expected = |opcode| {
+            format!(
+                "native emitter: owned {opcode:?} violates its pointer-pointee and value-type contract"
+            )
+        };
+        for instruction in [
+            Instruction::new(Op::Load, Some(15), Some(40), vec![Operand::IdRef(33)]),
+            Instruction::new(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(33), Operand::IdRef(36)],
             ),
-            (
-                Instruction::new(
-                    Op::Store,
-                    None,
-                    None,
-                    vec![Operand::IdRef(33), Operand::IdRef(36)],
-                ),
-                "native emitter: owned Store violates its pointer-pointee and value-type contract: \
-                 pointer %33, of type %14 (TypePointer Function %12), points at %12 \
-                 (TypeInt 32 0), but the stored value is %36, of type %15 (TypeFloat 32)",
-            ),
-            (
-                Instruction::new(
-                    Op::CopyMemory,
-                    None,
-                    None,
-                    vec![Operand::IdRef(33), Operand::IdRef(35)],
-                ),
-                "native emitter: owned CopyMemory violates its pointer-pointee and value-type \
-                 contract: the target %33, of type %14 (TypePointer Function %12), points at \
-                 %12 (TypeInt 32 0), and the source %35, of type %16 (TypePointer Function %15), \
-                 points at %15 (TypeFloat 32)",
+            Instruction::new(
+                Op::CopyMemory,
+                None,
+                None,
+                vec![Operand::IdRef(33), Operand::IdRef(35)],
             ),
         ] {
-            assert_owned_type_construction(&module_with_memory_instruction(instruction), expected);
+            let opcode = instruction.class.opcode;
+            assert_owned_type_construction(
+                &module_with_memory_instruction(instruction),
+                &expected(opcode),
+            );
         }
         assert_owned_type_construction(
             &module_with_memory_instruction(Instruction::new(
@@ -8404,10 +8194,7 @@ mod tests {
         ));
         assert_owned_type_construction(
             &invalid,
-            "native emitter: owned CopyMemory violates its pointer-pointee and value-type \
-             contract: the target %33, of type %14 (TypePointer Function %12), points at \
-             %12 (TypeInt 32 0), and the source %35, of type %16 (TypePointer Function %15), \
-             points at %15 (TypeFloat 32)",
+            "native emitter: owned CopyMemory violates its pointer-pointee and value-type contract",
         );
         assert_owned_type_construction(
             &invalid_alignment,
@@ -8566,8 +8353,7 @@ mod tests {
         ));
         assert_owned_type_construction(
             &atomic,
-            "native emitter: owned AtomicLoad pointer %33 (Variable Function) has the \
-             non-atomic storage class Function",
+            "native emitter: owned atomic pointer has a non-atomic storage class",
         );
 
         let pointer_select = |left, right| {
@@ -9109,20 +8895,8 @@ mod tests {
         );
     }
 
-    /// The owned derivative check is the ONLY thing that rejects this module.
-    ///
-    /// Every sibling in this family names a rule `spirv-val` also enforces, so the owned check is a
-    /// faster diagnosis of a failure the validator would catch anyway. This one is not. Before
-    /// SPIR-V 1.6 and `SPV_KHR_compute_shader_derivatives` a derivative instruction is valid only
-    /// under the Fragment execution model, and a Vulkan 1.2 target has neither -- but measured
-    /// against SPIRV-Tools v2026.3, `spirv-val` accepts `OpFwidth` reachable from a `GLCompute`
-    /// entry point under every target environment from `vulkan1.0` through `vulkan1.3`. The
-    /// assertion here is therefore the opposite of its siblings': it pins the validator's silence,
-    /// so that the day the gap closes this test says so rather than the owned check quietly becoming
-    /// redundant. What the owned check rejects is covered by
-    /// `owned_module_rejects_derivatives_from_non_fragment_call_trees` above.
     #[test]
-    fn owned_derivative_execution_model_check_is_not_backed_by_vulkan_validation() {
+    fn owned_derivative_execution_model_check_matches_vulkan_validation() {
         let module = module_with_composite_instruction(Instruction::new(
             Op::Fwidth,
             Some(15),
@@ -9145,10 +8919,8 @@ mod tests {
         let validation = crate::tools::spirv_val_bytes(&bytes, &tmp);
         let _ = std::fs::remove_dir(&tmp);
         assert!(
-            validation.is_ok(),
-            "spirv-val now rejects a derivative reachable from GLCompute, so the owned check has a \
-             second line of defence behind it; say so here rather than leaving this note stale: \
-             {validation:?}"
+            validation.is_err(),
+            "spirv-val must reject a derivative reachable from GLCompute"
         );
     }
 
@@ -10258,9 +10030,7 @@ mod tests {
         assert_eq!(
             owned_module_cfg_error(&wrong_argument).as_deref(),
             Some(
-                "native emitter: owned OpFunctionCall argument type disagrees with its function \
-                 type: argument 0 is %13, of type %12 (TypeInt 32 0), but the parameter type is \
-                 %9 (TypeBool)"
+                "native emitter: owned OpFunctionCall argument type disagrees with its function type"
             )
         );
 
@@ -10508,10 +10278,7 @@ mod tests {
 
         assert_eq!(
             owned_module_cfg_error(&module).as_deref(),
-            Some(
-                "native emitter: owned SSA definition does not dominate its use: CopyObject %23 \
-                 in block %4 reads %22, which is defined in block %2"
-            )
+            Some("native emitter: owned SSA definition does not dominate its use")
         );
     }
 
@@ -10524,10 +10291,7 @@ mod tests {
 
         assert_eq!(
             owned_module_cfg_error(&module).as_deref(),
-            Some(
-                "native emitter: owned SSA value is used before its definition: CopyObject %23 \
-                 reads %22, which block %1 defines below it"
-            )
+            Some("native emitter: owned SSA value is used before its definition")
         );
     }
 

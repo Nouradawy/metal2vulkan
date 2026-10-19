@@ -16,27 +16,6 @@ use crate::{disassemble, meta, tools};
 use spirv::{Decoration, Op, Scope, SelectionControl, StorageClass, Word};
 use std::collections::{HashMap, HashSet};
 
-/// Translate a tile kernel whose imageblock is one cell.
-///
-/// `air.write_imageblock_slice_to_texture_*` copies the whole imageblock region to the texture, and
-/// this translator emits one `OpImageWrite` of the single cell the pointer names -- exact when, and
-/// only when, the region is one cell. The imageblock extent is the kernel's local size, so these
-/// slice-write shape tests state the extent at which the lowering they pin down is the answer.
-fn translate_one_cell_tile(
-    san_ll: &str,
-    stage: Stage,
-    tmp: &std::path::Path,
-) -> Result<Vec<u8>, String> {
-    crate::translate_sanitized_native_with_options(san_ll, stage, tmp, one_cell_tile_options())
-}
-
-fn one_cell_tile_options() -> passes::TransformOptions {
-    passes::TransformOptions {
-        kernel_local_size: [1, 1, 1],
-        ..passes::TransformOptions::default()
-    }
-}
-
 fn runtime_sampler_state(
     coordinates: crate::reflect::SamplerCoordinates,
     filter: crate::reflect::SamplerFilter,
@@ -948,7 +927,9 @@ attributes #3 = { convergent nounwind memory(argmem: write) }
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("Binding 480"), "{asm}");
-    assert!(asm.contains("Binding 481"), "{asm}");
+    // The second field is never written, so nothing consumes its handle and no descriptor is
+    // declared for it.
+    assert!(!asm.contains("Binding 481"), "{asm}");
     assert_eq!(asm.matches("OpImageWrite").count(), 1, "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -1151,17 +1132,24 @@ declare i1 @air.is_null_texture_2d(ptr addrspace(1))
 fn native_kernel_texture_sampler_metadata_bindings() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
-define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler) {
+define void @k(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, ptr addrspace(1) %out) {
 entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, <2 x float> zeroinitializer)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  %x = extractelement <4 x float> %color, i64 0
+  store float %x, ptr addrspace(1) %out, align 4
   ret void
 }
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
 
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !4}
-!3 = !{i32 0, !"air.texture", !"air.location_index", i32 5, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"tex"}
+!2 = !{!3, !4, !5}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 5, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
 !4 = !{i32 1, !"air.sampler", !"air.location_index", i32 2, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
+!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_kernel_texture_sampler_{}",
@@ -1236,23 +1224,179 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
     let _ = std::fs::remove_dir_all(tmp);
 }
 
+/// CoreImage's stitched kernels carry each texture and sampler through a two-level by-value
+/// aggregate -- `Sampler_h { texture2d { ptr }, sampler { ptr }, .. }` -- built by one helper and
+/// taken apart field by field in another. The pointer inside the nested member has to survive the
+/// outer extract: before it did, the sample's sampler resolved to the aggregate's integer payload
+/// slot, the image pass substituted its synthesized `get_read_sampler` default (an extra binding
+/// no reflection names), and the device bound a normalized default in place of the guest's
+/// sampler. On macOS 26 that emptied every System Settings sidebar glyph.
+///
+/// Two textures and two samplers, so neither side can be satisfied by a "the only sampled image"
+/// fallback: each `OpSampledImage` must pair texture N with sampler N, and no sampler binding may
+/// exist beyond the two the kernel declares (Metal indices 0 and 2, bindings 160 and 162).
 #[test]
-fn native_texture_and_sampler_binding_bands_cover_high_and_last_abi_indices() {
+fn native_nested_aggregate_sampler_and_texture_reach_their_descriptors() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
-define void @k(ptr addrspace(1) %tex40, ptr addrspace(1) %tex127, ptr addrspace(2) %sampler8, ptr addrspace(2) %sampler15) {
+%"struct.metal::texture2d" = type { ptr addrspace(1) }
+%"struct.metal::sampler" = type { ptr addrspace(2) }
+%SamplerH = type { %"struct.metal::texture2d", %"struct.metal::sampler", <2 x float> }
+
+define void @k(ptr addrspace(1) %tex0, ptr addrspace(1) %tex1, ptr addrspace(2) %samp0, ptr addrspace(2) %samp2, ptr addrspace(1) %out) {
 entry:
+  %h0 = call fastcc %SamplerH @builder(ptr addrspace(1) %tex0, ptr addrspace(2) %samp0, <2 x float> <float 2.500000e-01, float 2.500000e-01>)
+  %h1 = call fastcc %SamplerH @builder(ptr addrspace(1) %tex1, ptr addrspace(2) %samp2, <2 x float> <float 7.500000e-01, float 7.500000e-01>)
+  %c0 = call fastcc <4 x float> @apply(%SamplerH %h0)
+  %c1 = call fastcc <4 x float> @apply(%SamplerH %h1)
+  %sum = fadd <4 x float> %c0, %c1
+  store <4 x float> %sum, ptr addrspace(1) %out, align 16
   ret void
 }
+
+define internal fastcc %SamplerH @builder(ptr addrspace(1) %t, ptr addrspace(2) %s, <2 x float> %uv) {
+  %a = insertvalue %SamplerH poison, ptr addrspace(1) %t, 0, 0
+  %b = insertvalue %SamplerH %a, ptr addrspace(2) %s, 1, 0
+  %c = insertvalue %SamplerH %b, <2 x float> %uv, 2
+  ret %SamplerH %c
+}
+
+define internal fastcc <4 x float> @apply(%SamplerH %h) {
+  %t = extractvalue %SamplerH %h, 0
+  %s = extractvalue %SamplerH %h, 1
+  %uv = extractvalue %SamplerH %h, 2
+  %color = call fastcc <4 x float> @sample(%"struct.metal::texture2d" %t, %"struct.metal::sampler" %s, <2 x float> %uv)
+  ret <4 x float> %color
+}
+
+define internal fastcc <4 x float> @sample(%"struct.metal::texture2d" %t, %"struct.metal::sampler" %s, <2 x float> %uv) {
+  %tp = extractvalue %"struct.metal::texture2d" %t, 0
+  %sp = extractvalue %"struct.metal::sampler" %s, 0
+  %r = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tp, ptr addrspace(2) %sp, <2 x float> %uv, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
+  %color = extractvalue { <4 x float>, i8 } %r, 0
+  ret <4 x float> %color
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
 
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !4, !5, !6}
-!3 = !{i32 0, !"air.texture", !"air.location_index", i32 40, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"tex40"}
-!4 = !{i32 1, !"air.texture", !"air.location_index", i32 127, i32 1, !"air.read", !"air.arg_type_name", !"texture2d<float, read>", !"air.arg_name", !"tex127"}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex0"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex1"}
+!5 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"samp0"}
+!6 = !{i32 3, !"air.sampler", !"air.location_index", i32 2, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"samp2"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+"#;
+    let tmp = std::env::temp_dir().join(format!(
+        "metal2vulkan_nested_aggregate_sampler_{}",
+        std::process::id()
+    ));
+    let _ = std::fs::create_dir_all(&tmp);
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp)
+        .expect("translate sampler and texture carried through a nested aggregate");
+    let asm = disassemble(&spv).expect("disassemble");
+
+    // `%var` -> binding, then `%loaded` -> binding of the variable it loads.
+    let mut binding_of: HashMap<String, u32> = HashMap::new();
+    for line in asm.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if let ["OpDecorate", var, "Binding", binding] = words.as_slice() {
+            binding_of.insert((*var).to_string(), binding.parse().expect("binding"));
+        }
+    }
+    let mut loaded: HashMap<String, u32> = HashMap::new();
+    for line in asm.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        if let [result, "=", "OpLoad", _, pointer, ..] = words.as_slice() {
+            if let Some(binding) = binding_of.get(*pointer) {
+                loaded.insert((*result).to_string(), *binding);
+            }
+        }
+    }
+    let mut pairs: Vec<(u32, u32)> = asm
+        .lines()
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            match words.as_slice() {
+                [_, "=", "OpSampledImage", _, image, sampler] => Some((
+                    *loaded.get(*image).unwrap_or(&u32::MAX),
+                    *loaded.get(*sampler).unwrap_or(&u32::MAX),
+                )),
+                _ => None,
+            }
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let texture0 = crate::reflect::DescriptorLayout::default()
+        .sampled_texture_binding(0)
+        .expect("texture 0 binding");
+    let texture1 = crate::reflect::DescriptorLayout::default()
+        .sampled_texture_binding(1)
+        .expect("texture 1 binding");
+    let sampler0 = crate::reflect::DescriptorLayout::default()
+        .sampler_binding(0)
+        .expect("sampler 0 binding");
+    let sampler2 = crate::reflect::DescriptorLayout::default()
+        .sampler_binding(2)
+        .expect("sampler 2 binding");
+    assert_eq!(
+        pairs,
+        vec![(texture0, sampler0), (texture1, sampler2)],
+        "{asm}"
+    );
+    let sampler_bindings: HashSet<u32> = binding_of
+        .values()
+        .copied()
+        .filter(|binding| {
+            let layout = crate::reflect::DescriptorLayout::default();
+            (layout.samplers.start..layout.samplers.end).contains(binding)
+        })
+        .collect();
+    assert_eq!(
+        sampler_bindings,
+        HashSet::from([sampler0, sampler2]),
+        "no synthesized sampler may appear beside the two the kernel declares:\n{asm}"
+    );
+    if std::process::Command::new("spirv-val")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
+    }
+    let _ = std::fs::remove_dir_all(tmp);
+}
+
+#[test]
+fn native_texture_and_sampler_binding_bands_cover_high_and_last_abi_indices() {
+    let ll = r#"
+target triple = "spirv-unknown-vulkan1.2"
+define void @k(ptr addrspace(1) %tex40, ptr addrspace(1) %tex127, ptr addrspace(2) %sampler8, ptr addrspace(2) %sampler15, ptr addrspace(1) %out) {
+entry:
+  %a = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex40, ptr addrspace(2) %sampler8, <2 x float> zeroinitializer)
+  %b = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex127, ptr addrspace(2) %sampler15, <2 x float> zeroinitializer)
+  %ac = extractvalue { <4 x float>, i8 } %a, 0
+  %bc = extractvalue { <4 x float>, i8 } %b, 0
+  %sum = fadd <4 x float> %ac, %bc
+  %x = extractelement <4 x float> %sum, i64 0
+  store float %x, ptr addrspace(1) %out, align 4
+  ret void
+}
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
+
+!air.kernel = !{!0}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4, !5, !6, !7}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 40, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex40"}
+!4 = !{i32 1, !"air.texture", !"air.location_index", i32 127, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex127"}
 !5 = !{i32 2, !"air.sampler", !"air.location_index", i32 8, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler8"}
 !6 = !{i32 3, !"air.sampler", !"air.location_index", i32 15, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler15"}
+!7 = !{i32 4, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_high_texture_sampler_bindings_{}",
@@ -1321,17 +1465,24 @@ target triple = "spirv-unknown-vulkan1.2"
 @dest_enabled = internal addrspace(2) global i8 1, align 1
 @source_enabled = internal addrspace(2) global i8 1, align 1
 
-define void @k(ptr addrspace(1) %dest, ptr addrspace(1) %source) {
+define void @k(ptr addrspace(1) %dest, ptr addrspace(1) %source, ptr addrspace(2) %sampler) {
 entry:
+  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %source, ptr addrspace(2) %sampler, <2 x float> zeroinitializer)
+  %color = extractvalue { <4 x float>, i8 } %sample, 0
+  tail call void @air.write_texture_2d.v4f32(ptr addrspace(1) %dest, <2 x i32> zeroinitializer, <4 x float> %color, i32 0, i32 2)
   ret void
 }
+
+declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>)
+declare void @air.write_texture_2d.v4f32(ptr addrspace(1), <2 x i32>, <4 x float>, i32, i32)
 
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !4}
+!2 = !{!3, !4, !7}
 !3 = !{i32 0, !"air.function_constant", !5, !"air.texture", !"air.location_index", ptr addrspace(2) @dest_location, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"dest"}
 !4 = !{i32 1, !"air.function_constant", !6, !"air.texture", !"air.location_index", ptr addrspace(2) @source_location, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"source"}
+!7 = !{i32 2, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"sampler"}
 !5 = !{ptr addrspace(2) @dest_enabled, !"bool", !"dest_enabled"}
 !6 = !{ptr addrspace(2) @source_enabled, !"bool", !"source_enabled"}
 "#;
@@ -1754,7 +1905,9 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
         crate::translate_sanitized_native_reflected(ll, Stage::Fragment, &tmp, options)
             .expect("fragment specialization");
     let asm = disassemble(&spv).expect("disassemble fragment specialization");
-    assert!(asm.contains("Binding 163"), "{asm}");
+    // Pixel sampling fetches texels and never uses the sampler, so no sampler descriptor is
+    // declared even though the runtime state is bound to Metal index 3.
+    assert!(!asm.contains("Binding 163"), "{asm}");
     assert!(asm.contains("OpSMod"), "{asm}");
     assert!(!asm.contains("OpSampledImage"), "{asm}");
     assert_eq!(
@@ -2116,310 +2269,6 @@ declare { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1), ptr addrspace(2
 }
 
 #[test]
-fn native_fragment_depth_sample_level_flag_selects_explicit_lod() {
-    // AIR always fills the level slot and says in the neighbouring `i1` whether it means anything.
-    // A fragment `sample()` that names `level(2)` must reach the mip it named, not the one the
-    // derivatives would pick.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant i64 -9188470239253757879, align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %depth) {
-entry:
-  %sample = tail call { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 0, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 true, float 2.000000e+00, float 0.000000e+00, i32 0)
-  %value = extractvalue { float, i8 } %sample, 0
-  %out0 = insertelement <4 x float> zeroinitializer, float %value, i32 0
-  ret <4 x float> %out0
-}
-
-declare { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!8}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>", !"air.arg_name", !"depth"}
-!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_fragment_depth_sample_explicit_level_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    let sample = asm
-        .lines()
-        .find(|line| line.contains("OpImageSampleExplicitLod"))
-        .expect("find OpImageSampleExplicitLod");
-    assert!(sample.contains("Lod"), "{sample}\n\n{asm}");
-    assert!(!asm.contains("OpImageSampleImplicitLod"), "{asm}");
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
-fn native_fragment_depth_sample_without_the_level_flag_stays_implicit() {
-    // The control for the test above: the same slot carrying the placeholder zero AIR writes for a
-    // plain `sample()` is not a level, and a fragment has the derivatives to pick one.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant i64 -9188470239253757879, align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %depth) {
-entry:
-  %sample = tail call { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 0, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %value = extractvalue { float, i8 } %sample, 0
-  %out0 = insertelement <4 x float> zeroinitializer, float %value, i32 0
-  ret <4 x float> %out0
-}
-
-declare { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!8}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>", !"air.arg_name", !"depth"}
-!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_fragment_depth_sample_implicit_level_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpImageSampleImplicitLod"), "{asm}");
-    assert!(!asm.contains("OpImageSampleExplicitLod"), "{asm}");
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
-fn native_fragment_depth_sample_constant_offset_reaches_the_sample() {
-    // A depth `sample()` with `int2(1, -1)` reads a neighbouring texel, so the offset has to be on
-    // the instruction rather than dropped.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant i64 -9188470239253757879, align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %depth) {
-entry:
-  %sample = tail call { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 0, <2 x float> %coord, i1 true, <2 x i32> <i32 1, i32 -1>, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %value = extractvalue { float, i8 } %sample, 0
-  %out0 = insertelement <4 x float> zeroinitializer, float %value, i32 0
-  ret <4 x float> %out0
-}
-
-declare { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!8}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>", !"air.arg_name", !"depth"}
-!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_fragment_depth_sample_const_offset_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    let sample = asm
-        .lines()
-        .find(|line| line.contains("OpImageSample"))
-        .expect("find the depth sample");
-    assert!(sample.contains("ConstOffset"), "{sample}\n\n{asm}");
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
-fn native_fragment_depth_sample_dynamic_offset_adjusts_the_coordinate() {
-    // A runtime offset cannot ride on the instruction, so it is normalized by the texture size and
-    // added to the coordinate -- the same route the colour path takes.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant i64 -9188470239253757879, align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %depth, ptr addrspace(1) %offsets) {
-entry:
-  %off = load <2 x i32>, ptr addrspace(1) %offsets, align 8
-  %sample = tail call { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 0, <2 x float> %coord, i1 true, <2 x i32> %off, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %value = extractvalue { float, i8 } %sample, 0
-  %out0 = insertelement <4 x float> zeroinitializer, float %value, i32 0
-  ret <4 x float> %out0
-}
-
-declare { float, i8 } @air.sample_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!8}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6, !7}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>", !"air.arg_name", !"depth"}
-!7 = !{i32 3, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"int2*", !"air.arg_name", !"offsets"}
-!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_fragment_depth_sample_dynamic_offset_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpImageQuerySizeLod"), "{asm}");
-    assert!(asm.contains("OpFDiv"), "{asm}");
-    assert!(asm.contains("OpFAdd"), "{asm}");
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
-fn native_fragment_compare_depth_constant_offset_reaches_the_sample() {
-    // A shadow tap that names `int2(1, -1)` reads a neighbouring texel. Dropping the offset makes
-    // every tap of a PCF cross read the same one, which is a filter that does not filter.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant i64 -9188470239253757879, align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %depth) {
-entry:
-  %s = tail call { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 0, <2 x float> %coord, float 5.000000e-01, i1 true, <2 x i32> <i32 1, i32 -1>, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %v = extractvalue { float, i8 } %s, 0
-  %o = insertelement <4 x float> zeroinitializer, float %v, i32 0
-  ret <4 x float> %o
-}
-
-declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, float, i1, <2 x i32>, i1, float, float, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!8}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>", !"air.arg_name", !"depth"}
-!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_compare_depth_const_offset_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    let sample = asm
-        .lines()
-        .find(|line| line.contains("OpImageSample"))
-        .expect("find the compare-depth sample");
-    assert!(sample.contains("ConstOffset"), "{sample}\n\n{asm}");
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
-fn native_fragment_compare_depth_dynamic_offset_adjusts_the_coordinate() {
-    // A runtime tap offset cannot ride on the instruction, so it is normalized by the texture size
-    // and added to the coordinate, exactly as the colour and depth-sample paths do.
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant i64 -9188470239253757879, align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %depth, ptr addrspace(1) %offs) {
-entry:
-  %off = load <2 x i32>, ptr addrspace(1) %offs, align 8
-  %s = tail call { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 0, <2 x float> %coord, float 5.000000e-01, i1 true, <2 x i32> %off, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %v = extractvalue { float, i8 } %s, 0
-  %o = insertelement <4 x float> zeroinitializer, float %v, i32 0
-  ret <4 x float> %o
-}
-
-declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, float, i1, <2 x i32>, i1, float, float, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!8}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6, !7}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d<float, sample>", !"air.arg_name", !"depth"}
-!7 = !{i32 3, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 8, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"int2*", !"air.arg_name", !"offs"}
-!8 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_compare_depth_dynamic_offset_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpImageQuerySizeLod"), "{asm}");
-    assert!(asm.contains("OpFDiv"), "{asm}");
-    assert!(asm.contains("OpFAdd"), "{asm}");
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
 fn native_kernel_pixel_linear_depth_sample_uses_four_addressed_fetches() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
@@ -2503,13 +2352,12 @@ declare { float, i8 } @air.sample_depth_2d_array.f32(ptr addrspace(1), ptr addrs
     let _ = std::fs::remove_dir_all(tmp);
 }
 
-/// A runtime `select` between two DIFFERENT embedded sampler states leaves the sampler operand
-/// pointer-shaped once the emitter's pointer-select fallback has run. Neither state survives, so
-/// there is nothing to sample with except the translator's own nearest/clamp default — which is a
-/// different filter and address mode than either state the shader asked for, in a module that
-/// otherwise validates, binds and reflects cleanly. Refuse instead of answering wrongly.
+/// A sample whose sampler is a `select` between two embedded `__air_sampler_state` globals. The
+/// native pointer-select fallback keeps no descriptor for the selected pointer, and the image pass
+/// used to answer that with its synthesized default read sampler: a valid module sampling with a
+/// filter neither constexpr state names. It is an honest FALLBACK now, naming the use.
 #[test]
-fn native_fragment_sampler_select_over_distinct_static_states_is_refused() {
+fn native_fragment_selected_static_sampler_refuses_the_default_substitute() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 
@@ -2518,9 +2366,7 @@ target triple = "spirv-unknown-vulkan1.2"
 
 define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex) {
 entry:
-  %edge = extractelement <2 x float> %coord, i64 0
-  %wide = fcmp oge float %edge, 1.000000e+00
-  %selected = select i1 %wide, ptr addrspace(2) @__air_sampler_state, ptr addrspace(2) @__air_sampler_state.1
+  %selected = select i1 true, ptr addrspace(2) @__air_sampler_state, ptr addrspace(2) @__air_sampler_state.1
   %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) %selected, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
   %color = extractvalue { <4 x float>, i8 } %sample, 0
   ret <4 x float> %color
@@ -2545,84 +2391,20 @@ declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr a
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let error = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp)
-        .expect_err("a sampler selected between two distinct states must not be answered");
+    let err = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp)
+        .expect_err("a selected constexpr sampler has no descriptor to sample through");
+    assert!(err.contains("Sample:"), "{err}");
     assert!(
-        error.contains("sampler operand is a pointer"),
-        "unexpected refusal: {error}"
+        err.contains("does not resolve to a Metal sampler argument"),
+        "{err}"
     );
     let _ = std::fs::remove_dir_all(tmp);
 }
 
-/// The one pointer-shaped sampler operand the translator may answer with its own default. A cube
-/// texel read that is also direction-sampled keeps `Dim Cube`, so it lowers to a nearest sample and
-/// needs a real `OpTypeSampler` — and AIR threads `air.get_read_sampler()` into it, which declares
-/// no state at all. The call has not been rewritten yet when the read lowers, so the operand still
-/// carries the AIR pointer type: this is what keeps the default substitution reachable, and what the
-/// selected-state refusals above must not take away.
+/// The depth-comparison form of the selected constexpr sampler: refused the same way, naming the
+/// comparison use.
 #[test]
-fn native_cube_read_through_air_read_sampler_uses_the_synthesized_default_sampler() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-define void @k(ptr addrspace(1) %cube, ptr addrspace(2) %smp, ptr addrspace(1) %out, <2 x i32> %gid) {
-entry:
-  %readsmp = tail call ptr addrspace(2) @air.get_read_sampler()
-  %read = tail call { <4 x float>, i8 } @air.read_texture_cube.i32.v4f32(ptr addrspace(1) %cube, ptr addrspace(2) %readsmp, <2 x i32> %gid, i32 0, i32 0, i32 0)
-  %texel = extractvalue { <4 x float>, i8 } %read, 0
-  %sample = tail call { <4 x float>, i8 } @air.sample_texture_cube.v4f32(ptr addrspace(1) %cube, ptr addrspace(2) %smp, <3 x float> <float 1.0, float 0.0, float 0.0>, i1 true, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %sampled = extractvalue { <4 x float>, i8 } %sample, 0
-  %sum = fadd <4 x float> %texel, %sampled
-  %x = extractelement <4 x float> %sum, i32 0
-  store float %x, ptr addrspace(1) %out, align 4
-  ret void
-}
-
-declare ptr addrspace(2) @air.get_read_sampler()
-declare { <4 x float>, i8 } @air.read_texture_cube.i32.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x i32>, i32, i32, i32)
-declare { <4 x float>, i8 } @air.sample_texture_cube.v4f32(ptr addrspace(1), ptr addrspace(2), <3 x float>, i1, float, float, i32)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !4, !5, !6}
-!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texturecube<float, sample>", !"air.arg_name", !"cube"}
-!4 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"smp"}
-!5 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
-!6 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_cube_read_default_sampler_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    // The cube stayed `Dim Cube`, so the read really did take the direction-sample path.
-    assert!(asm.contains("Cube 0 0 0 1 Unknown"), "{asm}");
-    assert_eq!(
-        asm.matches("OpImageSampleExplicitLod").count(),
-        2,
-        "both the cube read and the cube sample lower to explicit-LOD samples: {asm}"
-    );
-    // The declared sampler argument keeps the first sampler-band binding; the read's stateless
-    // placeholder is the synthesized one after it.
-    assert!(asm.contains("Binding 160"), "{asm}");
-    assert!(asm.contains("Binding 161"), "{asm}");
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-/// The same refusal on the compare-depth path: a shadow compare with the wrong address mode is a
-/// different silhouette, not a rounding difference.
-#[test]
-fn native_fragment_compare_depth_sampler_select_over_distinct_static_states_is_refused() {
+fn native_fragment_selected_static_sampler_compare_depth_refuses_the_default_substitute() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 
@@ -2659,11 +2441,12 @@ declare { float, i8 } @air.sample_compare_depth_2d.f32(ptr addrspace(1), ptr add
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let error = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp)
-        .expect_err("a sampler selected between two distinct states must not be answered");
+    let err = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp)
+        .expect_err("a selected constexpr sampler has no descriptor to sample through");
+    assert!(err.contains("DepthCompare:"), "{err}");
     assert!(
-        error.contains("sampler operand is a pointer"),
-        "unexpected refusal: {error}"
+        err.contains("does not resolve to a Metal sampler argument"),
+        "{err}"
     );
     let _ = std::fs::remove_dir_all(tmp);
 }
@@ -2715,304 +2498,6 @@ declare { float, i8 } @air.sample_compare_depth_2d_array.f32(ptr addrspace(1), p
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
-}
-
-#[test]
-fn native_fragment_sample_level_follows_the_flag_air_sets_beside_it() {
-    // The level slot is always present. `SLOT` splices the pair AIR writes into it: the flag and
-    // the value. `false, float 0.0` is a plain `sample()`; `true, float %lod` is `level(lod)`.
-    let scratch = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601038921, i64 0], align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex) {
-entry:
-  %lod = extractelement <4 x float> %position, i32 2
-  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, SLOT, float 0.000000e+00, i32 0)
-  %color = extractvalue { <4 x float>, i8 } %sample, 0
-  ret <4 x float> %color
-}
-
-declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!7}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
-!7 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_fragment_sample_level_flag_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-
-    let implicit = scratch.replace("SLOT", "i1 false");
-    assert_ne!(implicit, scratch, "the template has no level slot");
-    let asm = disassemble(
-        &crate::translate_sanitized_native(&implicit, Stage::Fragment, &tmp).expect("translate"),
-    )
-    .expect("disassemble");
-    assert!(
-        asm.contains("OpImageSampleImplicitLod"),
-        "a plain sample() picks its level from the fragment's derivatives: {asm}"
-    );
-    assert!(
-        !asm.contains("OpImageSampleExplicitLod"),
-        "the zero in the level slot is a placeholder, not a level: {asm}"
-    );
-
-    let explicit = scratch.replace("SLOT", "i1 true");
-    let asm = disassemble(
-        &crate::translate_sanitized_native(&explicit, Stage::Fragment, &tmp).expect("translate"),
-    )
-    .expect("disassemble");
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpImageSampleExplicitLod") && line.contains("Lod")),
-        "level(lod) is an explicit level: {asm}"
-    );
-
-    // Outside a fragment invocation there are no derivatives to pick a level from, so the same
-    // plain sample has to name one; Metal reads the base level there.
-    let vertex = implicit
-        .replace("!air.fragment = !{!0}", "!air.vertex = !{!0}")
-        .replace(
-            "!2 = !{!\"air.render_target\", i32 0, i32 0, !\"air.arg_type_name\", !\"float4\"}",
-            "!2 = !{!\"air.position\", !\"air.arg_type_name\", !\"float4\"}",
-        )
-        .replace(
-            "!5 = !{i32 1, !\"air.fragment_input\", !\"generated(coord)\", !\"air.center\", !\"air.perspective\", !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"coord\"}",
-            "!5 = !{i32 1, !\"air.vertex_input\", !\"air.location_index\", i32 1, !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"coord\"}",
-        )
-        .replace(
-            "!4 = !{i32 0, !\"air.position\", !\"air.center\", !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"position\"}",
-            "!4 = !{i32 0, !\"air.vertex_input\", !\"air.location_index\", i32 0, !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"position\"}",
-        );
-    let asm = disassemble(
-        &crate::translate_sanitized_native(&vertex, Stage::Vertex, &tmp).expect("translate"),
-    )
-    .expect("disassemble");
-    assert!(
-        !asm.contains("OpImageSampleImplicitLod"),
-        "a vertex invocation has no derivatives: {asm}"
-    );
-    assert!(
-        asm.contains("OpImageSampleExplicitLod"),
-        "the vertex sample still has to name a level: {asm}"
-    );
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
-fn native_fragment_sample_bias_reaches_the_implicit_level() {
-    // Metal spells `level(l)` and `bias(b)` into the same AIR slot and tells them apart with the
-    // `i1` beside it, so the flag that says "not a level" says "a bias". `SLOT` splices that pair.
-    let scratch = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601038921, i64 0], align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex) {
-entry:
-  %sample = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, i1 true, <2 x i32> zeroinitializer, SLOT, float 0.000000e+00, i32 0)
-  %color = extractvalue { <4 x float>, i8 } %sample, 0
-  ret <4 x float> %color
-}
-
-declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(2), <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!7}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"tex"}
-!7 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_fragment_sample_bias_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-
-    let biased = scratch.replace("SLOT", "i1 false, float -2.500000e-01");
-    assert_ne!(biased, scratch, "the template has no level slot");
-    let asm = disassemble(
-        &crate::translate_sanitized_native(&biased, Stage::Fragment, &tmp).expect("translate"),
-    )
-    .expect("disassemble");
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpImageSampleImplicitLod") && line.contains("Bias")),
-        "bias(b) shifts the level the derivatives give, so it rides the implicit sample: {asm}"
-    );
-    assert!(
-        !asm.contains("OpImageSampleExplicitLod"),
-        "a bias is not a level: {asm}"
-    );
-
-    // The zero AIR writes for a plain `sample()` sits in the same slot with the same flag. It is
-    // the identity bias, so naming it would put an image operand on every sample and change none.
-    let plain = scratch.replace("SLOT", "i1 false, float 0.000000e+00");
-    let asm = disassemble(
-        &crate::translate_sanitized_native(&plain, Stage::Fragment, &tmp).expect("translate"),
-    )
-    .expect("disassemble");
-    assert!(
-        asm.contains("OpImageSampleImplicitLod") && !asm.contains("Bias"),
-        "the zero placeholder is not a bias: {asm}"
-    );
-
-    // A level and a bias cannot both pick the level, and the flag picks between them.
-    let levelled = scratch.replace("SLOT", "i1 true, float -2.500000e-01");
-    let asm = disassemble(
-        &crate::translate_sanitized_native(&levelled, Stage::Fragment, &tmp).expect("translate"),
-    )
-    .expect("disassemble");
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpImageSampleExplicitLod") && line.contains("Lod")),
-        "the flag says this slot is a level: {asm}"
-    );
-    assert!(!asm.contains("Bias"), "a level is not a bias: {asm}");
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
-fn native_fragment_sample_level_slot_without_its_flag_is_neither() {
-    // A one-dimensional sample puts a scalar float where the level search looks, so the operand
-    // before the slot is what says the slot is a level slot at all. Replacing that `i1` with
-    // anything else is how the families that carry no level here read -- `sample_compare` puts its
-    // compare value in reach of the same search -- and the float must then be left alone.
-    let scratch = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601038921, i64 0], align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex) {
-entry:
-  %u = extractelement <2 x float> %coord, i32 0
-  %sample = tail call { <4 x float>, i8 } @air.sample_texture_1d.v4f32(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, float %u, i1 false, i32 0, FLAG, float 5.000000e-01, float 0.000000e+00, i32 0)
-  %color = extractvalue { <4 x float>, i8 } %sample, 0
-  ret <4 x float> %color
-}
-
-declare { <4 x float>, i8 } @air.sample_texture_1d.v4f32(ptr addrspace(1), ptr addrspace(2), float, i1, i32, FLAGTY, float, float, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!7}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture1d<float, sample>", !"air.arg_name", !"tex"}
-!7 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_fragment_sample_flagless_slot_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-
-    // With the flag, the half in that slot is the bias AIR says it is.
-    let flagged = scratch.replace("FLAGTY", "i1").replace("FLAG", "i1 false");
-    let asm = disassemble(
-        &crate::translate_sanitized_native(&flagged, Stage::Fragment, &tmp).expect("translate"),
-    )
-    .expect("disassemble");
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpImageSampleImplicitLod") && line.contains("Bias")),
-        "the flag says this slot is a bias: {asm}"
-    );
-
-    // Without it, the same float is some other family's operand and means nothing here.
-    let flagless = scratch.replace("FLAGTY", "i32").replace("FLAG", "i32 0");
-    let asm = disassemble(
-        &crate::translate_sanitized_native(&flagless, Stage::Fragment, &tmp).expect("translate"),
-    )
-    .expect("disassemble");
-    assert!(
-        asm.contains("OpImageSampleImplicitLod"),
-        "a slot with no flag leaves the sample implicit: {asm}"
-    );
-    assert!(
-        !asm.contains("Bias") && !asm.contains("OpImageSampleExplicitLod"),
-        "a float with no flag before it is neither a level nor a bias: {asm}"
-    );
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
-fn native_fragment_gradient_sample_carries_its_derivatives() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-
-@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601038921, i64 0], align 8
-
-define <4 x float> @frag(<4 x float> %position, <2 x float> %coord, ptr addrspace(1) %tex) {
-entry:
-  %dx = fmul <2 x float> %coord, <float 2.000000e+00, float 2.000000e+00>
-  %dy = fmul <2 x float> %coord, <float 4.000000e+00, float 4.000000e+00>
-  %sample = tail call { <4 x half>, i8 } @air.sample_texture_2d_grad.v4f16(ptr addrspace(1) %tex, ptr addrspace(2) @__air_sampler_state, <2 x float> %coord, <2 x float> %dx, <2 x float> %dy, float 0.000000e+00, i1 true, <2 x i32> zeroinitializer, i32 0)
-  %half4 = extractvalue { <4 x half>, i8 } %sample, 0
-  %color = fpext <4 x half> %half4 to <4 x float>
-  ret <4 x float> %color
-}
-
-declare { <4 x half>, i8 } @air.sample_texture_2d_grad.v4f16(ptr addrspace(1), ptr addrspace(2), <2 x float>, <2 x float>, <2 x float>, float, i1, <2 x i32>, i32)
-
-!air.fragment = !{!0}
-!air.sampler_states = !{!7}
-!0 = !{ptr @frag, !1, !3}
-!1 = !{!2}
-!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
-!3 = !{!4, !5, !6}
-!4 = !{i32 0, !"air.position", !"air.center", !"air.arg_type_name", !"float4", !"air.arg_name", !"position"}
-!5 = !{i32 1, !"air.fragment_input", !"generated(coord)", !"air.center", !"air.perspective", !"air.arg_type_name", !"float2", !"air.arg_name", !"coord"}
-!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<half, sample>", !"air.arg_name", !"tex"}
-!7 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_fragment_gradient_sample_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv =
-        crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("gradient translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    let sample = asm
-        .lines()
-        .find(|line| line.contains("OpImageSampleExplicitLod"))
-        .unwrap_or_else(|| panic!("a gradient sample names its level: {asm}"));
-    assert!(
-        sample.contains("Grad"),
-        "the derivatives Metal was handed choose the level: {sample}"
-    );
-    assert!(
-        !sample.contains(" Lod "),
-        "SPIR-V forbids the Lod image operand beside Grad: {sample}"
-    );
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -4185,87 +3670,60 @@ declare { <4 x float>, i8 } @air.gather_depth_2d.v4f32(ptr addrspace(1), ptr add
     }
 }
 
-/// `air.gather_depth_2d_array` takes its coordinate domain from the sampler, exactly as the
-/// non-array and colour gathers do. The `i1` operand beside the layer is `true` at every call site
-/// the frontend emits -- pixel sampler or normalized, offset or no offset -- so it names nothing.
-///
-/// A normalized sampler must reach `OpImageGather` with the layer as a third coordinate component.
-/// Reconstructing the footprint by fetching four texels at the raw coordinate instead reads
-/// `floor(u - 0.5)` texels out of a coordinate that is still in 0..1, which lands on texel 0 (or
-/// its clamp) for every gather in the middle of an image.
 #[test]
-fn native_gather_depth_2d_array_normalized_sampler_gathers() {
-    let spv = gather_depth_2d_array_spv(34901797601020416, "normalized");
-    let asm = disassemble(&spv).expect("disassemble");
-    let module = load_bytes(&spv).expect("load spv");
-    assert!(asm.contains("OpImageGather"), "{asm}");
-    // The layer rides in as the third component of the sampled coordinate.
-    assert!(asm.contains("OpConvertUToF"), "{asm}");
-    assert_eq!(image_fetch_count(&module), 0, "{asm}");
-    assert!(!asm.contains("OpFunctionCall"), "{asm}");
-}
-
-/// The mirror of [`native_gather_depth_2d_array_normalized_sampler_gathers`]: the same call with a
-/// pixel-coordinate sampler is the one that reconstructs Metal's four-texel footprint by hand,
-/// because a Vulkan sampler has no pixel-coordinate mode to gather through.
-#[test]
-fn native_gather_depth_2d_array_pixel_sampler_reconstructs_the_footprint() {
-    let spv = gather_depth_2d_array_spv(559_689, "pixel");
-    let asm = disassemble(&spv).expect("disassemble");
-    let module = load_bytes(&spv).expect("load spv");
-    assert_eq!(image_fetch_count(&module), 4, "{asm}");
-    assert!(asm.contains("OpImageQuerySizeLod"), "{asm}");
-    assert!(asm.contains(" Floor "), "{asm}");
-    assert!(!asm.contains("OpImageGather"), "{asm}");
-    assert!(!asm.contains("OpFunctionCall"), "{asm}");
-}
-
-fn image_fetch_count(module: &crate::spirv_module::Module) -> usize {
-    module
-        .functions
-        .iter()
-        .flat_map(|func| &func.blocks)
-        .flat_map(|block| &block.instructions)
-        .filter(|inst| inst.class.opcode == Op::ImageFetch)
-        .count()
-}
-
-/// Translate one `air.gather_depth_2d_array` call through a sampler with the given AIR state word.
-fn gather_depth_2d_array_spv(sampler_word: i64, label: &str) -> Vec<u8> {
-    let ll = format!(
-        r#"
+fn native_gather_depth_2d_array_uses_layer_coordinate() {
+    let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 
-@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 {sampler_word}, i64 0], align 8
+@__air_sampler_state = internal addrspace(2) constant [2 x i64] [i64 34901797601020416, i64 0], align 8
 
-define void @k(ptr addrspace(1) %depth, ptr addrspace(1) %out) {{
+define void @k(ptr addrspace(1) %depth, ptr addrspace(1) %out) {
 entry:
   %c0 = insertelement <2 x float> poison, float 5.000000e-01, i32 0
   %coord = insertelement <2 x float> %c0, float 5.000000e-01, i32 1
-  %gather = tail call {{ <4 x float>, i8 }} @air.gather_depth_2d_array.v4f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 1, <2 x float> %coord, i32 2, i1 true, <2 x i32> zeroinitializer, i32 0)
-  %values = extractvalue {{ <4 x float>, i8 }} %gather, 0
+  %gather = tail call { <4 x float>, i8 } @air.gather_depth_2d_array.v4f32(ptr addrspace(1) %depth, ptr addrspace(2) @__air_sampler_state, i32 1, <2 x float> %coord, i32 2, i1 true, <2 x i32> zeroinitializer, i32 0)
+  %values = extractvalue { <4 x float>, i8 } %gather, 0
   store <4 x float> %values, ptr addrspace(1) %out, align 16
   ret void
-}}
+}
 
-declare {{ <4 x float>, i8 }} @air.gather_depth_2d_array.v4f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i32, i1, <2 x i32>, i32)
+declare { <4 x float>, i8 } @air.gather_depth_2d_array.v4f32(ptr addrspace(1), ptr addrspace(2), i32, <2 x float>, i32, i1, <2 x i32>, i32)
 
-!air.kernel = !{{!0}}
-!air.sampler_states = !{{!5}}
-!0 = !{{ptr @k, !1, !2}}
-!1 = !{{}}
-!2 = !{{!3, !4}}
-!3 = !{{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d_array<float, sample>", !"air.arg_name", !"depth"}}
-!4 = !{{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}}
-!5 = !{{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}}
-"#
-    );
+!air.kernel = !{!0}
+!air.sampler_states = !{!5}
+!0 = !{ptr @k, !1, !2}
+!1 = !{}
+!2 = !{!3, !4}
+!3 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"depth2d_array<float, sample>", !"air.arg_name", !"depth"}
+!4 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4*", !"air.arg_name", !"out"}
+!5 = !{!"air.sampler_state", ptr addrspace(2) @__air_sampler_state}
+"#;
     let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_gather_depth_2d_array_{label}_{}",
+        "metal2vulkan_gather_depth_2d_array_{}",
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(&ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
+    let asm = disassemble(&spv).expect("disassemble");
+    let module = load_bytes(&spv).expect("load spv");
+    assert!(
+        module
+            .functions
+            .iter()
+            .flat_map(|func| &func.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|inst| inst.class.opcode == Op::ImageFetch)
+            .count()
+            == 4,
+        "{asm}"
+    );
+    assert!(asm.contains("OpImageQuerySizeLod"), "{asm}");
+    assert!(asm.contains("OpULessThan"), "{asm}");
+    assert!(asm.contains("OpSelect"), "{asm}");
+    assert!(asm.contains("OpConstantNull"), "{asm}");
+    assert!(asm.contains(" Floor "), "{asm}");
+    assert!(!asm.contains("OpImageGather"), "{asm}");
+    assert!(!asm.contains("OpFunctionCall"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -4273,11 +3731,10 @@ declare {{ <4 x float>, i8 }} @air.gather_depth_2d_array.v4f32(ptr addrspace(1),
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
-    spv
 }
 
 #[test]
-fn native_kernel_unused_texture1d_uses_metadata_dimension() {
+fn native_kernel_unused_texture1d_declares_no_descriptor() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 
@@ -4301,9 +3758,10 @@ entry:
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpTypeImage"), "{asm}");
-    assert!(asm.contains(" 1D "), "{asm}");
-    assert!(asm.contains("Binding 32"), "{asm}");
+    // Nothing reads the texture, so the module declares no image, binding, or interface entry for it.
+    assert!(!asm.contains("OpTypeImage"), "{asm}");
+    assert!(!asm.contains("Binding 32"), "{asm}");
+    assert!(!asm.contains("UniformConstant"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -5239,134 +4697,19 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
     let _ = std::fs::remove_dir_all(tmp);
 }
 
-/// A shared imageblock tile is linearised `y * width + x`, and AIR never states that width -- it is
-/// the threadgroup extent, a dispatch-time fact. A kernel that takes `[[threads_per_threadgroup]]`
-/// hands it over; one that does not used to be refused outright ("a cross-coordinate imageblock has
-/// no row stride"), even though the translator already knows the number: the pass layer answers
-/// `air.get_imageblock_width` with the workgroup-size specialization constants.
-///
-/// So the stride must be exactly that spec constant, not a second derivation of the tile extent and
-/// not a baked default. Asserting the id ties the two together: if the emitter ever invents its own
-/// width, this fails even though the module still validates.
-#[test]
-fn native_shared_imageblock_without_a_stride_parameter_uses_the_workgroup_size() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
-
-define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %tid) {
-entry:
-  %mine = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
-  store <4 x half> <half 0xH3C00, half 0xH4000, half 0xH4200, half 0xH4400>, ptr addrspace(4) %mine, align 8
-  tail call void @air.wg.barrier(i32 2, i32 1)
-  %origin = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)
-  %v = load <4 x half>, ptr addrspace(4) %origin, align 8
-  store <4 x half> %v, ptr addrspace(1) %dst, align 8
-  ret void
-}
-
-declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
-declare void @air.wg.barrier(i32, i32)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !6}
-!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
-!4 = !{i32 0, i32 8, i32 0, !"half4", !"v"}
-!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"half4*", !"air.arg_name", !"dst"}
-!6 = !{i32 2, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_imageblock_stride_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    let module = load_bytes(&spv).expect("load spv");
-
-    // A cross-coordinate tile is threadgroup memory, never per-invocation Private scratch.
-    let cell_array = module
-        .types_global_values
-        .iter()
-        .find(|inst| {
-            inst.class.opcode == Op::Variable
-                && matches!(
-                    inst.operands.first(),
-                    Some(Operand::StorageClass(StorageClass::Workgroup))
-                )
-        })
-        .and_then(|inst| inst.result_id)
-        .unwrap_or_else(|| panic!("shared imageblock cells must be Workgroup:\n{asm}"));
-
-    // The x component of `gl_WorkGroupSize` is the tile row stride.
-    let workgroup_size = module
-        .types_global_values
-        .iter()
-        .find(|inst| {
-            inst.class.opcode == Op::SpecConstantComposite
-                && module.annotations.iter().any(|annotation| {
-                    annotation.class.opcode == Op::Decorate
-                        && annotation.operands.first()
-                            == Some(&Operand::IdRef(inst.result_id.unwrap()))
-                        && annotation.operands.iter().any(|operand| {
-                            matches!(operand, Operand::BuiltIn(spirv::BuiltIn::WorkgroupSize))
-                        })
-                })
-        })
-        .and_then(|inst| match inst.operands.first() {
-            Some(Operand::IdRef(x)) => Some(*x),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("no WorkgroupSize spec constant:\n{asm}"));
-
-    // Every cell access chain is `array[stride * y + x]`, and `stride` must be that same id --
-    // through the `OpCopyObject` the pass leaves where the `air.get_imageblock_width` call was.
-    let copies = module
-        .all_inst_iter()
-        .filter(|inst| {
-            inst.class.opcode == Op::CopyObject
-                && inst.operands.first() == Some(&Operand::IdRef(workgroup_size))
-        })
-        .filter_map(|inst| inst.result_id)
-        .collect::<HashSet<_>>();
-    let strides = module
-        .all_inst_iter()
-        .filter(|inst| inst.class.opcode == Op::IMul)
-        .filter(|inst| {
-            inst.operands.iter().any(|operand| match operand {
-                Operand::IdRef(id) => *id == workgroup_size || copies.contains(id),
-                _ => false,
-            })
-        })
-        .count();
-    assert!(
-        strides >= 2,
-        "both tile coordinates must linearize on the workgroup width, got {strides}:\n{asm}"
-    );
-    assert!(
-        module.all_inst_iter().any(|inst| {
-            matches!(inst.class.opcode, Op::AccessChain | Op::InBoundsAccessChain)
-                && inst.operands.first() == Some(&Operand::IdRef(cell_array))
-        }),
-        "the linearized index must address the shared cell array:\n{asm}"
-    );
-    tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
 /// An explicit imageblock is tile-local scratch, undefined on entry, and Private storage is an
 /// honest refinement of that. `air.alias_implicit_imageblock` states the opposite: the storage is
 /// the implicit imageblock -- the render targets the rasterizer already wrote -- so the kernel's
-/// first read is of framebuffer content and its writes have to land back there.
+/// first read is of framebuffer content and its writes have to land back there. Neither is true of
+/// Private scratch.
 ///
-/// Nothing else in the module distinguishes the two. The marker sits beside the ordinary `explicit`
-/// qualifier on the same node and the body is the same `air.imageblock_data` pointer, so the pair is
-/// checked from both ends: without the marker the cell stays scratch and no descriptor-backed plane
-/// appears at all; with it the cell is filled from the plane on entry and written back on return.
+/// Nothing else in the module distinguishes the two. The marker sits beside the ordinary
+/// `explicit` qualifier on the same node, the body is the same `air.imageblock_data` pointer, and
+/// the emitted module validates and reports the same descriptors either way -- it just resolves an
+/// uninitialized array. So the pair is checked from both ends: the marker must refuse, and the same
+/// shader without it must still translate.
 #[test]
-fn native_kernel_imageblock_aliased_onto_the_implicit_one_reaches_the_render_target() {
+fn native_kernel_imageblock_aliased_onto_the_implicit_one_is_refused() {
     let scratch = r#"
 target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
@@ -5396,97 +4739,21 @@ declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
     ));
     let _ = std::fs::create_dir_all(&tmp);
 
-    let plane_traffic = |source: &str| {
-        let spv = crate::translate_sanitized_native(source, Stage::Kernel, &tmp)
-            .expect("an imageblock kernel translates");
-        let module = load_bytes(&spv).expect("load spv");
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-        let positions = |opcode| {
-            module
-                .all_inst_iter()
-                .enumerate()
-                .filter(|(_, inst)| inst.class.opcode == opcode)
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>()
-        };
-        let reads = positions(Op::ImageRead);
-        let writes = positions(Op::ImageWrite);
-        // How many barriers the module has in total is not the claim -- a shared tile also gets one
-        // for its zero initialisation. The claim is that the fill is published before the body can
-        // read a neighbour's cell and that the write-back waits for the body, so what is counted is
-        // the barriers strictly BETWEEN the plane read and the plane write.
-        let bracketing = match (reads.first(), writes.first()) {
-            (Some(read), Some(write)) => positions(Op::ControlBarrier)
-                .into_iter()
-                .filter(|barrier| barrier > read && barrier < write)
-                .count(),
-            _ => 0,
-        };
-        (reads.len(), writes.len(), bracketing)
-    };
-
     let plain = scratch.replace("ALIAS", "");
     assert_ne!(plain, scratch, "the template has no ALIAS splice point");
-    assert_eq!(
-        plane_traffic(&plain),
-        (0, 0, 0),
-        "tile-local scratch reaches no render-target plane"
-    );
+    crate::translate_sanitized_native(&plain, Stage::Kernel, &tmp)
+        .expect("tile-local scratch still translates");
 
     let aliased = scratch.replace("ALIAS", "!\"air.alias_implicit_imageblock\", ");
-    assert_eq!(
-        plane_traffic(&aliased),
-        (1, 1, 2),
-        "the one aliased member must be filled from its plane on entry and written back on \
-         return, each behind a threadgroup barrier"
-    );
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-/// A member of an aliased imageblock that names no plane format is refused rather than staged.
-///
-/// Staging it while its siblings reached the attachments is exactly the silence the marker exists
-/// to prevent: the module would validate, bind, and answer that member out of uninitialised
-/// threadgroup memory.
-#[test]
-fn native_kernel_imageblock_aliased_member_without_a_plane_format_is_refused() {
-    let source = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
-
-define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %tid) {
-entry:
-  %ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
-  %v = load <4 x half>, ptr addrspace(4) %ptr, align 8
-  store <4 x half> %v, ptr addrspace(1) %dst, align 8
-  ret void
-}
-
-declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !6}
-!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 16, !"air.struct_type_info", !4, !"air.alias_implicit_imageblock", !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
-!4 = !{i32 0, i32 8, i32 0, !"half4", !"v", i32 8, i32 12, i32 0, !"float3", !"w"}
-!5 = !{i32 1, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"half4*", !"air.arg_name", !"dst"}
-!6 = !{i32 2, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_kernel_imageblock_alias_gap_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let error = crate::translate_sanitized_native(source, Stage::Kernel, &tmp)
-        .expect_err("a member with no plane format has no attachment to alias");
+    let error = crate::translate_sanitized_native(&aliased, Stage::Kernel, &tmp)
+        .expect_err("an imageblock aliased onto the render targets has no Private equivalent");
     assert!(
-        error.contains("parameter 0") && error.contains("implicit imageblock"),
-        "the refusal must name the parameter and what its storage aliases: {error}"
+        error.contains("implicit imageblock"),
+        "the refusal must name what the storage aliases: {error}"
     );
     assert!(
-        error.contains("member 1"),
-        "the refusal must name the member that has no plane: {error}"
+        error.contains("parameter 0"),
+        "the refusal must name the parameter carrying the marker: {error}"
     );
     let _ = std::fs::remove_dir_all(tmp);
 }
@@ -5525,7 +4792,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), p
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("Rgba16f"), "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
@@ -5535,7 +4802,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), p
         ll,
         Stage::Kernel,
         &tmp,
-        one_cell_tile_options()
+        passes::TransformOptions::default()
             .with_runtime_storage_image(
                 1,
                 runtime_storage_image_state(
@@ -5555,7 +4822,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), p
         ll,
         Stage::Kernel,
         &tmp,
-        one_cell_tile_options()
+        passes::TransformOptions::default()
             .with_runtime_storage_image(
                 1,
                 runtime_storage_image_state(
@@ -5687,7 +4954,7 @@ declare void @air.write_imageblock_slice_to_texture_2d_array.i16.v4f16(ptr addrs
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("Rgba16f"), "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
@@ -5738,7 +5005,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpImageWrite"), "{asm}");
     assert!(asm.contains("OpIEqual"), "{asm}");
@@ -5754,124 +5021,8 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1
     }
 }
 
-/// A tile whose cells are narrow enough holds every cell a threadgroup can address.
-///
-/// The shared-cell array used to be a flat 512 entries, so a 32x32 block -- the largest a
-/// threadgroup can have, one cell per thread at Metal's 1024-thread maximum -- named cells that did
-/// not exist and the block copy refused it. Five corpus modules do exactly this with an 8-byte cell,
-/// which is 8 KiB, comfortably inside the 16 KiB of threadgroup memory Vulkan guarantees.
 #[test]
-fn native_kernel_imageblock_full_threadgroup_block_copy_fits_a_narrow_cell() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
-
-define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
-entry:
-  %ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
-  store <4 x half> zeroinitializer, ptr addrspace(4) %ptr, align 8
-  %base = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)
-  tail call void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1) %dst, ptr addrspace(4) %base, i1 true, <2 x i16> zeroinitializer, <2 x i16> splat (i16 32), <2 x i16> %gid, i16 0, i1 false, i32 2)
-  ret void
-}
-
-declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
-declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !6, !7}
-!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
-!4 = !{i32 0, i32 8, i32 0, !"half4", !"v"}
-!5 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"dst"}
-!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
-!7 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_kernel_imageblock_full_tile_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    // One cell per thread at the 1024-thread maximum; an 8-byte cell puts that at 8 KiB.
-    let length = asm
-        .lines()
-        .find_map(|line| {
-            line.split_once(" = OpTypeArray ")?
-                .1
-                .split_whitespace()
-                .nth(1)
-        })
-        .expect("imageblock cell array");
-    let cells = asm
-        .lines()
-        .find_map(|line| {
-            line.split_once(&format!("{length} = OpConstant "))?
-                .1
-                .split_whitespace()
-                .nth(1)
-        })
-        .expect("cell array length");
-    assert_eq!(cells, "1024", "{asm}");
-    assert!(asm.contains("OpImageWrite"), "{asm}");
-    assert!(!asm.contains("air.imageblock"), "{asm}");
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-/// The same block over a cell wide enough that 1024 of them would not fit is bounded by the bytes.
-///
-/// A 32-byte cell reaches 16 KiB -- the whole of Vulkan's guaranteed `maxComputeSharedMemorySize` --
-/// at 512 cells, so that is where the tile stops and a 1024-cell block is refused. Naming the
-/// capacity in the refusal is what makes the two bounds distinguishable from outside.
-#[test]
-fn native_kernel_imageblock_block_copy_is_bounded_by_the_threadgroup_byte_budget() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
-
-define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i32> %gid, <2 x i16> %tid) {
-entry:
-  %ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
-  store <8 x float> zeroinitializer, ptr addrspace(4) %ptr, align 32
-  %base = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)
-  tail call void @air.write_imageblock_slice_to_texture_2d.v4f32(ptr addrspace(1) %dst, ptr addrspace(4) %base, i1 true, <2 x i16> zeroinitializer, <2 x i16> splat (i16 32), <2 x i32> %gid, i32 0, i1 false, i32 2)
-  ret void
-}
-
-declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
-declare void @air.write_imageblock_slice_to_texture_2d.v4f32(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i32>, i32, i1, i32)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !6, !7}
-!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 32, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 32, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
-!4 = !{i32 0, i32 32, i32 0, !"float8", !"v"}
-!5 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<float, write>", !"air.arg_name", !"dst"}
-!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"gid"}
-!7 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_kernel_imageblock_wide_cell_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let err = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect_err("32-byte cell tile");
-    assert!(err.contains("imageblock holds 512 cells"), "{err}");
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
-fn native_kernel_imageblock_runtime_slice_region_walks_a_spec_constant_trip_count() {
+fn native_kernel_imageblock_explicit_oversized_slice_discards_region() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
@@ -5899,84 +5050,16 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4i16(ptr addrspace(1
 !8 = !{i32 4, !"air.threads_per_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tgSize"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_kernel_imageblock_runtime_slice_{}",
+        "metal2vulkan_kernel_imageblock_explicit_oversized_slice_{}",
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    // The size operand is `[[threads_per_threadgroup]]`, which reaches SPIR-V as `OpSpecConstant`
-    // and so cannot be folded to a trip count. It can still BE the trip count: the block copy's
-    // bound is an id, and the only thing a constant extent buys is that the multiply happens here
-    // instead of on the device.
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    assert_eq!(asm.matches("OpLoopMerge").count(), 1, "{asm}");
-    assert_eq!(asm.matches("OpImageWrite").count(), 1, "{asm}");
-    let result_of = |needle: &str| {
-        asm.lines()
-            .find(|line| line.contains(needle))
-            .unwrap_or_else(|| panic!("no {needle} in {asm}"))
-            .split_whitespace()
-            .next()
-            .expect("result")
-            .to_string()
-    };
-    let defining = |id: &str| {
-        asm.lines()
-            .find(|line| line.trim_start().starts_with(&format!("{id} = ")))
-            .unwrap_or_else(|| panic!("no definition of {id} in {asm}"))
-            .to_string()
-    };
-    let operands = |line: &str| {
-        line.split_whitespace()
-            .skip(4)
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-    };
-    // The trip count is the product of the two components of the size operand, not a constant and
-    // not one axis: a lowering that took only `size.x` would copy a single row of the block.
-    let counted = defining(&result_of("OpULessThan "));
-    let total = operands(&counted).last().expect("bound").to_string();
-    let product = defining(&total);
-    assert!(product.contains("OpIMul "), "{asm}");
-    let axes = operands(&product);
-    let sources = axes
-        .iter()
-        .map(|axis| operands(&defining(axis)))
-        .collect::<Vec<_>>();
-    assert!(
-        sources.iter().all(|from| from.len() == 2)
-            && sources[0][0] == sources[1][0]
-            && sources[0][1] != sources[1][1],
-        "the two factors must be the two lanes of one size operand: {axes:?} {sources:?} in {asm}"
-    );
-    // Both extents came out of a specialization constant, so nothing here was folded away.
-    assert!(asm.contains("OpSpecConstant"), "{asm}");
-    // A runtime extent cannot be checked against the cell array ahead of time, so the loop checks
-    // the cell it is about to name and leaves through the exit it already has.
-    let guard = asm
-        .lines()
-        .filter(|line| line.contains("OpULessThan "))
-        .nth(1)
-        .unwrap_or_else(|| panic!("no cell-index guard in {asm}"))
-        .to_string();
-    let limit = operands(&guard).last().expect("limit").to_string();
-    assert!(
-        defining(&limit).contains("OpConstant "),
-        "the guard must bound the cell index by the array's own length: {asm}"
-    );
-    let joined = defining(&result_of("OpLogicalAnd "));
-    assert_eq!(
-        operands(&joined),
-        vec![
-            counted
-                .split_whitespace()
-                .next()
-                .expect("result")
-                .to_string(),
-            guard.split_whitespace().next().expect("result").to_string(),
-        ],
-        "{asm}"
-    );
+    assert!(asm.contains("OpImageWrite"), "{asm}");
+    assert!(asm.contains("OpSConvert"), "{asm}");
+    assert!(asm.contains("4294967295"), "{asm}");
+    assert!(!asm.contains("air.imageblock"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
         .output()
@@ -5984,7 +5067,6 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4i16(ptr addrspace(1
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
-    let _ = std::fs::remove_dir_all(tmp);
 }
 
 #[test]
@@ -6019,7 +5101,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f16(ptr addrspace(1
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("Rgba16f"), "{asm}");
     assert!(asm.contains("OpInBoundsAccessChain"), "{asm}");
@@ -6072,7 +5154,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v2f16(ptr addrspace(1
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpImageWrite"), "{asm}");
     assert!(asm.contains("OpCompositeExtract"), "{asm}");
@@ -6124,7 +5206,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4i16(ptr addrspace(1
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpImageWrite"), "{asm}");
     assert!(asm.contains("OpSConvert"), "{asm}");
@@ -6176,7 +5258,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v4f32(ptr addrspace(1
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(
         asm.lines()
@@ -6201,12 +5283,11 @@ fn native_kernel_imageblock_data_uses_metadata_float4_pointee() {
 target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
-define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid, ptr addrspace(1) %out) {
+define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid) {
 entry:
   %ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
   store <4 x float> zeroinitializer, ptr addrspace(4) %ptr, align 16
   %loaded = load <4 x float>, ptr addrspace(4) %ptr, align 16
-  store <4 x float> %loaded, ptr addrspace(1) %out, align 16
   ret void
 }
 
@@ -6215,11 +5296,10 @@ declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !5, !6}
+!2 = !{!3, !5}
 !3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 16, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
 !4 = !{i32 0, i32 16, i32 0, !"float4", !"v"}
 !5 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-!6 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_kernel_imageblock_data_float4_{}",
@@ -6242,354 +5322,8 @@ declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
     }
 }
 
-/// The shared cell array is linearised `y * width + x`, and `width` is the tile's, which is the
-/// threadgroup extent times however many cells each thread owns in each axis. This kernel stages a
-/// 2x2 output block per thread and addresses `2 * tid + {0,1}^2`, so its tile is twice the
-/// threadgroup in both axes and everything derived from the extent doubles with it: the row stride,
-/// the cell array, and the implicit block a slice write copies.
-///
-/// Linearising it by the threadgroup extent instead put cells one row apart on the same index and
-/// copied a quarter of the block, which is why this used to be refused. Offsetting a thread position
-/// is not scaling one -- `tid + (1, 0)` is a neighbour read, which is what tile memory is for, and
-/// the block origin here is named as a plain constant, so the entry mixes coordinate coefficients 2
-/// and 0 and the tile is as wide as the largest.
 #[test]
-fn native_kernel_imageblock_widens_the_tile_by_the_per_thread_block() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
-
-define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
-entry:
-  %base = shl <2 x i16> %tid, splat (i16 1)
-  %c0 = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %base, i32 0, i16 0)
-  store <4 x half> zeroinitializer, ptr addrspace(4) %c0, align 8
-  %right = or <2 x i16> %base, <i16 1, i16 0>
-  %c1 = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %right, i32 0, i16 0)
-  store <4 x half> zeroinitializer, ptr addrspace(4) %c1, align 8
-  %origin = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)
-  tail call void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1) %dst, ptr addrspace(4) %origin, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %gid, i16 0, i1 false, i32 2)
-  ret void
-}
-
-declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
-declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !6, !7}
-!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
-!4 = !{i32 0, i32 8, i32 0, !"half4", !"v"}
-!5 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"dst"}
-!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
-!7 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_kernel_imageblock_wide_tile_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native_with_options(
-        ll,
-        Stage::Kernel,
-        &tmp,
-        passes::TransformOptions {
-            kernel_local_size: [2, 2, 1],
-            ..passes::TransformOptions::default()
-        },
-    )
-    .expect("a tile twice the threadgroup in each axis has a linearisation");
-    let asm = disassemble(&spv).expect("disassemble");
-    let module = load_bytes(&spv).expect("load spv");
-    let constants = module
-        .types_global_values
-        .iter()
-        .filter_map(|inst| match (inst.class.opcode, inst.operands.first()) {
-            (Op::Constant, Some(Operand::LiteralBit32(value))) => Some((inst.result_id?, *value)),
-            _ => None,
-        })
-        .collect::<std::collections::HashMap<_, _>>();
-    let second_operand_constant = |inst: &Instruction| {
-        constants
-            .get(&id_ref_operand(inst.operands.get(1)?)?)
-            .copied()
-    };
-    // 1024 threads x 2^2 cells each, cut to what 16 KiB holds of an 8-byte cell.
-    let cells = module
-        .types_global_values
-        .iter()
-        .find(|inst| inst.class.opcode == Op::TypeArray)
-        .and_then(second_operand_constant);
-    assert_eq!(cells, Some(2048), "{asm}");
-    let body = module
-        .functions
-        .iter()
-        .flat_map(|function| &function.blocks)
-        .flat_map(|block| &block.instructions)
-        .collect::<Vec<_>>();
-    // The row stride is the threadgroup width times the 2 the coordinates scale it by.
-    assert!(
-        body.iter()
-            .filter(|inst| inst.class.opcode == Op::IMul)
-            .any(|inst| second_operand_constant(inst) == Some(2)),
-        "{asm}"
-    );
-    // The implicit block a slice write copies is the whole 4x4 tile, not the 2x2 threadgroup.
-    assert!(
-        body.iter()
-            .filter(|inst| inst.class.opcode == Op::ULessThan)
-            .any(|inst| second_operand_constant(inst) == Some(16)),
-        "{asm}"
-    );
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-/// The mirror of [`native_kernel_imageblock_widens_the_tile_by_the_per_thread_block`]: a coordinate
-/// scaled by a value that is not a constant has no width that bounds it, at any dispatch, so there
-/// is no tile to linearise and this stays refused rather than guessing one.
-#[test]
-fn native_kernel_imageblock_refuses_a_nonlinear_cell_coordinate() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
-
-define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
-entry:
-  %base = mul <2 x i16> %tid, %gid
-  %c0 = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %base, i32 0, i16 0)
-  store <4 x half> zeroinitializer, ptr addrspace(4) %c0, align 8
-  %right = or <2 x i16> %base, <i16 1, i16 0>
-  %c1 = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %right, i32 0, i16 0)
-  store <4 x half> zeroinitializer, ptr addrspace(4) %c1, align 8
-  %origin = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)
-  tail call void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1) %dst, ptr addrspace(4) %origin, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %gid, i16 0, i1 false, i32 2)
-  ret void
-}
-
-declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
-declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !6, !7}
-!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
-!4 = !{i32 0, i32 8, i32 0, !"half4", !"v"}
-!5 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"dst"}
-!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
-!7 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_kernel_imageblock_nonlinear_tile_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let error = crate::translate_sanitized_native_with_options(
-        ll,
-        Stage::Kernel,
-        &tmp,
-        passes::TransformOptions {
-            kernel_local_size: [2, 2, 1],
-            ..passes::TransformOptions::default()
-        },
-    )
-    .expect_err("a coordinate scaled by a runtime value names no tile width");
-    assert!(
-        error.contains("not a linear function of a thread position"),
-        "the refusal must name what it could not place inside the tile: {error}"
-    );
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-/// `air.write_imageblock_slice_to_texture_*` copies the WxH block of cells starting at the one its
-/// pointer names, and the per-texel lowering writes exactly one of them. The block copy turns the
-/// call into a loop over the block, so every cell reaches the texture at its own coordinate.
-///
-/// The 3x2 threadgroup here is deliberately not square and not the implicit region's only reading:
-/// the block is the implicit imageblock extent (the has-size flag is `false`), so the loop must run
-/// 6 times, offsetting the cell index by `dy * 3 + dx` -- the same `y * width + x` the emitter
-/// linearised the cell array by -- and the destination coordinate by `(dx, dy)`.
-#[test]
-fn native_kernel_imageblock_slice_write_copies_the_whole_block() {
-    let ll = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
-
-define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid) {
-entry:
-  %store_ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
-  store <4 x half> zeroinitializer, ptr addrspace(4) %store_ptr, align 8
-  %origin = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)
-  tail call void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1) %dst, ptr addrspace(4) %origin, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %gid, i16 0, i1 false, i32 2)
-  ret void
-}
-
-declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
-declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !6, !7}
-!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
-!4 = !{i32 0, i32 8, i32 0, !"half4", !"v"}
-!5 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"dst"}
-!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
-!7 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_kernel_imageblock_block_copy_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native_with_options(
-        ll,
-        Stage::Kernel,
-        &tmp,
-        passes::TransformOptions {
-            kernel_local_size: [3, 2, 1],
-            ..passes::TransformOptions::default()
-        },
-    )
-    .expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    // One loop, and one write inside it: the block copy must not unroll into six writes, nor leave
-    // the single write the per-texel lowering used to emit on its own.
-    assert_eq!(asm.matches("OpLoopMerge").count(), 1, "{asm}");
-    assert_eq!(asm.matches("OpImageWrite").count(), 1, "{asm}");
-    // The last operand of an instruction line, which for the loop's arithmetic is its right side.
-    let rhs = |needle: &str| {
-        asm.lines()
-            .find(|line| line.contains(needle))
-            .unwrap_or_else(|| panic!("no {needle} in {asm}"))
-            .split_whitespace()
-            .last()
-            .expect("operand")
-            .to_string()
-    };
-    let result_of = |needle: &str| {
-        asm.lines()
-            .find(|line| line.contains(needle))
-            .unwrap_or_else(|| panic!("no {needle} in {asm}"))
-            .split_whitespace()
-            .next()
-            .expect("result")
-            .to_string()
-    };
-    let constant = |id: &str| {
-        asm.lines()
-            .find(|line| line.starts_with(&format!("{id} = OpConstant ")))
-            .map(|line| line.split_whitespace().last().expect("literal").to_string())
-    };
-    // Six cells: the loop runs once per cell of the 3x2 block.
-    assert_eq!(
-        constant(&rhs("OpULessThan ")).as_deref(),
-        Some("6"),
-        "{asm}"
-    );
-    // Knowing the extent is six cells says nothing about where those six LAND: the block origin is
-    // the writing thread's own cell, a runtime value, so `base + offset` can leave the cell array
-    // and the `OpInBoundsAccessChain` that names it would be out of range. The loop guards the
-    // index it is about to use against the array's declared length -- 1024 cells for an 8-byte cell
-    // in the threadgroup byte budget -- and leaves through the exit it already has.
-    let guard = asm
-        .lines()
-        .filter(|line| line.contains("OpULessThan "))
-        .nth(1)
-        .unwrap_or_else(|| panic!("no cell-index guard in {asm}"))
-        .to_string();
-    assert_eq!(
-        constant(guard.split_whitespace().last().expect("limit")).as_deref(),
-        Some("1024"),
-        "{asm}"
-    );
-    assert!(asm.contains("OpLogicalAnd "), "{asm}");
-    let dx = result_of("OpUMod ");
-    let dy = result_of("OpUDiv ");
-    // Rows are stepped by the same id the emitter linearised the cell array with, not by a second
-    // derivation of the threadgroup width: the loop's `dy * width` names the very multiplier the
-    // `y * width + x` index it offsets was built from.
-    let row_step = asm
-        .lines()
-        .find(|line| line.contains("OpIMul ") && line.contains(&format!(" {dy} ")))
-        .unwrap_or_else(|| panic!("no row step in {asm}"))
-        .to_string();
-    let stride = row_step
-        .split_whitespace()
-        .last()
-        .expect("stride")
-        .to_string();
-    assert!(
-        asm.lines()
-            .filter(|line| line.contains("OpIMul ") && line.ends_with(&stride))
-            .count()
-            >= 2,
-        "{asm}"
-    );
-    // The block starts at the IMAGEBLOCK's origin, not at the cell the slice pointer names: Metal
-    // ignores the pointer's cell coordinate at every block size (the device table is on
-    // `imageblock_cell_chain`). So the cell this iteration names is exactly `dy * stride + dx` with
-    // nothing added to it. The pointer's own `y * width + x` is still in the module -- it is where
-    // the stride was recovered from -- which is why the check is on what the access chain indexes
-    // with rather than on the index being absent.
-    let row = row_step.split_whitespace().next().expect("row").to_string();
-    let cell_index = asm
-        .lines()
-        .find(|line| line.contains("OpIAdd ") && line.ends_with(&format!("{row} {dx}")))
-        .map(|line| line.split_whitespace().next().expect("result").to_string())
-        .unwrap_or_else(|| panic!("no `dy * stride + dx` cell index in {asm}"));
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpInBoundsAccessChain ") && line.ends_with(&cell_index)),
-        "the loop must index the cell array with `dy * stride + dx`: {asm}"
-    );
-    // Each cell lands at its own texel: the destination coordinate is offset by (dx, dy), the
-    // block coordinate this iteration decoded out of the counter.
-    let delta = asm
-        .lines()
-        .find(|line| line.contains("OpCompositeConstruct") && line.ends_with(&format!("{dx} {dy}")))
-        .map(|line| line.split_whitespace().next().expect("result").to_string())
-        .unwrap_or_else(|| panic!("no (dx, dy) offset in {asm}"));
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpIAdd ") && line.ends_with(&delta)),
-        "{asm}"
-    );
-    // The cell is re-formed against the threadgroup array rather than offsetting a pointer, so the
-    // cells past the first are other threads' -- which is the whole point of the copy.
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpVariable") && line.contains("Workgroup")),
-        "{asm}"
-    );
-    assert!(
-        !asm.lines()
-            .any(|line| line.contains("OpVariable") && line.contains("Private")),
-        "{asm}"
-    );
-    if std::process::Command::new("spirv-val")
-        .arg("--version")
-        .output()
-        .is_ok()
-    {
-        tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
-    }
-}
-
-/// Two `air.imageblock_data` calls at one coordinate name one cell, so they allocate one scratch
-/// array between them rather than one each. The entry also writes a slice to a texture, which makes
-/// that array threadgroup memory (`calls_imageblock_slice_write`) -- the claim under test is the
-/// sharing, and it holds in whichever storage the block lands in.
-#[test]
-fn native_kernel_imageblock_data_calls_share_one_scratch_allocation() {
+fn native_kernel_imageblock_data_calls_share_private_scratch() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
@@ -6621,15 +5355,13 @@ declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), p
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    let scratch_vars = asm
+    let private_vars = asm
         .lines()
-        .filter(|line| {
-            line.contains("OpVariable") && (line.contains("Private") || line.contains("Workgroup"))
-        })
+        .filter(|line| line.contains("OpVariable") && line.contains("Private"))
         .count();
-    assert_eq!(scratch_vars, 1, "{asm}");
+    assert_eq!(private_vars, 1, "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -6641,91 +5373,12 @@ declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), p
 }
 
 #[test]
-fn native_kernel_cross_coordinate_imageblock_is_shared_either_way() {
-    // The corpus `copy` tile kernel in miniature: every thread stores into its own imageblock cell,
-    // a threadgroup barrier publishes the tile, then one thread reads the block base at the
-    // constant coordinate. The second structural coordinate is the whole point -- those two calls
-    // communicate through the tile, so they cannot both resolve to one per-invocation slot.
-    let scratch = r#"
-target triple = "spirv-unknown-vulkan1.2"
-%"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
-
-define void @k(%"struct.metal::_imageblock_base" %img_blk, ptr addrspace(1) %dst, <2 x i16> %gid, <2 x i16> %tid STRIDE_PARAM) {
-entry:
-  %store_ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
-  store <4 x half> zeroinitializer, ptr addrspace(4) %store_ptr, align 8
-  tail call void @air.wg.barrier(i32 8, i32 1)
-  %write_ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> zeroinitializer, i32 0, i16 0)
-  tail call void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1) %dst, ptr addrspace(4) %write_ptr, i1 false, <2 x i16> zeroinitializer, <2 x i16> undef, <2 x i16> %gid, i16 0, i1 false, i32 2)
-  ret void
-}
-
-declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
-declare void @air.wg.barrier(i32, i32)
-declare void @air.write_imageblock_slice_to_texture_2d.v4f16(ptr addrspace(1), ptr addrspace(4), i1, <2 x i16>, <2 x i16>, <2 x i16>, i16, i1, i32)
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3, !5, !6, !7 STRIDE_META}
-!3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
-!4 = !{i32 0, i32 8, i32 0, !"half4", !"v"}
-!5 = !{i32 1, !"air.texture", !"air.location_index", i32 1, i32 1, !"air.write", !"air.arg_type_name", !"texture2d<half, write>", !"air.arg_name", !"dst"}
-!6 = !{i32 2, !"air.thread_position_in_grid", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"gid"}
-!7 = !{i32 3, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-!8 = !{i32 4, !"air.threads_per_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tpt"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_kernel_cross_coordinate_imageblock_shared_or_refused_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-
-    let strided = scratch
-        .replace("STRIDE_PARAM", ", <2 x i16> %tpt")
-        .replace("STRIDE_META", ", !8");
-    let spv = translate_one_cell_tile(&strided, Stage::Kernel, &tmp)
-        .expect("a dispatch-supplied row stride linearizes the shared tile");
-    let asm = disassemble(&spv).expect("disassemble");
-    assert!(
-        asm.lines()
-            .any(|line| line.contains("OpVariable") && line.contains("Workgroup")),
-        "the shared tile has to live in Workgroup storage: {asm}"
-    );
-
-    let strideless = scratch
-        .replace(" STRIDE_PARAM", "")
-        .replace(" STRIDE_META", "");
-    assert_ne!(
-        strideless, scratch,
-        "the template has no stride splice point"
-    );
-    // With no stride parameter the tile is still shared and still linearised -- the width just
-    // comes from the workgroup-size specialization constant instead of a dispatch argument. The
-    // two paths must agree on the storage class; only the source of the row stride differs.
-    let strideless = translate_one_cell_tile(&strideless, Stage::Kernel, &tmp)
-        .expect("a shared tile with no stride parameter linearizes on the workgroup width");
-    let strideless_asm = disassemble(&strideless).expect("disassemble");
-    assert!(
-        strideless_asm
-            .lines()
-            .any(|line| line.contains("OpVariable") && line.contains("Workgroup")),
-        "the shared tile has to live in Workgroup storage: {strideless_asm}"
-    );
-    assert!(
-        strideless_asm.contains("BuiltIn WorkgroupSize"),
-        "the row stride has to be the workgroup size, not an invented constant: {strideless_asm}"
-    );
-    let _ = std::fs::remove_dir_all(tmp);
-}
-
-#[test]
 fn native_kernel_imageblock_private_byte_view_loads_typed_half_lane() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
-define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid, ptr addrspace(1) %out) {
+define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid) {
 entry:
   %base = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
   store half 0xH3C00, ptr addrspace(4) %base, align 2
@@ -6734,7 +5387,6 @@ entry:
   store half 0xH4000, ptr addrspace(4) %lane, align 2
   %value = load half, ptr addrspace(4) %lane, align 2
   store half %value, ptr addrspace(4) %base, align 2
-  store half %value, ptr addrspace(1) %out, align 2
   ret void
 }
 
@@ -6743,11 +5395,10 @@ declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !5, !6}
+!2 = !{!3, !5}
 !3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 8, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 8, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
 !4 = !{i32 0, i32 2, i32 0, !"half", !"a", i32 2, i32 2, i32 0, !"half", !"b", i32 4, i32 2, i32 0, !"half", !"c", i32 6, i32 2, i32 0, !"half", !"d"}
 !5 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-!6 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_kernel_imageblock_private_byte_half_{}",
@@ -6774,7 +5425,7 @@ fn native_kernel_cross_coordinate_imageblock_uses_shared_workgroup_cells() {
 target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
-define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid, <2 x i16> %threads, ptr addrspace(1) %out) {
+define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid, <2 x i16> %threads) {
 entry:
   %own = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
   store half 0xH3C00, ptr addrspace(4) %own, align 2
@@ -6783,7 +5434,6 @@ entry:
   %neighbor = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %neighbor_coord, i32 0, i16 0)
   %value = load half, ptr addrspace(4) %neighbor, align 2
   store half %value, ptr addrspace(4) %own, align 2
-  store half %value, ptr addrspace(1) %out, align 2
   ret void
 }
 
@@ -6793,12 +5443,11 @@ declare void @air.wg.barrier(i32, i32)
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !5, !6, !7}
+!2 = !{!3, !5, !6}
 !3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 2, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
 !4 = !{i32 0, i32 2, i32 0, !"half", !"v"}
 !5 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
 !6 = !{i32 2, !"air.threads_per_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"threads"}
-!7 = !{i32 3, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 2, !"air.arg_type_align_size", i32 2, !"air.arg_type_name", !"half", !"air.arg_name", !"out"}
 "#;
     let tmp = std::env::temp_dir().join(format!(
         "metal2vulkan_kernel_cross_coordinate_imageblock_{}",
@@ -6824,11 +5473,9 @@ declare void @air.wg.barrier(i32, i32)
         "{asm}"
     );
     assert!(asm.contains("OpIMul"), "{asm}");
-    // One cell per thread, and a threadgroup holds at most 1024 of them. A 2-byte cell is 2 KiB
-    // there, well inside the threadgroup memory Vulkan guarantees, so the thread count is the bound.
     assert!(
         asm.lines()
-            .any(|line| line.contains("OpConstant") && line.ends_with(" 1024")),
+            .any(|line| line.contains("OpConstant") && line.ends_with(" 512")),
         "{asm}"
     );
     if std::process::Command::new("spirv-val")
@@ -6876,7 +5523,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.f16(ptr addrspace(1),
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpImageWrite"), "{asm}");
     assert!(asm.contains("OpInBoundsAccessChain"), "{asm}");
@@ -6927,7 +5574,7 @@ declare void @air.write_imageblock_slice_to_texture_2d.i16.v2f16(ptr addrspace(1
         std::process::id()
     ));
     let _ = std::fs::create_dir_all(&tmp);
-    let spv = translate_one_cell_tile(ll, Stage::Kernel, &tmp).expect("translate");
+    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert_eq!(asm.matches("OpImageWrite").count(), 2, "{asm}");
     assert!(asm.contains("OpInBoundsAccessChain"), "{asm}");
@@ -6947,12 +5594,10 @@ fn native_kernel_backend_imageblock_dimensions_use_shared_workgroup_cells() {
 target triple = "spirv-unknown-vulkan1.2"
 %"struct.metal::_imageblock_base" = type { ptr addrspace(4) }
 
-define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid, ptr addrspace(1) %out) {
+define void @k(%"struct.metal::_imageblock_base" %img_blk, <2 x i16> %tid) {
 entry:
   %ptr = tail call ptr addrspace(4) @air.imageblock_data(<2 x i16> %tid, i32 0, i16 0)
   store i32 7, ptr addrspace(4) %ptr, align 4
-  %staged = load i32, ptr addrspace(4) %ptr, align 4
-  store i32 %staged, ptr addrspace(1) %out, align 4
   ret void
 }
 
@@ -6961,11 +5606,10 @@ declare ptr addrspace(4) @air.imageblock_data(<2 x i16>, i32, i16)
 !air.kernel = !{!0}
 !0 = !{ptr @k, !1, !2}
 !1 = !{}
-!2 = !{!3, !5, !7}
+!2 = !{!3, !5}
 !3 = !{i32 0, !"air.imageblock", !"explicit", !"air.imageblock_data_size", i32 4, !"air.struct_type_info", !4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"imageblock<ImageBlockData, layout_explicit>", !"air.arg_name", !"imgBlk"}
 !4 = !{i32 0, i32 4, i32 0, !"uint", !"v"}
 !5 = !{i32 1, !"air.thread_position_in_threadgroup", !"air.arg_type_name", !"ushort2", !"air.arg_name", !"tid"}
-!7 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_size", i32 4, !"air.arg_type_align_size", i32 4, !"air.arg_type_name", !"uint", !"air.arg_name", !"out"}
 !apv.imageblock_dimensions = !{!6}
 !6 = !{i32 4, i32 1}
 "#;
@@ -7439,10 +6083,7 @@ declare void @air.write_texture_2d_array.i16.v4f16(ptr addrspace(1), <2 x i16>, 
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
     assert!(asm.contains("OpImageFetch"), "{asm}");
-    // The pixel coordinate becomes a texel index. (This asserted `OpConvertFToU` when the fetch
-    // level was also converted, from the zero placeholder AIR puts in the level slot; the level is
-    // a constant now that the slot's presence flag is read, so name the coordinate conversion.)
-    assert!(asm.contains("OpConvertFToS"), "{asm}");
+    assert!(asm.contains("OpConvertFToU"), "{asm}");
     assert!(!asm.contains("OpSampledImage"), "{asm}");
     assert!(!asm.contains("OpImageSample"), "{asm}");
     if std::process::Command::new("spirv-val")
@@ -7751,12 +6392,8 @@ declare void @air.write_texture_buffer_1d.v4f32(ptr addrspace(1), i32, <4 x floa
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    // `Dim Buffer` is enabled by either `SampledBuffer` or `ImageBuffer`, and the type's `Sampled`
-    // operand -- 2 here -- says which one describes it. A write-only texel buffer is the storage
-    // one; asking for `SampledBuffer` beside it demands a capability for an image the module does
-    // not contain.
+    assert!(asm.contains("OpCapability SampledBuffer"), "{asm}");
     assert!(asm.contains("OpCapability ImageBuffer"), "{asm}");
-    assert!(!asm.contains("OpCapability SampledBuffer"), "{asm}");
     assert!(asm.contains("Buffer 0 0 0 2 R32f"), "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
     assert!(asm.contains("Binding 480"), "{asm}");
@@ -7845,10 +6482,8 @@ declare void @air.write_texture_1d.i16.v4f32(ptr addrspace(1), i16, <4 x float>,
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    // The `Dim 1D` mirror of the texel-buffer case above: a write-only `texture1d` is a storage
-    // image, so `Image1D` is what enables it and `Sampled1D` names an image that is not here.
+    assert!(asm.contains("OpCapability Sampled1D"), "{asm}");
     assert!(asm.contains("OpCapability Image1D"), "{asm}");
-    assert!(!asm.contains("OpCapability Sampled1D"), "{asm}");
     assert!(asm.contains("1D 0 0 0 2 R32f"), "{asm}");
     assert!(asm.contains("OpImageWrite"), "{asm}");
     if std::process::Command::new("spirv-val")
@@ -7973,24 +6608,15 @@ attributes #0 = { nounwind }
     }
 }
 
-/// The sample index of a multisample depth read is the operand AFTER the coordinate.
-///
-/// `air.read_depth_*` carries an extra scalar between the sampler and the coordinate, and this test
-/// used to put the sample index there -- a shape the Metal frontend never emits. In real AIR that
-/// operand is the constant 1 at every call site of every depth read form, including the
-/// non-multisample ones that have no sample to name, and the sample index sits where `read_texture`
-/// puts it. Reading the leading scalar made every multisample depth read in the corpus fetch sample
-/// 1 whatever was asked for, which is why this asserts WHICH id the `Sample` operand carries rather
-/// than only that one is present.
 #[test]
-fn native_fragment_multisample_depth_read_takes_the_sample_after_the_coordinate() {
+fn native_fragment_multisample_depth_read_uses_sample_operand() {
     let ll = r#"
 target datalayout = "e-p:64:64:64"
 target triple = "air64-apple-macosx14.0.0"
 
 define <{ float }> @frag(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, i32 %sampleId) local_unnamed_addr #0 {
 entry:
-  %read = tail call { float, i8 } @air.read_depth_2d_ms.f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, i32 1, <2 x i32> zeroinitializer, i32 %sampleId, i32 1)
+  %read = tail call { float, i8 } @air.read_depth_2d_ms.f32(ptr addrspace(1) %tex, ptr addrspace(2) %sampler, i32 %sampleId, <2 x i32> zeroinitializer, i32 0, i32 1)
   %depth = extractvalue { float, i8 } %read, 0
   %out = insertvalue <{ float }> undef, float %depth, 0
   ret <{ float }> %out
@@ -8016,37 +6642,15 @@ attributes #0 = { nounwind }
     let _ = std::fs::create_dir_all(&tmp);
     let spv = crate::translate_sanitized_native(ll, Stage::Fragment, &tmp).expect("translate");
     let asm = disassemble(&spv).expect("disassemble");
-    let fetch = asm
-        .lines()
-        .find(|line| line.contains("OpImageFetch") && line.contains("Sample"))
-        .expect(&asm);
+    assert!(
+        asm.lines()
+            .any(|line| line.contains("OpImageFetch") && line.contains("Sample")),
+        "{asm}"
+    );
     assert!(
         !asm.lines()
             .any(|line| line.contains("OpImageFetch") && line.contains("Lod")),
         "{asm}"
-    );
-    // The id the fetch samples at must be the SampleId builtin's loaded value, not a constant: the
-    // whole bug was that a constant operand looked exactly as plausible here.
-    let sample = fetch
-        .rsplit_once("Sample ")
-        .expect(&asm)
-        .1
-        .trim()
-        .to_string();
-    let sample_id_variable = asm
-        .lines()
-        .find(|line| line.contains("OpDecorate") && line.contains("BuiltIn SampleId"))
-        .and_then(|line| line.split_whitespace().nth(1))
-        .expect(&asm)
-        .to_string();
-    let loaded = asm
-        .lines()
-        .find(|line| line.contains(" = OpLoad ") && line.ends_with(&sample_id_variable))
-        .and_then(|line| line.split_whitespace().next())
-        .expect(&asm);
-    assert_eq!(
-        loaded, sample,
-        "fetch does not sample at the sample id\n{asm}"
     );
     if std::process::Command::new("spirv-val")
         .arg("--version")
@@ -8426,53 +7030,4 @@ declare void @air.fence_texture_2d(ptr addrspace(1))
     {
         tools::spirv_val_bytes(&spv, &tmp).expect("spirv-val");
     }
-}
-
-#[test]
-fn native_opaque_named_type_bodies_do_not_block_a_texture_handle() {
-    // The Metal frontend spells a texture and a sampler handle as a pointer to an LLVM named
-    // type with no body: `%struct._texture_2d_t = type opaque`. The type table parsed every
-    // `= type` body, so `opaque` -- a body LLVM itself does not know -- failed the whole module
-    // with "unsupported type `opaque`" before any texture work started. The handle's body is
-    // never needed here either: `air.texture` in the metadata is what types the binding.
-    let ll = r#"
-source_filename = "case.metal"
-
-%struct._texture_2d_t = type opaque
-%struct._sampler_t = type opaque
-
-define void @k(%struct._texture_2d_t addrspace(1)* nocapture readonly %0, %struct._sampler_t addrspace(2)* nocapture readonly %1, <4 x float> addrspace(1)* nocapture writeonly "air-buffer-no-alias" %2, <2 x i32> %3) {
-  %5 = tail call fast <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32> %3)
-  %7 = tail call { <4 x float>, i8 } @air.sample_texture_2d.v4f32(%struct._texture_2d_t addrspace(1)* nocapture readonly %0, %struct._sampler_t addrspace(2)* nocapture readonly %1, <2 x float> %5, i1 true, <2 x i32> zeroinitializer, i1 false, float 0.000000e+00, float 0.000000e+00, i32 0)
-  %8 = extractvalue { <4 x float>, i8 } %7, 0
-  %9 = extractelement <2 x i32> %3, i64 0
-  %10 = zext i32 %9 to i64
-  %11 = getelementptr inbounds <4 x float>, <4 x float> addrspace(1)* %2, i64 %10
-  store <4 x float> %8, <4 x float> addrspace(1)* %11, align 16
-  ret void
-}
-
-declare <2 x float> @air.convert.f.v2f32.u.v2i32(<2 x i32>)
-declare { <4 x float>, i8 } @air.sample_texture_2d.v4f32(%struct._texture_2d_t addrspace(1)*, %struct._sampler_t addrspace(2)*, <2 x float>, i1, <2 x i32>, i1, float, float, i32)
-
-!air.kernel = !{!9}
-!9 = !{void (%struct._texture_2d_t addrspace(1)*, %struct._sampler_t addrspace(2)*, <4 x float> addrspace(1)*, <2 x i32>)* @k, !10, !11}
-!10 = !{}
-!11 = !{!12, !13, !14, !15}
-!12 = !{i32 0, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"src"}
-!13 = !{i32 1, !"air.sampler", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"sampler", !"air.arg_name", !"s"}
-!14 = !{i32 2, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read_write", !"air.address_space", i32 1, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"float4", !"air.arg_name", !"o"}
-!15 = !{i32 3, !"air.thread_position_in_grid", !"air.arg_type_name", !"uint2", !"air.arg_name", !"g"}
-"#;
-    let tmp = std::env::temp_dir().join(format!(
-        "metal2vulkan_native_opaque_named_type_{}",
-        std::process::id()
-    ));
-    let _ = std::fs::create_dir_all(&tmp);
-    let spv = crate::translate_sanitized_native(ll, Stage::Kernel, &tmp).expect("translate");
-    let asm = disassemble(&spv).expect("disassemble");
-    assert!(asm.contains("OpTypeImage"), "{asm}");
-    assert!(asm.contains("OpImageSampleExplicitLod"), "{asm}");
-    // The handle's body stayed unknown: nothing invented an empty struct to stand in for it.
-    assert!(!asm.contains("OpTypeStruct\n"), "{asm}");
 }

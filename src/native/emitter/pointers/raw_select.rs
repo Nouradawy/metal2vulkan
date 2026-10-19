@@ -179,81 +179,6 @@ impl Emitter {
         ))
     }
 
-    /// Emit `body` guarded by `condition`, as a structured `if` spliced into the instruction stream.
-    ///
-    /// The selected-pointer stores below need this because a pointer `OpSelect`-then-store is illegal
-    /// under Logical addressing when the arms are distinct bindings, and the branch-free alternative
-    /// is not equivalent. That alternative loaded each arm, selected the new value against the old one
-    /// under the arm's condition, and stored the result back into EVERY arm. Storing a value back is
-    /// still a write: when two invocations reach the same byte of one buffer through DIFFERENT
-    /// selections, the one that did not select it overwrites the other's result with the pre-store
-    /// value. Apple's store is a single indirect store through the selected pointer and has no such
-    /// write, so the branch-free form is a data race the source does not have -- measured on the
-    /// device as a nondeterministic answer, three distinct outputs in four runs.
-    ///
-    /// A guarded store has no write to un-write. The emitter's block list is a flat instruction
-    /// stream split at `OpLabel` (`emit_raw_store`'s bounds guard uses the same idiom), so this is a
-    /// well-formed selection construct even though CFG structurization has already run.
-    fn emit_guarded(
-        &mut self,
-        condition: Word,
-        instructions: &mut Vec<Instruction>,
-        body: impl FnOnce(&mut Self, &mut Vec<Instruction>) -> Result<(), String>,
-    ) -> Result<(), String> {
-        let body_label = self.fresh();
-        let merge_label = self.fresh();
-        instructions.push(Self::inst(
-            Op::SelectionMerge,
-            None,
-            None,
-            vec![
-                Operand::IdRef(merge_label),
-                Operand::SelectionControl(SelectionControl::NONE),
-            ],
-        ));
-        instructions.push(Self::inst(
-            Op::BranchConditional,
-            None,
-            None,
-            vec![
-                Operand::IdRef(condition),
-                Operand::IdRef(body_label),
-                Operand::IdRef(merge_label),
-            ],
-        ));
-        instructions.push(Self::inst(Op::Label, None, Some(body_label), vec![]));
-        body(self, instructions)?;
-        instructions.push(Self::inst(
-            Op::Branch,
-            None,
-            None,
-            vec![Operand::IdRef(merge_label)],
-        ));
-        instructions.push(Self::inst(Op::Label, None, Some(merge_label), vec![]));
-        Ok(())
-    }
-
-    /// `condition` when `when_true`, else its negation. The arm-selected predicate for a store guard.
-    fn store_arm_condition(
-        &mut self,
-        condition: Word,
-        when_true: bool,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<Word, String> {
-        if when_true {
-            return Ok(condition);
-        }
-        let bool_ty = self.type_id(&LlType::Bool)?;
-        let negated = self.fresh();
-        instructions.push(Self::inst(
-            Op::LogicalNot,
-            Some(bool_ty),
-            Some(negated),
-            vec![Operand::IdRef(condition)],
-        ));
-        Ok(negated)
-    }
-
     /// Store `object` THROUGH a direct pointer select (`selected_pointers`), the write-side analog of
     /// [`emit_selected_pointer_direct_load`]. A pointer `OpSelect`-then-store is illegal under Logical
     /// addressing when the arms can point into distinct buffers, and there is no value-level "store to
@@ -310,25 +235,46 @@ impl Emitter {
                 "native emitter: selected store type mismatch {pointee:?} vs {object_ty:?}"
             ));
         }
-        // Only the SELECTED arm is written, each store under its own guard. `cond` true selects the
-        // true arm. See [`Self::emit_guarded`] for why writing both arms is not an option.
-        for (value, selected_when_true) in
+        let object_type = self.type_id(&object_ty)?;
+        // The SELECTED arm receives the new value; the other arm is written back unchanged. `cond` true
+        // selects the true arm, so the true arm stores `select(cond, object, old)` and the false arm
+        // stores `select(cond, old, object)`.
+        for (value, take_object_when_true) in
             [(&selected.true_value, true), (&selected.false_value, false)]
         {
             if matches!(value, LlValue::Zero) {
                 continue; // a null arm is UB to store through in the source; skip it.
             }
             let ptr = self.value_id(value, &selected.ty)?;
-            let arm = self.store_arm_condition(selected.cond, selected_when_true, instructions)?;
-            self.emit_guarded(arm, instructions, |_, instructions| {
-                instructions.push(Self::inst(
-                    Op::Store,
-                    None,
-                    None,
-                    vec![Operand::IdRef(ptr), Operand::IdRef(object_id)],
-                ));
-                Ok(())
-            })?;
+            let old = self.fresh();
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(object_type),
+                Some(old),
+                vec![Operand::IdRef(ptr)],
+            ));
+            let merged = self.fresh();
+            let (t, f) = if take_object_when_true {
+                (object_id, old)
+            } else {
+                (old, object_id)
+            };
+            instructions.push(Self::inst(
+                Op::Select,
+                Some(object_type),
+                Some(merged),
+                vec![
+                    Operand::IdRef(selected.cond),
+                    Operand::IdRef(t),
+                    Operand::IdRef(f),
+                ],
+            ));
+            instructions.push(Self::inst(
+                Op::Store,
+                None,
+                None,
+                vec![Operand::IdRef(ptr), Operand::IdRef(merged)],
+            ));
         }
         Ok(())
     }
@@ -551,23 +497,48 @@ impl Emitter {
                         "native emitter: selected access store has unsupported storage {storage:?}"
                     ));
                 }
-                let ptr = *ptr;
-                self.emit_guarded(condition, instructions, |_, instructions| {
-                    instructions.push(Self::inst(
-                        Op::Store,
-                        None,
-                        None,
-                        vec![Operand::IdRef(ptr), Operand::IdRef(object)],
-                    ));
-                    Ok(())
-                })
+                let object_type = self.type_id(object_ty)?;
+                let old = self.fresh();
+                instructions.push(Self::inst(
+                    Op::Load,
+                    Some(object_type),
+                    Some(old),
+                    vec![Operand::IdRef(*ptr)],
+                ));
+                let value = self.fresh();
+                instructions.push(Self::inst(
+                    Op::Select,
+                    Some(object_type),
+                    Some(value),
+                    vec![
+                        Operand::IdRef(condition),
+                        Operand::IdRef(object),
+                        Operand::IdRef(old),
+                    ],
+                ));
+                instructions.push(Self::inst(
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(*ptr), Operand::IdRef(value)],
+                ));
+                Ok(())
             }
             SelectedAccessArm::Raw(raw) => {
-                let raw = raw.clone();
-                let object_ty = object_ty.clone();
-                self.emit_guarded(condition, instructions, move |emitter, instructions| {
-                    emitter.emit_raw_store(&object_ty, object, &raw, access_align, instructions)
-                })
+                let old = self.fresh();
+                self.emit_raw_load(old, object_ty, raw, access_align, instructions)?;
+                let value = self.fresh();
+                instructions.push(Self::inst(
+                    Op::Select,
+                    Some(self.type_id(object_ty)?),
+                    Some(value),
+                    vec![
+                        Operand::IdRef(condition),
+                        Operand::IdRef(object),
+                        Operand::IdRef(old),
+                    ],
+                ));
+                self.emit_raw_store(object_ty, value, raw, access_align, instructions)
             }
             SelectedAccessArm::Null => Ok(()),
         }
@@ -726,18 +697,55 @@ impl Emitter {
         let false_ptr = selected.false_ptr.ok_or_else(|| {
             "native emitter: selected pointer store missing false arm".to_string()
         })?;
-        for (ptr, selected_when_true) in [(true_ptr, true), (false_ptr, false)] {
-            let arm = self.store_arm_condition(selected.cond, selected_when_true, instructions)?;
-            self.emit_guarded(arm, instructions, |_, instructions| {
-                instructions.push(Self::inst(
-                    Op::Store,
-                    None,
-                    None,
-                    vec![Operand::IdRef(ptr), Operand::IdRef(object)],
-                ));
-                Ok(())
-            })?;
-        }
+        let object_type = self.type_id(&object_ty)?;
+        let true_old = self.fresh();
+        instructions.push(Self::inst(
+            Op::Load,
+            Some(object_type),
+            Some(true_old),
+            vec![Operand::IdRef(true_ptr)],
+        ));
+        let false_old = self.fresh();
+        instructions.push(Self::inst(
+            Op::Load,
+            Some(object_type),
+            Some(false_old),
+            vec![Operand::IdRef(false_ptr)],
+        ));
+        let true_value = self.fresh();
+        instructions.push(Self::inst(
+            Op::Select,
+            Some(object_type),
+            Some(true_value),
+            vec![
+                Operand::IdRef(selected.cond),
+                Operand::IdRef(object),
+                Operand::IdRef(true_old),
+            ],
+        ));
+        let false_value = self.fresh();
+        instructions.push(Self::inst(
+            Op::Select,
+            Some(object_type),
+            Some(false_value),
+            vec![
+                Operand::IdRef(selected.cond),
+                Operand::IdRef(false_old),
+                Operand::IdRef(object),
+            ],
+        ));
+        instructions.push(Self::inst(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(true_ptr), Operand::IdRef(true_value)],
+        ));
+        instructions.push(Self::inst(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(false_ptr), Operand::IdRef(false_value)],
+        ));
         Ok(())
     }
 

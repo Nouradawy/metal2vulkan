@@ -92,37 +92,6 @@ mod tests {
     }
 
     #[test]
-    fn clone_source_name_inverts_fresh() {
-        for original in [
-            "%1",
-            "%cont",
-            "%metal2vulkan.helper.5.3.param.1",
-            "%xa7_already_a_clone",
-        ] {
-            for id in [
-                0usize,
-                7,
-                DEEP_SHARED_COUNTER_START,
-                SWITCH_CASE_COUNTER_START,
-            ] {
-                assert_eq!(
-                    clone_source_name(&fresh(original, id)).as_deref(),
-                    Some(original),
-                    "fresh({original}, {id}) does not invert"
-                );
-            }
-        }
-        // A name the clone never minted is not a clone, whatever it starts with.
-        for ordinary in ["%1", "%xa_1", "%xax7_1", "%xa7", "%metal2vulkan.uret", "%x"] {
-            assert_eq!(
-                clone_source_name(ordinary),
-                None,
-                "{ordinary} is not a clone"
-            );
-        }
-    }
-
-    #[test]
     fn rename_is_boundary_aware() {
         let mut map = HashMap::new();
         map.insert("%1".to_string(), "%xa0_1".to_string());

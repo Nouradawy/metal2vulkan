@@ -38,8 +38,8 @@ fn main() {
     // --stage vertex" mis-mappings when translating captured guest AIR.
     let mut stage = "auto".to_string();
     let mut emit_meta: Option<String> = None;
+    let mut simd_cluster32 = false;
     let mut raster_sample_count = None;
-    let mut vertex_amplification_count = 1;
     let mut kernel_local_size = [64, 1, 1];
     let mut kernel_dispatch = None;
     let mut translation_options = Vec::new();
@@ -58,10 +58,10 @@ options:
       shader stage (default: auto from AIR metadata; compute aliases kernel)
   --emit-meta out.json
       write ShaderReflection JSON (requires the serde feature; not passthrough)
+  --simd-cluster32
+      request 32-lane clustered subgroup reductions
   --raster-samples 1|2|4|8|16|32|64
       exact graphics-pipeline sample count for AIR sample-count queries
-  --vertex-amplification-count N
-      vertex amplification count the render pass encodes (default: 1, Metal's own default)
   --local X,Y,Z
       nominal Metal kernel threadgroup size (default: 64,1,1)
   --threads-per-grid X,Y,Z
@@ -87,23 +87,18 @@ options:
                 emit_meta = args.get(i + 1).cloned();
                 i += 2;
             }
+            // M-D2: cluster simd reductions to Metal's 32-lane simdgroup (see TransformOptions).
+            "--simd-cluster32" => {
+                simd_cluster32 = true;
+                translation_options.push("--simd-cluster32".to_string());
+                i += 1;
+            }
             "--raster-samples" => {
                 raster_sample_count = args.get(i + 1).and_then(|value| value.parse().ok());
                 if !matches!(raster_sample_count, Some(1 | 2 | 4 | 8 | 16 | 32 | 64)) {
                     fail("--raster-samples requires one of 1, 2, 4, 8, 16, 32, or 64");
                 }
                 translation_options.extend(["--raster-samples".to_string(), args[i + 1].clone()]);
-                i += 2;
-            }
-            "--vertex-amplification-count" => {
-                match args.get(i + 1).and_then(|value| value.parse::<u32>().ok()) {
-                    Some(count) if count >= 1 => vertex_amplification_count = count,
-                    _ => fail("--vertex-amplification-count requires a count of 1 or more"),
-                }
-                translation_options.extend([
-                    "--vertex-amplification-count".to_string(),
-                    args[i + 1].clone(),
-                ]);
                 i += 2;
             }
             "--local" => {
@@ -160,20 +155,6 @@ options:
             "--entry" => {
                 i += 2;
             }
-            // A leading dash is always a flag here, and an unknown one is a mistake rather than a
-            // path. Falling through to the positional list made `-o out.spv` write a file named
-            // `-o` in the working directory and silently never write `out.spv` -- the tool even
-            // printed "wrote -o". A misspelled `--stag vertex` failed the same way. There are
-            // exactly two positionals and neither can begin with a dash.
-            other if other.starts_with('-') && other.len() > 1 => {
-                fail(&format!(
-                    concat!(
-                        "unrecognized option `{}`; the input and output are positional ",
-                        "(`metal2vulkan <in.air|.ll> <out.spv>`), and --help lists every option"
-                    ),
-                    other
-                ));
-            }
             _ => {
                 pos.push(args[i].clone());
                 i += 1;
@@ -206,8 +187,8 @@ options:
     let options = TransformOptions {
         kernel_local_size,
         kernel_dispatch,
+        simd_cluster32,
         raster_sample_count,
-        vertex_amplification_count,
         ..TransformOptions::default()
     };
     let want_meta = emit_meta.is_some();

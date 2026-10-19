@@ -696,18 +696,9 @@ impl Emitter {
         // <4 x i16> array) each rewrite the other's word from their stale copy, losing writes that
         // Metal's 4-byte store keeps. Emit two 16-bit component stores through component access
         // chains instead wherever the storage class allows a 16-bit pointer without extra
-        // capabilities (Workgroup/Function/Private). StorageBuffer keeps the vector RMW, and the
-        // same inter-thread race is possible there in principle.
-        //
-        // The reason that used to be given for the StorageBuffer arm -- "a 16-bit StorageBuffer
-        // pointer needs StorageBuffer16BitAccess, which the executors do not enable" -- is FALSE:
-        // `validation/src/candidate.rs` enables `storage_buffer16_bit_access` and its 8-bit and
-        // uniform-and-storage siblings whenever the device reports them, and 276 corpus modules
-        // already use a narrow StorageBuffer pointer with no capability declared, spirv-val
-        // accepting and MoltenVK running them. What actually justifies leaving the arm alone is
-        // that it is DEAD: an `eprintln` on this branch, swept over all 14579 sources, fires on
-        // ZERO of them. Every vector word store the corpus reaches is Workgroup/Function/Private
-        // and takes the component-store path above. Measure it again before rewriting it.
+        // capabilities (Workgroup/Function/Private). StorageBuffer keeps the vector RMW: a 16-bit
+        // StorageBuffer pointer needs StorageBuffer16BitAccess, which the executors do not enable;
+        // the same inter-thread race is still possible there and needs that capability to fix.
         if matches!(
             pointer.storage,
             StorageClass::Workgroup | StorageClass::Function | StorageClass::Private

@@ -16,7 +16,6 @@
 //! Reflection never mutates the module, so reflected and non-reflected
 //! translation remain byte-identical.
 
-use crate::float16::f16_bits_to_f32;
 use crate::meta::{
     texture_shape_from_name, AirType, BufferAccess, FragMeta, FragRole, FunctionConstant, KernMeta,
     KernRole, TextureComponent, TextureDimension, TextureShape, VertMeta, VertOutRole, VertRole,
@@ -24,18 +23,6 @@ use crate::meta::{
 use crate::spirv_module::Module;
 
 mod footprint;
-mod nonwritable;
-
-/// Decorate every descriptor the finished module provably never writes `NonWritable`.
-///
-/// This states a fact about the module *in* the module rather than reflecting one out of it. It
-/// lives beside reflection because the buffer half of the proof is the access walk
-/// `add_buffer_footprints` already performs, and two implementations of "did any instruction write
-/// through this descriptor" would be two answers to drift apart. See `reflect::nonwritable` for what
-/// makes each walk's silence a proof rather than an absence of evidence.
-pub(crate) fn decorate_unwritten_descriptors(module: &mut Module) {
-    nonwritable::decorate_unwritten_descriptors(module);
-}
 
 /// Schema version of [`ShaderReflection`]. Bump on any breaking change to the serialized shape so a
 /// consumer's persisted reflection cache invalidates cleanly rather than deserializing stale fields.
@@ -100,106 +87,7 @@ pub(crate) fn decorate_unwritten_descriptors(module: &mut Module) {
 /// v41 stops reporting a constexpr sampler the finished module does not bind. A state no sample
 /// reads leaves a variable nothing references, which the module drops; reflection still asked a
 /// consumer to create a `VkSampler` there. 112 such bindings in 60 of the 2880-source sample.
-/// v42 reports a function-constant-gated `air.sampler` argument as the descriptor it is, in every
-/// stage. The fragment decode always did; kernel and vertex read the wrapped role through a
-/// promoted-role list that named `texture` but not `sampler`, so the same declaration produced a
-/// texture descriptor and no sampler descriptor. 9 such arguments in 6 of 14579 local corpus
-/// sources are kernel or vertex.
-/// v43 reports a function-constant-gated `air.vertex_output` as the varying it is. A vertex return
-/// struct and the fragment parameter list it feeds are one Metal declaration compiled twice, and
-/// the two are linked by `Location`; the fragment decode read a gated member as a varying and the
-/// vertex output decode dropped it, so every varying declared behind a gated one was numbered one
-/// lower on the vertex side. 106 of 14579 local corpus sources declare the shape that shifts.
-/// v44 reports a function-constant-gated `air.vertex_input` as the attribute it is. The wrapper
-/// says when a parameter is live, not whether it exists; the vertex decode read its roles through a
-/// resource-promotion list that named no stage-input role, so the argument became no input variable
-/// at all and reflection omitted the attribute an application had to bind. 573 such arguments in 89
-/// of 14579 local corpus sources; 59 attributes gained in 15 of the 2880-source sample, none lost.
-/// v45 reports a function-constant-gated `air.stage_in` as the descriptor-backed stream it is. The
-/// kernel decode collapsed it to the wrapper, so the parameter lowered to `OpUndef` and the kernel
-/// read nothing where the runtime had a vertex stream. 120 such arguments in 52 of 14579 local
-/// corpus sources; 12 of the 2880-source sample gain 24 `KernelStageInput` bindings and the same 24
-/// descriptors in the module.
-/// v46 stops reporting a texture whose Metal slot is a function-constant RUNNING SUM and whose own
-/// gate this module's initializers drive to zero. The sum is that argument's slot only while the
-/// argument is one the variant enables; for one it leaves out the global holds a LIVE argument's
-/// slot, so reflection named two different textures at one Metal index and the module decorated both
-/// with one descriptor. 338 of 14579 local corpus sources emitted a colliding slot; 92 remain, and
-/// those either state the shared slot as a literal (Metal's mutually exclusive alternatives) or are
-/// degenerate for a reason of their own.
-/// v47 folds the ordered `icmp` predicates and the remaining integer opcodes in an AIR static
-/// initializer, so a function-constant gate built from one is answered rather than guessed. An
-/// unevaluated predicate reads as "not enabled by default", and two corpus fragment shaders
-/// reported -- and emitted -- NO color attachment at all because their only `air.render_target` sat
-/// behind an `icmp ult`. 648 of the 10938 `icmp`s in the local corpus's static initializers are
-/// ordered comparisons.
-/// v48 derives the footprint of a descriptor the finished module never declares from the module's
-/// ADDRESSING MODEL rather than from what AIR declared about the buffer. Under Logical addressing
-/// every access reaches memory through a declared variable, so a binding with no variable executes
-/// zero bytes; the previous fallback only said that for a binding AIR already called `Unused` and
-/// answered `has_unbounded_access` for every other one. Measured over 2880 corpus sources, 2261
-/// reflected descriptors are absent from their module and 704 of them carried a non-`Unused`
-/// declared access; 251 of those, in 144 modules, are in modules that lower no pointer to a device
-/// address and are therefore provably untouched. `PhysicalStorageBuffer64` modules are unchanged:
-/// there a device address can reach a buffer that has no descriptor.
-/// v49 gives a descriptor the finished Logical module never declares the ACCESS its own footprint
-/// already proves. v48 answered zero bytes for exactly this binding while `access` kept AIR's
-/// declared `ReadOnly`/`ReadWrite`, so one function reported two incompatible facts about the same
-/// resource: nothing can reach a binding with no variable, and a consumer staging or barriering it
-/// on the strength of that access is serving an access the module cannot perform. Measured over the
-/// 2659 of 2880 sampled corpus sources that translate, 407 reflected buffer descriptors in 182
-/// modules carried a non-`Unused` access with no variable to reach them. `PhysicalStorageBuffer64`
-/// modules are unchanged, for the same reason v48 left their footprint conservative.
-/// v50 reads a static sampler's `lod_min_clamp` from the whole 16-bit half AIR stores at bits
-/// 24-39 of `words[0]`, not from the byte at 32-39 with a zero low byte assumed. Compiling one
-/// kernel per `constexpr sampler` option with metalfe-32023.883 shows the low byte is the encoding
-/// and not padding: `lod_clamp(3.7f, 4.0f)` emits the half `0x4366`, which v49 read as 3.5.
-/// **Measured reach over the 14579-source corpus: zero.** All 5499 static-sampler sites hold
-/// `lod_min_clamp` 0, so no reflection this corpus can produce changes; this is the field's
-/// derivation being made right rather than a reflection any local module reads differently.
-/// v51 widens the signed storage-image default to 16 bits for a `<short` texture, mirroring the
-/// `<ushort` branch that already widened the unsigned one. A `texture2d<short, write>` was
-/// decorated `Rgba8i` -- an 8-bit storage image for a 16-bit texture -- so every component a
-/// shader wrote through it was truncated to the signed byte range, and the reflected
-/// `storage_format` named the truncating format as though it were the right one.
-/// **Measured reach over the 14579-source corpus: 5 modules change SPIR-V and reflection, 0 change
-/// status.** The same fact is derived a second time from the intrinsic name in resource discovery,
-/// which is corrected to match; that branch has zero reach today, so it is parity, not the fix.
-/// v52 removes the four-byte floor on a struct's alignment in `spirv_size_align`, the third and last
-/// copy of one rule -- `9993cca8` took it out of `raw_size_align` and `1c2d724d` out of
-/// `memcpy_size_align`. `struct { short a[5]; uchar b[7]; }` is 17 bytes of members aligned to 2, so
-/// Metal's sizeof is 18, and Metal states it twice: `air.arg_type_size, i32 18` on the buffer and
-/// `sizeof` inside the shader. The floor made it 20, which became the buffer's `OpDecorate
-/// ArrayStride 20`, so every element but the zeroth was addressed two bytes per record too far
-/// along; the reflected footprints were rounded up to match.
-/// **Measured reach over the 14579-source corpus: 59 modules change SPIR-V, 11 change reflection, 0
-/// change status.** Device-proven by the authored case
-/// `a-record-whose-size-is-not-a-multiple-of-four`, which is MoltenVK Mismatch before and Match
-/// after with only `src/layout.rs` different between the two runs.
-/// v54 surfaces one embedded resource per element of a C-array argument-buffer member. AIR states a
-/// member's length in its `air.struct_type_info` tuple's `array_len` slot, and for a C array that is
-/// the ONLY statement of it -- the type name is the element type and the node's
-/// `air.location_index` count operand stays `1`. `device half4* bufs[2] [[id(12)]]` is two device
-/// addresses at ids 12 and 13 in consecutive 8-byte slots, and only the first was named, so a
-/// consumer left the second slot unwritten and a runtime index into the member read an address
-/// nothing populated. A texture array is NOT repeated in `argument_buffer_fields`: `01003197` gave
-/// `EmbeddedTexture::array_length` its count and every consumer derives the elements from that.
-/// **Measured reach over the 14579-source corpus: 0 modules change SPIR-V, 2 change reflection, 0
-/// change status.**
-/// v55 reports the ACCESS the walk saw, not the walk's answer ORed onto AIR's declaration, wherever
-/// the walk is provably complete. `widen_access` only ever widens because a store through a device
-/// address it cannot attribute would be missed -- but that risk has a boundary, and the boundary was
-/// already being computed. Under Logical addressing, with no pointer rooted at the descriptor
-/// escaping into an operand slot the walk does not model, there is nowhere else for an access to
-/// come from, and that is the same proof under which the module now decorates the descriptor
-/// `NonWritable` (`d1e8e223`). Reporting the wider answer beside that decoration made one function
-/// state two incompatible facts: the module told the driver the buffer is read-only while
-/// reflection told the consumer to stage it, barrier it, and read it back. AIR's `air.read_write`
-/// on a buffer the body only stores to describes the parameter, not the program.
-/// **Measured reach over the 14579-source corpus: 2258 buffer bindings in 1727 modules change
-/// access -- 1846 `ReadWrite`->`WriteOnly`, 388 `ReadWrite`->`ReadOnly`, 21 `WriteOnly`->`Unused`,
-/// 3 `ReadOnly`->`Unused`. No SPIR-V, no other reflected field, and no status changes.**
-pub const REFLECTION_VERSION: u32 = 55;
+pub const REFLECTION_VERSION: u32 = 41;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -208,6 +96,12 @@ pub const KERNEL_DISPATCH_PUSH_CONSTANT_SIZE: u32 = 48;
 /// Vulkan specialization-constant ids which select the exact local size of a decomposed dispatch
 /// region. Consumers must specialize all three values when creating each region pipeline.
 pub const KERNEL_LOCAL_SIZE_SPEC_IDS: [u32; 3] = [0, 1, 2];
+
+/// Vulkan specialization-constant id carrying the graphics pipeline's rasterization sample count, for a
+/// fragment shader that calls `get_num_samples()` when the translation was not told the count. Consumers
+/// specialize it with the pipeline's `rasterizationSamples`; unspecialized it reads 1. A pipeline whose
+/// module does not declare it may still name it - Vulkan ignores a map entry no constant uses.
+pub const RASTER_SAMPLE_COUNT_SPEC_ID: u32 = 0x4d53_0001;
 
 /// Default byte offset of the exact-thread dispatch-region payload.
 pub const DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET: u32 = 0;
@@ -672,38 +566,42 @@ impl DescriptorLayout {
     }
 }
 
-// The default-layout descriptor binding for one Metal resource index.
-//
-// Each of these is the same question [`DescriptorLayout`] answers for an arbitrary layout, asked of
-// [`DEFAULT_DESCRIPTOR_LAYOUT`], and it is asked through that type rather than spelled again over
-// the range constants the default layout is built from. Reflection assigns default bindings first
-// and `apply_descriptor_layout` rewrites them for a caller-selected layout, so the two answers are
-// compared against each other on every reconfigured module: a second spelling here is a second
-// place for the sampler-argument bound, or a band's extent, to be stated differently.
-
 pub const fn buffer_resource_binding(index: u32) -> Option<u32> {
-    DEFAULT_DESCRIPTOR_LAYOUT.buffer_binding(index)
+    BUFFER_BINDING_RANGE.binding(index)
 }
 
 pub const fn texture_resource_binding(index: u32) -> Option<u32> {
-    DEFAULT_DESCRIPTOR_LAYOUT.sampled_texture_binding(index)
+    TEXTURE_BINDING_RANGE.binding(index)
 }
 
 pub const fn storage_texture_resource_binding(index: u32) -> Option<u32> {
-    DEFAULT_DESCRIPTOR_LAYOUT.storage_texture_binding(index)
+    STORAGE_TEXTURE_BINDING_RANGE.binding(index)
 }
 
 pub const fn sampler_resource_binding(index: u32) -> Option<u32> {
-    DEFAULT_DESCRIPTOR_LAYOUT.sampler_binding(index)
+    if index < SAMPLER_ARGUMENT_COUNT {
+        SAMPLER_BINDING_RANGE.binding(index)
+    } else {
+        None
+    }
 }
 
 pub const fn color_input_resource_binding(index: u32) -> Option<u32> {
-    DEFAULT_DESCRIPTOR_LAYOUT.color_input_binding(index)
+    COLOR_INPUT_BINDING_RANGE.binding(index)
 }
 
 /// Storage-image descriptor used to emulate one implicit imageblock render-target/data-rate plane.
 pub const fn imageblock_resource_binding(attachment: u32, data_rate: u32) -> Option<u32> {
-    DEFAULT_DESCRIPTOR_LAYOUT.imageblock_binding(attachment, data_rate)
+    if data_rate >= IMAGEBLOCK_DATA_RATE_STRIDE {
+        return None;
+    }
+    let Some(offset) = attachment.checked_mul(IMAGEBLOCK_DATA_RATE_STRIDE) else {
+        return None;
+    };
+    let Some(offset) = offset.checked_add(data_rate) else {
+        return None;
+    };
+    IMAGEBLOCK_BINDING_RANGE.binding(offset)
 }
 
 pub const fn fragment_imageblock_resource_binding(master_member: u32) -> Option<u32> {
@@ -717,12 +615,6 @@ pub const ADDRESS_SPACE_CONSTANT: u32 = 2;
 /// AIR address space 3 = threadgroup memory. A `[[buffer(n)]]` in this space becomes a Workgroup
 /// `OpVariable` and consumes NO descriptor (its [`ResourceBinding::descriptor`] is `None`).
 pub const ADDRESS_SPACE_THREADGROUP: u32 = 3;
-/// Number of threadgroup-buffer argument-table entries exposed by the Metal ABI
-/// (`air.max_threadgroup_buffers` is 31, so indices run 0..=30). Threadgroup buffers take no
-/// descriptor, so this bounds the runtime-length specialization table rather than a binding band.
-pub const THREADGROUP_BUFFER_ARGUMENT_COUNT: u32 = 32;
-pub const THREADGROUP_BUFFER_ARGUMENT_COUNT_USIZE: usize =
-    THREADGROUP_BUFFER_ARGUMENT_COUNT as usize;
 
 /// The shader stage of a reflected module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1091,46 +983,6 @@ impl RuntimeSamplerState {
     }
 }
 
-impl StaticSamplerState {
-    /// The state a consumer must bind for a [`ResourceKind::SynthesizedReadSampler`].
-    ///
-    /// This descriptor answers to no Metal argument -- the translator invents it because SPIR-V has
-    /// no cube texel fetch (`OpImageFetch` forbids `Dim Cube`) and no sampler-free LOD query, so a
-    /// texel READ that AIR spells exactly becomes a SAMPLE, and a sample needs a sampler. It is
-    /// only equal to the read AIR asked for when that sampler filters nothing: nearest at both
-    /// magnification and minification, nearest between mip levels, and no LOD bias. The cube
-    /// direction is built to pass through the exact centre of the named texel, so nearest returns
-    /// that texel's bytes unchanged -- and a LINEAR sampler bound here silently returns a blend of
-    /// four texels instead, in a module that validates, binds and reflects cleanly.
-    ///
-    /// Addressing is clamp-to-edge, which for a cube direction and a normalized in-range coordinate
-    /// never selects a different texel than any other mode; it is named so the descriptor has one
-    /// answer rather than a caller's choice. `raw_words` is zero because no AIR constexpr encodes
-    /// this sampler -- the same convention [`RuntimeSamplerState::lowering_state`] uses.
-    pub const fn synthesized_read_sampler() -> Self {
-        Self {
-            min_filter: SamplerFilter::Nearest,
-            mag_filter: SamplerFilter::Nearest,
-            mip_filter: SamplerMipFilter::Nearest,
-            address_mode_s: SamplerAddressMode::ClampToEdge,
-            address_mode_t: SamplerAddressMode::ClampToEdge,
-            address_mode_r: SamplerAddressMode::ClampToEdge,
-            coordinates: SamplerCoordinates::Normalized,
-            // What AIR's own constexpr default decodes to, so this state reads like every other
-            // sampler in the reflection. Neither field can move a result: the translator only ever
-            // samples through this descriptor at an explicit LOD with a nearest mip filter.
-            compare_function: SamplerCompareFunction::Never,
-            max_anisotropy: 1,
-            lod_min_clamp: 0.0,
-            lod_max_clamp: 65504.0,
-            border_color: SamplerBorderColor::TransparentBlack,
-            reduction: SamplerReduction::WeightedAverage,
-            lod_bias: 0.0,
-            raw_words: [0; 2],
-        }
-    }
-}
-
 /// One runtime sampler state applied to every AIR sampler parameter at the same Metal index.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1163,7 +1015,6 @@ pub enum RuntimeStorageImageFormat {
     Rgba32Uint,
     R32Sint,
     Rgba8Sint,
-    Rgba16Sint,
     Rgba32Sint,
 }
 
@@ -1185,9 +1036,7 @@ impl RuntimeStorageImageFormat {
             | Self::Rgba8Uint
             | Self::Rgba16Uint
             | Self::Rgba32Uint => TextureComponent::Uint,
-            Self::R32Sint | Self::Rgba8Sint | Self::Rgba16Sint | Self::Rgba32Sint => {
-                TextureComponent::Sint
-            }
+            Self::R32Sint | Self::Rgba8Sint | Self::Rgba32Sint => TextureComponent::Sint,
         }
     }
 
@@ -1209,7 +1058,6 @@ impl RuntimeStorageImageFormat {
             Self::Rgba32Uint => Some(TextureFormat::Rgba32ui),
             Self::R32Sint => Some(TextureFormat::R32i),
             Self::Rgba8Sint => Some(TextureFormat::Rgba8i),
-            Self::Rgba16Sint => Some(TextureFormat::Rgba16i),
             Self::Rgba32Sint => Some(TextureFormat::Rgba32i),
             Self::Bgra8Unorm => None,
         }
@@ -1270,10 +1118,8 @@ impl StaticSamplerState {
     /// Decode the two `i64` words AIR stores for a `constexpr sampler`.
     ///
     /// The complete bit map, so that what is read and what is not are both stated rather than
-    /// implied by the shifts below. Every field below is what the Metal frontend emits for the
-    /// matching `constexpr sampler` option, measured one option at a time; the table lives in
-    /// `every_metal_constexpr_sampler_option_decodes_to_what_the_frontend_emits`. Counts are over
-    /// the 5499 static-sampler sites in the 14579-source corpus.
+    /// implied by the shifts below. Counts are over the 1084 static samplers in a 2880-source
+    /// corpus.
     ///
     /// | `words[0]` | Field |
     /// |---|---|
@@ -1282,21 +1128,20 @@ impl StaticSamplerState {
     /// | 15 | `coordinates` |
     /// | 16-19 | `compare_function` |
     /// | 20-23 | `max_anisotropy - 1` |
-    /// | 24-39 | `lod_min_clamp` half |
+    /// | 24-31 | **not read** (always zero) |
+    /// | 32-39 | high byte of the `lod_min_clamp` half; the low byte is assumed zero (always zero) |
     /// | 40-55 | `lod_max_clamp` half |
     /// | 56-57, 58-59 | `border_color` / `reduction` |
     /// | 60-62 | **not read** (always zero) |
-    /// | 63 | **not read**; set on every sampler the 2.6.0 frontend emits and none the 2.8.0 one does |
+    /// | 63 | **not read**, and set on 151 of them, with no correlate among the decoded fields |
     ///
     /// | `words[1]` | Field |
     /// |---|---|
-    /// | 0-15 | `lod_bias` half, which the `bias(f)` option sets |
+    /// | 0-15 | `lod_bias` half |
     /// | 16-63 | **not read** (always zero) |
     ///
-    /// Bit 63 is not a sampler property: the metalfe-32023.850 frontend (`air.version` 2.6.0, which
-    /// spells the state as one `i64`) sets it on every sampler it emits and metalfe-32023.884
-    /// (2.8.0, `[2 x i64]`) never does, so ignoring it is a conclusion rather than a gap.
-    /// An unrecognized *enum code* in a field this does read is
+    /// Bit 63 is a gap, not a decision: no evidence says what it selects, and every translation
+    /// carrying it is currently accepted. An unrecognized *enum code* in a field this does read is
     /// a different matter and returns `Err`, since the alternative would be inventing a filter or
     /// address mode. `raw_words` is retained so a consumer can act on a bit this does not decode.
     pub(crate) fn from_air_words(words: [u64; 2]) -> Result<Self, String> {
@@ -1355,7 +1200,7 @@ impl StaticSamplerState {
             2 => SamplerReduction::Maximum,
             value => return Err(format!("unsupported AIR sampler reduction code {value}")),
         };
-        let min_half = ((word >> 24) & 0xffff) as u16;
+        let min_half = (((word >> 32) & 0xff) as u16) << 8;
         let max_half = ((word >> 40) & 0xffff) as u16;
         let bias_half = (words[1] & 0xffff) as u16;
         Ok(Self {
@@ -1368,11 +1213,11 @@ impl StaticSamplerState {
             coordinates,
             compare_function,
             max_anisotropy: (((word >> 20) & 0xf) as u32) + 1,
-            lod_min_clamp: f16_bits_to_f32(min_half),
-            lod_max_clamp: f16_bits_to_f32(max_half),
+            lod_min_clamp: half_to_f32(min_half),
+            lod_max_clamp: half_to_f32(max_half),
             border_color,
             reduction,
-            lod_bias: f16_bits_to_f32(bias_half),
+            lod_bias: half_to_f32(bias_half),
             raw_words: words,
         })
     }
@@ -1476,6 +1321,24 @@ impl StaticSamplerState {
         .get(dimension)
         .copied()
     }
+}
+
+fn half_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = (bits >> 10) & 0x1f;
+    let fraction = u32::from(bits & 0x03ff);
+    let value = match exponent {
+        0 if fraction == 0 => sign,
+        0 => {
+            let leading = 31 - fraction.leading_zeros();
+            let normalized_fraction = (fraction << (10 - leading)) & 0x03ff;
+            let exponent = 127 - 14 - (10 - leading);
+            sign | (exponent << 23) | (normalized_fraction << 13)
+        }
+        0x1f => sign | 0x7f80_0000 | (fraction << 13),
+        _ => sign | (u32::from(exponent) + 112) << 23 | (fraction << 13),
+    };
+    f32::from_bits(value)
 }
 
 /// The argument-buffer source of a translator-synthesized embedded texture: which
@@ -2529,12 +2392,6 @@ impl ShaderReflection {
                 }
                 _ => continue,
             };
-            // A synthesized read sampler is only correct when it filters nothing, and until now the
-            // only place that said so was a comment in the lowering that creates it. Report the
-            // state, so a consumer binds it from the reflection rather than from a claim about what
-            // some harness happens to do.
-            let static_sampler = (kind == ResourceKind::SynthesizedReadSampler)
-                .then(StaticSamplerState::synthesized_read_sampler);
             self.bindings.push(ResourceBinding {
                 kind,
                 metal_index,
@@ -2554,7 +2411,7 @@ impl ShaderReflection {
                 texture_shape,
                 embedded_source: None,
                 access,
-                static_sampler,
+                static_sampler: None,
             });
         }
     }
@@ -2715,12 +2572,8 @@ impl ShaderReflection {
                 | FragRole::SampleMaskIn
                 | FragRole::ViewportArrayIndex
                 | FragRole::RenderTargetArrayIndex
-                | FragRole::AmplificationId
-                | FragRole::AmplificationCount
                 | FragRole::Varying(_)
                 | FragRole::ImageblockData
-                | FragRole::ExecutionGroup { .. }
-                | FragRole::VariantAbsentTexture
                 | FragRole::Other => {
                     continue;
                 }
@@ -2876,14 +2729,14 @@ impl ShaderReflection {
                 VertRole::VertexInput(_)
                 | VertRole::VertexId
                 | VertRole::InstanceId
+                | VertRole::BaseInstance
+                | VertRole::BaseVertex
                 | VertRole::PatchControlPoints
                 | VertRole::PatchInput(_)
                 | VertRole::PositionInPatch
                 | VertRole::PatchId
                 | VertRole::AmplificationId
                 | VertRole::AmplificationCount
-                | VertRole::ExecutionGroup { .. }
-                | VertRole::VariantAbsentTexture
                 | VertRole::Other => continue,
             };
             bindings.push(binding);

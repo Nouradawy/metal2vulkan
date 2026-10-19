@@ -55,8 +55,6 @@ mod selection_merge;
 pub(in crate::native) use selection_merge::*;
 mod multi_exit;
 pub(in crate::native) use multi_exit::*;
-mod dispatch_state;
-pub(in crate::native) use dispatch_state::*;
 mod phi_util;
 pub(in crate::native) use phi_util::*;
 mod rewrite;

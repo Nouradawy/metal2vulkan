@@ -52,34 +52,6 @@ pub(in crate::passes) fn recover_inlined_local_pointer_fields(ctx: &mut Ctx, ent
         return;
     }
 
-    // Forwarding substitutes `source` for the load at every use, so the source has to be usable
-    // wherever the load was, and only the load side is filtered above. A source is NOT required to
-    // keep its declared shape across the interface boundary, and two of those changes are by design:
-    // an entry texture parameter is pointer-shaped when its store is recorded and a loaded image id
-    // by the second replay, which is the whole reason that replay exists. What is never a
-    // substitution is a plain numeric value -- a device buffer parameter that reaches the second
-    // replay as its `ulong` address hands every consumer a 64-bit integer where a handle belongs,
-    // and an access chain cannot descend that at all.
-    //
-    // So the test is on the source, not on agreement between the two: it must still be one of the
-    // opaque handle shapes the load side already accepts.
-    let value_types = function_value_types(ctx, entry_idx);
-    let is_handle = |id: Word| {
-        value_types
-            .get(&id)
-            .and_then(|ty| type_defs.get(ty))
-            .is_some_and(|definition| {
-                matches!(
-                    definition.class.opcode,
-                    Op::TypePointer
-                        | Op::TypeImage
-                        | Op::TypeSampler
-                        | Op::TypeSampledImage
-                        | Op::TypeAccelerationStructureKHR
-                )
-            })
-    };
-
     let mut replacements = Vec::new();
     for blk in &ctx.module.functions[entry_idx].blocks {
         for inst in &blk.instructions {
@@ -122,12 +94,6 @@ pub(in crate::passes) fn recover_inlined_local_pointer_fields(ctx: &mut Ctx, ent
             let Some(source) = stored_fields.get(&key).copied() else {
                 continue;
             };
-            // Decline rather than rewrite: a handle load whose recovered source is no longer a
-            // handle has no well typed forwarding, and leaving the load alone keeps whatever the
-            // placeholder path already decided about it.
-            if !is_handle(source) {
-                continue;
-            }
             replacements.push((result, source));
         }
     }

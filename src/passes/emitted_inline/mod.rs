@@ -131,38 +131,6 @@ pub(super) fn complete_inlined_access_chain_descent(ctx: &mut Ctx, entry_idx: us
     }
 }
 
-/// Carry a cloned callee instruction's own decorations onto the copy the splice just gave a fresh id.
-///
-/// A decoration on a value states a property of the operation, not of the function the operation was
-/// written in: `NoContraction` says Metal was never given permission to fuse this multiply. Inlining
-/// renumbers the callee's results, so a decoration naming the original names nothing in the caller,
-/// and it is swept as dangling once the now-unreferenced helper is pruned -- the shipped module then
-/// silently regains the permission the source withheld. Copying the decoration onto the clone keeps
-/// the statement attached to the operation across the splice.
-fn clone_inlined_value_decorations(ctx: &mut Ctx, cloned_results: &[(Word, Word)]) {
-    if cloned_results.is_empty() {
-        return;
-    }
-    let carried = cloned_results
-        .iter()
-        .flat_map(|&(old, fresh)| {
-            ctx.module
-                .annotations
-                .iter()
-                .filter(move |annotation| {
-                    annotation.class.opcode == Op::Decorate
-                        && annotation.operands.first() == Some(&Operand::IdRef(old))
-                })
-                .map(move |annotation| {
-                    let mut cloned = annotation.clone();
-                    cloned.operands[0] = Operand::IdRef(fresh);
-                    cloned
-                })
-        })
-        .collect::<Vec<_>>();
-    ctx.module.annotations.extend(carried);
-}
-
 /// Inline only calls whose callee id is in `selected`.
 ///
 /// This is the producer-side seam before serialization. It deliberately leaves dead helper
@@ -1196,6 +1164,12 @@ fn inline_one_call(
         })
         .collect::<HashMap<_, _>>();
     let mut elided_aggregate_extracts = HashSet::new();
+    let callee_definitions = callee
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| instruction.result_id.map(|id| (id, instruction)))
+        .collect::<HashMap<_, _>>();
     for instruction in callee.blocks.iter().flat_map(|block| &block.instructions) {
         if instruction.class.opcode != Op::CompositeExtract {
             continue;
@@ -1205,21 +1179,20 @@ fn inline_one_call(
         else {
             continue;
         };
-        let Some(root) = remap.get(composite).copied() else {
+        let Some(path) = extract_path(instruction) else {
             continue;
         };
-        let Some(path) = instruction
-            .operands
-            .iter()
-            .skip(1)
-            .map(|operand| match operand {
-                Operand::LiteralBit32(index) => Some(*index),
-                _ => None,
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
+        // A pointer reached through a nested by-value aggregate arrives as an extract of an
+        // extract: `sampler { ptr } = Sampler_h.1`, then `ptr = sampler.0`. The sidecar fact names
+        // the outermost aggregate and the whole path, so fold the chain -- inside the callee down
+        // to one of its parameters, then in the caller down to the aggregate the fact was recorded
+        // on -- before asking. An unfolded chain matched no fact, kept the integer payload slot,
+        // and a sample's sampler then fell to the image pass's synthesized default.
+        let (local_root, path) = fold_extract_chain(*composite, path, &callee_definitions);
+        let Some(root) = remap.get(&local_root).copied() else {
             continue;
         };
+        let (root, path) = fold_extract_chain(root, path, &definitions);
         if let Some(source) = ctx
             .emit_sidecar
             .aggregate_pointer_values
@@ -1296,11 +1269,7 @@ fn inline_one_call(
     let fresh_for = |old: Word, ctx: &mut Ctx, remap: &mut HashMap<Word, Word>| -> Word {
         *remap.entry(old).or_insert_with(|| ctx.module.fresh_id())
     };
-    // Pre-allocate fresh ids for all block labels + instruction results. The results that get a
-    // fresh id here -- as opposed to one already in `remap`, which names a value the caller already
-    // has -- are exactly the callee instructions this splice clones, so they are also exactly the
-    // ones whose decorations have to be carried over.
-    let mut cloned_results: Vec<(Word, Word)> = Vec::new();
+    // Pre-allocate fresh ids for all block labels + instruction results.
     for blk in &callee.blocks {
         if let Some(lbl) = &blk.label {
             if let Some(rid) = lbl.result_id {
@@ -1310,12 +1279,11 @@ fn inline_one_call(
         for inst in &blk.instructions {
             if let Some(rid) = inst.result_id {
                 if !remap.contains_key(&rid) {
-                    cloned_results.push((rid, fresh_for(rid, ctx, &mut remap)));
+                    fresh_for(rid, ctx, &mut remap);
                 }
             }
         }
     }
-    clone_inlined_value_decorations(ctx, &cloned_results);
     ctx.emit_sidecar.clone_inlined_facts(&remap);
     ctx.emit_sidecar
         .remap_local_pointer_field_store_sources(&remap);
@@ -1402,6 +1370,48 @@ fn inline_one_call(
         &byte_view_plan,
         &elided_aggregate_extracts,
     )
+}
+
+/// The literal index path of one `OpCompositeExtract`, or `None` for a dynamic one.
+fn extract_path(instruction: &Instruction) -> Option<Vec<u32>> {
+    instruction
+        .operands
+        .iter()
+        .skip(1)
+        .map(|operand| match operand {
+            Operand::LiteralBit32(index) => Some(*index),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Fold a chain of literal `OpCompositeExtract`s ending at `value` into its root aggregate and the
+/// concatenated path: `extract(extract(a, [1]), [0])` asked at `[..]` is `a` asked at `[1, 0, ..]`.
+/// Stops at the first value `definitions` does not define as such an extract.
+fn fold_extract_chain(
+    mut value: Word,
+    mut path: Vec<u32>,
+    definitions: &HashMap<Word, &Instruction>,
+) -> (Word, Vec<u32>) {
+    let mut visited = HashSet::new();
+    while visited.insert(value) {
+        let Some(definition) = definitions.get(&value) else {
+            break;
+        };
+        if definition.class.opcode != Op::CompositeExtract {
+            break;
+        }
+        let (Some(Operand::IdRef(composite)), Some(prefix)) =
+            (definition.operands.first(), extract_path(definition))
+        else {
+            break;
+        };
+        let mut full = prefix;
+        full.extend_from_slice(&path);
+        path = full;
+        value = *composite;
+    }
+    (value, path)
 }
 
 fn resolve_inserted_object(
@@ -1690,19 +1700,11 @@ fn inline_multiblock(
     let insert_at = bi + 1;
     {
         let func = &mut ctx.module.functions[entry_idx];
-        // Snapshot the caller's own block labels BEFORE the splice. Every phi naming the caller block
-        // as a predecessor has to be rewired wherever it lives, not only in the blocks that follow
-        // it: a back edge out of the caller block reaches a header that PRECEDES it in the block
-        // list, and that header's phi is exactly as severed as one in the tail. What must not be
-        // rewired is the cloned callee blocks and the continuation -- when the callee entry is
-        // appended into the caller block, both name the caller block on purpose, because the entry's
-        // instructions genuinely live there now.
-        let caller_blocks = func
-            .blocks
+        let mut tail: Vec<Block> = func.blocks.split_off(insert_at);
+        let tail_labels = tail
             .iter()
             .filter_map(|block| block.label.as_ref()?.result_id)
             .collect::<HashSet<_>>();
-        let mut tail: Vec<Block> = func.blocks.split_off(insert_at);
         func.blocks.extend(new_blocks);
         func.blocks.push(cont_block);
         func.blocks.append(&mut tail);
@@ -1716,7 +1718,7 @@ fn inline_multiblock(
                 let Some(label) = blk.label.as_ref().and_then(|label| label.result_id) else {
                     continue;
                 };
-                if !caller_blocks.contains(&label) {
+                if !tail_labels.contains(&label) {
                     continue;
                 }
                 for inst in &mut blk.instructions {

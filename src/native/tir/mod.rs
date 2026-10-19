@@ -847,66 +847,11 @@ enum TirInstData {
     Select(Option<Box<(TypedValue, TypedValue)>>),
 }
 
-/// The fast-math permissions one float arithmetic instruction grants, as the set of LLVM flag
-/// keywords it carries. This is a whitelist, exactly like SPIR-V's `FPFastMathMode`, so the two
-/// translate one-for-one; see [`TirInst::float_math_mode`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::native) struct FloatMathMode {
-    /// `nnan` -- the operands and result are assumed not to be NaN.
-    pub(in crate::native) not_nan: bool,
-    /// `ninf` -- the operands and result are assumed not to be an infinity.
-    pub(in crate::native) not_inf: bool,
-    /// `nsz` -- the sign of a zero result carries no information.
-    pub(in crate::native) signed_zero_insignificant: bool,
-    /// `arcp` -- a division may become a multiply by an approximate reciprocal.
-    pub(in crate::native) allow_reciprocal: bool,
-    /// `contract` -- a multiply feeding an add may be fused into one rounding.
-    pub(in crate::native) allow_contract: bool,
-    /// `reassoc` -- an association chain may be regrouped.
-    pub(in crate::native) allow_reassociate: bool,
-}
-
-impl FloatMathMode {
-    /// The permissions an LLVM flag run grants. `afn` (approximate library functions) has no
-    /// `FPFastMathMode` bit and is therefore not represented: it says nothing about the arithmetic
-    /// operators this mode decorates.
-    fn from_llvm_flags(flags: &[&str]) -> Self {
-        let has = |keyword: &str| flags.contains(&keyword);
-        Self {
-            not_nan: has("nnan"),
-            not_inf: has("ninf"),
-            signed_zero_insignificant: has("nsz"),
-            allow_reciprocal: has("arcp"),
-            allow_contract: has("contract"),
-            allow_reassociate: has("reassoc"),
-        }
-    }
-
-    /// True when this mode withholds nothing that changes the arithmetic, so leaving the emitted
-    /// instruction undecorated says everything the flag run says that matters.
-    ///
-    /// Three of the six permissions rewrite an expression: fusing a multiply into an add,
-    /// regrouping an association chain, and turning a division into a multiply by a reciprocal.
-    /// The other three -- `nnan`, `ninf`, `nsz` -- only license folding an expression LLVM already
-    /// had the same licence to fold, so a withheld one is observable only where LLVM KEPT such an
-    /// expression. Censused over all 14579 corpus sources: **3 instructions in 3 sources**, all
-    /// `fsub float 0.0, %x`, whose only exposure is the sign of a zero, and no shader anywhere in
-    /// the corpus asks an `fcmp uno`/`ord` question. Decorating for them would put
-    /// `SPV_KHR_float_controls2` on every module that spells a flag run at all.
-    fn grants_every_rewrite(self) -> bool {
-        self.allow_contract && self.allow_reassociate && self.allow_reciprocal
-    }
-}
-
 #[derive(Clone, Debug)]
 struct TirInstDetails {
     /// LLVM's aggregate `fast` floating-point flag on this instruction. Keeping it in the existing
     /// opcode-detail allocation avoids enlarging every instruction carrier.
     fast_math: bool,
-    /// The fast-math permissions a float `fmul`/`fadd`/`fsub`/`fdiv` GRANTS, when it does not grant
-    /// all of them. `None` on every other instruction and on one marked `fast`, which is the
-    /// permissive answer and matches how a synthesized instruction is emitted.
-    float_math_mode: Option<FloatMathMode>,
     payload: TirInstData,
 }
 
@@ -920,14 +865,6 @@ enum EmitScanData {
 impl TirInst {
     pub(super) fn fast_math(&self) -> bool {
         self.data.fast_math
-    }
-
-    /// The fast-math permissions this float arithmetic instruction grants, when it withholds any.
-    ///
-    /// SPIR-V has no per-module math mode, so a withheld permission has to travel on the emitted
-    /// instruction as an `FPFastMathMode` decoration; see `emit_body_inst`.
-    pub(in crate::native) fn float_math_mode(&self) -> Option<FloatMathMode> {
-        self.data.float_math_mode
     }
 
     /// Visit the instruction's def/use edges without retaining a second copy of resolved operand values.
@@ -1246,7 +1183,6 @@ impl TirInst {
             opcode: TirOpcode::Metal2VulkanInlineParameter,
             data: Box::new(TirInstDetails {
                 fast_math: false,
-                float_math_mode: None,
                 payload: TirInstData::Plain,
             }),
         }

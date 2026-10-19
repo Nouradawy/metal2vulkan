@@ -1469,6 +1469,17 @@ fn collect_llvalue_locals(value: &crate::native::ir::LlValue, out: &mut Vec<Stri
     }
 }
 
+fn terminator_uses(carrier: &crate::native::tir::TirBlock) -> Vec<String> {
+    match &carrier.terminator {
+        crate::native::tir::TirTerminator::Br(_)
+        | crate::native::tir::TirTerminator::Ret(None)
+        | crate::native::tir::TirTerminator::Unreachable => Vec::new(),
+        crate::native::tir::TirTerminator::BrCond { cond, .. }
+        | crate::native::tir::TirTerminator::Switch { selector: cond, .. }
+        | crate::native::tir::TirTerminator::Ret(Some(cond)) => vec![cond.clone()],
+    }
+}
+
 fn multilevel_break_switch_witnesses(blocks: &[BodyBlock]) -> Vec<String> {
     let forest = analyze(blocks);
     let mut out = Vec::new();

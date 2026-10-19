@@ -327,11 +327,13 @@ pub(in crate::passes) fn private_zero_pointer_for_type(
     ptr_ty: Word,
 ) -> Result<Word, String> {
     let pointee = private_pointer_pointee(ctx, ptr_ty).ok_or("private pointer type")?;
-    // One null per pointee type, as in `push_null_copy`. Each neutralized chain still gets its own
-    // variable -- two absent chains are two addresses in Metal and merging them would let one
-    // observe the other's store -- but the initializer is a value, not storage, and a second
-    // `OpConstantNull` of the same type is a byte-identical global standing for the same fact.
-    let init = ctx.get_or_create(Op::ConstantNull, Some(pointee), vec![]);
+    let init = ctx.module.fresh_id();
+    ctx.new_globals.push(Instruction::new(
+        Op::ConstantNull,
+        Some(pointee),
+        Some(init),
+        vec![],
+    ));
     let var = ctx.module.fresh_id();
     ctx.new_globals.push(Instruction::new(
         Op::Variable,
@@ -385,12 +387,13 @@ pub(in crate::passes) fn push_null_copy(
         ));
         return;
     }
-    // One null per type, not one per call. `OpConstantNull` has no operands, so every call for the
-    // same `result_type` minted a byte-identical global: 83 of the 84 corpus sources that reach here
-    // carried at least one duplicate and one carried 48. Duplicates are legal SPIR-V and change no
-    // answer, but they leave two ids standing for one fact, which is the shape an id-equality test
-    // elsewhere silently gets wrong.
-    let zero = ctx.get_or_create(Op::ConstantNull, Some(result_type), vec![]);
+    let zero = ctx.module.fresh_id();
+    ctx.new_globals.push(Instruction::new(
+        Op::ConstantNull,
+        Some(result_type),
+        Some(zero),
+        vec![],
+    ));
     out.push(Instruction::new(
         Op::CopyObject,
         Some(result_type),
@@ -428,10 +431,6 @@ pub(in crate::passes) fn is_function_variable(inst: &Instruction) -> bool {
 /// like `count == 0 ? sum : sum / count`, but the native IR can still contain an eager `OpUDiv`
 /// feeding an `OpSelect`. Guard denominator zeros to one so the normal selected arm remains
 /// unchanged while the otherwise-undefined arm becomes deterministic across Vulkan drivers.
-///
-/// A denominator that is already a non-zero constant needs no guard: dividing by a stride, a lane
-/// count or a literal is the common case, and emitting a predicate that folds to false there costs
-/// two instructions per divide in every such module.
 pub(in crate::passes) fn guard_integer_division_by_zero(ctx: &mut Ctx, entry_idx: usize) {
     let n_blocks = ctx.module.functions[entry_idx].blocks.len();
     for bi in 0..n_blocks {
@@ -453,12 +452,6 @@ pub(in crate::passes) fn guard_integer_division_by_zero(ctx: &mut Ctx, entry_idx
                 continue;
             };
             let denom = *denom;
-            // A guard on a denominator that is a non-zero constant is two dead instructions: the
-            // `IEqual` is a compile-time false and the `Select` always yields the original operand.
-            if integer_constant_is_never_zero(ctx, denom) {
-                out.push(inst);
-                continue;
-            }
             let Some((zero, one, pred_ty)) = integer_division_guard_values(ctx, result_ty) else {
                 out.push(inst);
                 continue;
@@ -531,5 +524,37 @@ pub(in crate::passes) fn const_composite_splat(
     value: Word,
     lanes: u32,
 ) -> Word {
-    ctx.const_composite(ty, vec![value; lanes as usize])
+    let key = SynthCacheKey::CompositeSplat { ty, value, lanes };
+    if let Some(&id) = ctx.synth_cache.get(&key) {
+        return id;
+    }
+    for inst in ctx
+        .module
+        .types_global_values
+        .iter()
+        .chain(ctx.new_globals.iter())
+    {
+        if inst.class.opcode == Op::ConstantComposite
+            && inst.result_type == Some(ty)
+            && inst.operands.len() == lanes as usize
+            && inst
+                .operands
+                .iter()
+                .all(|operand| operand == &Operand::IdRef(value))
+        {
+            if let Some(id) = inst.result_id {
+                ctx.synth_cache.insert(key, id);
+                return id;
+            }
+        }
+    }
+    let id = ctx.module.fresh_id();
+    ctx.new_globals.push(Instruction::new(
+        Op::ConstantComposite,
+        Some(ty),
+        Some(id),
+        (0..lanes).map(|_| Operand::IdRef(value)).collect(),
+    ));
+    ctx.synth_cache.insert(key, id);
+    id
 }

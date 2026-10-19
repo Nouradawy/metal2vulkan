@@ -127,16 +127,12 @@ fn a_device_address_kernel_translates_to_the_same_bytes_every_time() {
     );
 }
 
-/// A kernel with one bound resource parameter and one that is never bound.
+/// A kernel whose only resource parameter is never bound.
 ///
-/// The argument list names `%out` and stops there, so `%u` has no descriptor to bind to and the
-/// pipeline re-classes it into a null-initialized Private placeholder root, rewriting every load
-/// from it into a copy of that type's zero. One `OpConstantNull` is minted per distinct load result
-/// type, and the order they are minted in is the order they are declared in the module.
-///
-/// `%out` is bound so that the kernel's one store reaches a descriptor. Left unbound it landed in a
-/// Private placeholder too, which made this a kernel that reads nothing and writes nowhere -- the
-/// nulls it was written to count were the only thing in it that still meant anything.
+/// Without `!air.kernel` metadata naming it, `%u` has no descriptor to bind to, so the pipeline
+/// re-classes it into a null-initialized Private placeholder root and rewrites every load from it
+/// into a copy of that type's zero. One `OpConstantNull` is minted per distinct load result type,
+/// and the order they are minted in is the order they are declared in the module.
 ///
 /// That order used to come from a `HashSet` of the result types, so this kernel's three nulls came
 /// out in a different permutation on every run. Three distinct load types make an accidental
@@ -165,12 +161,6 @@ entry:
   store float %t1, ptr addrspace(1) %out
   ret void
 }
-
-!air.kernel = !{!0}
-!0 = !{ptr @k, !1, !2}
-!1 = !{}
-!2 = !{!3}
-!3 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.write", !"air.address_space", i32 1, !"air.arg_type_name", !"float*", !"air.arg_name", !"out"}
 "#;
 
 /// The zero-root rewrite is the path this test exists for; assert the module really takes it, so a

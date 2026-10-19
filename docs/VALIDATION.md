@@ -19,8 +19,8 @@ Run Rust tests with Cargo's default available parallelism:
 ```sh
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test -p metal2vulkan --all-features
-cargo test -p metal2vulkan-validation --all-features
+cargo test -p metal2vulkan
+cargo test -p metal2vulkan-validation
 ```
 
 CI uses owned synthetic fixtures. Private AIR and machine-specific GPU execution are optional.
@@ -36,14 +36,6 @@ cargo run -p metal2vulkan-validation --release --bin corpus-harvest
 cargo run -p metal2vulkan-validation --bin corpus-index
 cargo run -p metal2vulkan-validation --bin corpus-next -- --limit 1
 ```
-
-`corpus-next --coverage` orders the same case-less sources by what authoring one would add rather
-than by hash: each row's `reach` is the total number of case-less sources that call the `air.*`
-symbols this source would be the first cased source to call, and `calls` is how many distinct
-symbols it calls at all, which breaks ties toward the cheapest row to author. Coverage is
-source-level -- a symbol counts as covered once any source with a case calls it -- so `reach` is an
-upper bound on what one case closes, not a promise. The query reads only `sources`, `cases`, and
-the cached `triage_analysis` histogram; it opens no source shard.
 
 Ordinary `corpus-index` runs are incremental: unchanged multi-gigabyte AIR source shards are not
 opened. Use `corpus-index -- --rebuild` only for explicit recovery; `--check` verifies a cloned,
@@ -320,24 +312,6 @@ only that identity's observations:
 cargo run -p metal2vulkan-validation --bin corpus-case-check -- \
   --delete-air AIR_SHA256 --delete-name CASE_NAME
 ```
-
-### Re-check the installed store against the current product
-
-An authored case is evidence about the bytes this translator emits **today**. A product change that
-moves a descriptor slot or starts requiring a resource turns that evidence into a manifest the
-checker no longer accepts, with its Metal and candidate observations still committed beside it.
-`corpus-index --check` does not see this: it verifies the index against the shards, not the shards
-against the product.
-
-```sh
-cargo run --release -p metal2vulkan-validation --bin corpus-case-check -- --recheck-all
-```
-
-It re-runs the shared checker over every installed case, names each one it now rejects with the
-checker's own reasons, and exits non-zero if any are stale. It needs the private AIR sources, so it
-is a developer command rather than a CI gate. Run it after any change to reflection, to the
-descriptor ABI, or to the authored schema — a full-corpus translation A/B measures status and bytes
-and will not tell you the store went stale.
 
 ## Contract 1: emitter stability
 

@@ -16,26 +16,8 @@ impl Emitter {
         else {
             return Ok(false);
         };
-        if vector_len != array_len {
+        if vector_len != array_len || !types_compatible(vector_elem, array_elem) {
             return Ok(false);
-        }
-        let elements_are_compatible = types_compatible(vector_elem, array_elem);
-        if !elements_are_compatible {
-            // Same lane count, different scalar interpretation: reinterpret each lane, exactly as
-            // `emit_scalar_array_as_vector_load` does in the other direction. Only an equal-width
-            // scalar pair qualifies -- a lane bitcast is a pure bit reinterpret, so the stored bytes
-            // are the object's own.
-            if !is_scalar_storage_type(vector_elem) || !is_scalar_storage_type(array_elem) {
-                return Ok(false);
-            }
-            let (Some(vector_elem_bits), Some(array_elem_bits)) =
-                (bitcast_width(vector_elem), bitcast_width(array_elem))
-            else {
-                return Ok(false);
-            };
-            if vector_elem_bits != array_elem_bits {
-                return Ok(false);
-            }
         }
 
         // LLVM permits a vector store through an opaque pointer whose allocation is an equivalent
@@ -43,8 +25,6 @@ impl Emitter {
         // type exactly matches its pointer pointee.
         let object_id = self.value_id_in(&object.value, &object.ty, instructions)?;
         let elem_type = self.type_id(vector_elem)?;
-        let array_elem_type = self.type_id(array_elem)?;
-        let elements_need_bitcast = !elements_are_compatible && elem_type != array_elem_type;
         let mut elements = Vec::with_capacity(*vector_len as usize);
         for lane in 0..*vector_len {
             let value = self.fresh();
@@ -54,18 +34,6 @@ impl Emitter {
                 Some(value),
                 vec![Operand::IdRef(object_id), Operand::LiteralBit32(lane)],
             ));
-            let value = if elements_need_bitcast {
-                let reinterpreted = self.fresh();
-                instructions.push(Self::inst(
-                    Op::Bitcast,
-                    Some(array_elem_type),
-                    Some(reinterpreted),
-                    vec![Operand::IdRef(value)],
-                ));
-                reinterpreted
-            } else {
-                value
-            };
             elements.push(Operand::IdRef(value));
         }
         let array_type = self.type_id(pointee)?;
@@ -495,22 +463,7 @@ impl Emitter {
         Ok(true)
     }
 
-    /// Reinterpret an `OpStore` whose object and declared pointee are INCOMPATIBLE but equal in total
-    /// bit width: `OpBitcast` the object to the pointee type and store. Byte-identical on any target
-    /// (an equal-width bitcast is a pure bit reinterpret), and shape-agnostic — scalar→scalar,
-    /// scalar→vector, vector→vector and vector→scalar all take the same two instructions, because
-    /// `bitcast_width` multiplies a vector through and both types arrive resolved.
-    ///
-    /// Shape-agnostic ON PURPOSE: this is the exact mirror of the equal-width reinterpret LOAD in
-    /// `emit_load_resolved`, which accepts ANY pointee/result pair of equal bit width and emits
-    /// `OpLoad` of the pointee plus `OpBitcast` to the result. A store arm that took only some of
-    /// those shapes would refuse to write back what the load arm happily read: `*(device ushort2*)&buf[i]`
-    /// reads as `load <2 x i16>` from a `uint` pointee, but `store <2 x i16>` into it used to fall
-    /// through to a plain `OpStore` and fail the owned-module pointee/value contract.
-    ///
-    /// Floor-safe by construction: only fires when the types are INCOMPATIBLE but equal in width — a
-    /// valid module's stores match their pointee, so it never reaches here.
-    pub(in crate::native::emitter) fn emit_same_width_reinterpret_store(
+    pub(in crate::native::emitter) fn emit_same_width_scalar_store(
         &mut self,
         object: &TypedValue,
         ptr: &TypedValue,
@@ -518,16 +471,19 @@ impl Emitter {
         pointee: &LlType,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
+        if matches!(object_ty, LlType::Vector(_, _)) {
+            return Ok(false);
+        }
         let (Some(object_bits), Some(pointee_bits)) =
             (bitcast_width(object_ty), bitcast_width(pointee))
         else {
             return Ok(false);
         };
-        if object_bits == 0 || object_bits != pointee_bits {
+        if object_bits != pointee_bits {
             return Ok(false);
         }
 
-        let ptr_id = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
+        let ptr_id = self.value_id(&ptr.value, &ptr.ty)?;
         let object_id = self.value_id_in(&object.value, &object.ty, instructions)?;
         let pointee_ty = self.type_id(pointee)?;
         let stored = self.fresh();
@@ -579,7 +535,7 @@ impl Emitter {
             return Ok(false);
         };
         // Strict narrowing only: a wider object would write past the slot (a sibling the access-chain
-        // rewrite owns); same-width is `emit_same_width_reinterpret_store` above.
+        // rewrite owns); same-width is `emit_same_width_scalar_store` above.
         if object_bits == 0 || pointee_bits == 0 || object_bits >= pointee_bits {
             return Ok(false);
         }
@@ -687,160 +643,6 @@ impl Emitter {
             None,
             vec![Operand::IdRef(ptr_id), Operand::IdRef(stored)],
         ));
-        Ok(true)
-    }
-
-    /// An MSL `union` lowers to a ONE-MEMBER LLVM struct -- `union { ulong u; float f; }` is
-    /// `%union.Slot = type { i64 }` -- so `s.f = x` arrives as a store whose object is a narrower,
-    /// differently typed scalar and whose declared pointee is that struct. Every width-based rule
-    /// above declines (`bitcast_width` has no answer for a struct) and the store falls through to a
-    /// plain `OpStore` that fails the owned pointee/value contract.
-    ///
-    /// Every union member starts at byte offset 0, and a `Function`/`Private` struct carries no
-    /// explicit `Offset` decoration, so member 0 of a SINGLE-member struct is the slot's own address.
-    /// Descend to it and re-enter the store handler on the leaf: the whole chain above -- scalar
-    /// narrowing, same-width reinterpret, the vector rules -- then applies unchanged, so one descent
-    /// covers every member type a union can name rather than one rule's worth.
-    ///
-    /// Runs LAST, after every aggregate rule has declined, so no module that already stores through a
-    /// one-member struct by some other route changes. Floor-safe: the only alternative at this point
-    /// is the mismatched plain `OpStore` the contract already refuses.
-    /// The mismatched-store chain: thirteen rules, each one way a `store` whose object type does not
-    /// match its pointer's declared pointee is still a byte-faithful write of the object's own bytes.
-    /// Order is load-bearing -- every rule sees only what the rules above it declined -- and so is the
-    /// precondition, which is the CHAIN's and not any rule's: neither `pointee` nor `object_ty`
-    /// changes as the chain runs, so the thirteen copies of `!types_compatible(&pointee, &object_ty)`
-    /// the dispatch used to spell out were one test asked thirteen times. A rule that returns
-    /// `Ok(false)` has emitted nothing -- the ones that speculate wrap themselves in `staged_emit` --
-    /// so declining is free.
-    ///
-    /// `Ok(false)` means no rule claimed the store and the caller falls through to a plain `OpStore`,
-    /// which the owned pointee/value contract then refuses, so the module retries at a lower tier
-    /// rather than silently writing the wrong bytes.
-    pub(in crate::native::emitter) fn emit_mismatched_store(
-        &mut self,
-        object: &TypedValue,
-        ptr: &TypedValue,
-        object_ty: &LlType,
-        pointee: &LlType,
-        align: Option<u64>,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<bool, String> {
-        if types_compatible(pointee, object_ty) {
-            return Ok(false);
-        }
-        Ok(
-            self.emit_i64_to_i32_pair_struct_store(object, ptr, pointee, instructions)?
-                || self.emit_aggregate_prefix_integer_reinterpret_store(
-                    object,
-                    ptr,
-                    object_ty,
-                    pointee,
-                    instructions,
-                )?
-                || self.emit_first_vector_aggregate_reinterpret_store(
-                    object,
-                    ptr,
-                    object_ty,
-                    pointee,
-                    instructions,
-                )?
-                || self.emit_first_scalar_aggregate_reinterpret_store(
-                    object,
-                    ptr,
-                    object_ty,
-                    pointee,
-                    instructions,
-                )?
-                || self.emit_zero_scalar_to_aggregate_store(
-                    object,
-                    ptr,
-                    object_ty,
-                    pointee,
-                    instructions,
-                )?
-                || self.emit_vector_as_scalar_array_store(object, ptr, pointee, instructions)?
-                || self.emit_vector_to_scalar_stores(object, ptr, pointee, instructions)?
-                || self.emit_workgroup_vector_chunk_stores(
-                    object,
-                    ptr,
-                    object_ty,
-                    pointee,
-                    instructions,
-                )?
-                || self.emit_widening_vector_store(object, ptr, pointee, instructions)?
-                || self.emit_narrowing_vector_store(object, ptr, pointee, instructions)?
-                || self.emit_same_width_reinterpret_store(
-                    object,
-                    ptr,
-                    object_ty,
-                    pointee,
-                    instructions,
-                )?
-                || self.emit_scalar_narrowing_store(
-                    object,
-                    ptr,
-                    object_ty,
-                    pointee,
-                    instructions,
-                )?
-                || self.emit_single_member_struct_store(
-                    object,
-                    ptr,
-                    pointee,
-                    align,
-                    instructions,
-                )?,
-        )
-    }
-
-    pub(in crate::native::emitter) fn emit_single_member_struct_store(
-        &mut self,
-        object: &TypedValue,
-        ptr: &TypedValue,
-        pointee: &LlType,
-        align: Option<u64>,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<bool, String> {
-        let LlType::Struct(fields) = pointee else {
-            return Ok(false);
-        };
-        let [field] = fields.as_slice() else {
-            return Ok(false);
-        };
-        let leaf_pointee = self.resolve_type(field)?;
-        let storage = match self.resolve_type(&ptr.ty)? {
-            LlType::Ptr(addrspace) => self.pointer_storage_for(&ptr.value, addrspace)?,
-            _ => return Ok(false),
-        };
-
-        let ptr_id = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
-        let leaf_ptr_type = self.ptr_type_id(storage, &leaf_pointee)?;
-        let index = self.const_uint(0)?;
-        let leaf = self.fresh();
-        instructions.push(Self::inst(
-            Op::InBoundsAccessChain,
-            Some(leaf_ptr_type),
-            Some(leaf),
-            vec![Operand::IdRef(ptr_id), Operand::IdRef(index)],
-        ));
-
-        // Name the leaf so the re-entered handler can resolve it like any other local pointer. The
-        // name is minted from the leaf's own id, so it is unique within the function and nothing else
-        // ever refers to it -- the access chain dominates its single use, the store two lines below.
-        let name = format!("metal2vulkan.union.member.{leaf}");
-        self.values.insert(name.clone(), (leaf, ptr.ty.clone()));
-        self.pointer_pointees.insert(name.clone(), leaf_pointee);
-        self.pointer_storage.insert(name.clone(), storage);
-        self.emit_store_resolved(
-            object.clone(),
-            TypedValue {
-                ty: ptr.ty.clone(),
-                value: LlValue::Local(name),
-            },
-            align,
-            instructions,
-        )?;
         Ok(true)
     }
 
@@ -952,6 +754,51 @@ impl Emitter {
         Ok(true)
     }
 
+    /// Reinterpret a vector `OpStore` whose object is a SAME-TOTAL-WIDTH vector of a different type than
+    /// the declared pointee (e.g. `store <2 x float>` through a `<4 x half>` pointer — 8 bytes either
+    /// way): `OpBitcast` the object to the pointee vector and store. Byte-identical on any target (an
+    /// equal-size vector bitcast is a pure bit reinterpret). Floor-safe by construction: only fires on a
+    /// vector→vector store whose types are INCOMPATIBLE but equal in total width — a valid module's
+    /// stores match their pointee, so it never reaches here.
+    pub(in crate::native::emitter) fn emit_same_width_vector_reinterpret_store(
+        &mut self,
+        object: &TypedValue,
+        ptr: &TypedValue,
+        object_ty: &LlType,
+        pointee: &LlType,
+        instructions: &mut Vec<Instruction>,
+    ) -> Result<bool, String> {
+        if !matches!(object_ty, LlType::Vector(..)) || !matches!(pointee, LlType::Vector(..)) {
+            return Ok(false);
+        }
+        let (Some(ow), Some(pw)) = (
+            self.vector_total_bits(object_ty),
+            self.vector_total_bits(pointee),
+        ) else {
+            return Ok(false);
+        };
+        if ow == 0 || ow != pw {
+            return Ok(false);
+        }
+        let object_id = self.value_id_in(&object.value, &object.ty, instructions)?;
+        let ptr_id = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
+        let pointee_ty = self.type_id(pointee)?;
+        let cast = self.fresh();
+        instructions.push(Self::inst(
+            Op::Bitcast,
+            Some(pointee_ty),
+            Some(cast),
+            vec![Operand::IdRef(object_id)],
+        ));
+        instructions.push(Self::inst(
+            Op::Store,
+            None,
+            None,
+            vec![Operand::IdRef(ptr_id), Operand::IdRef(cast)],
+        ));
+        Ok(true)
+    }
+
     /// Total bit width of a vector type (`elem_bits * lanes`), or `None` if `ty` is not a vector of a
     /// bitcastable scalar. Used to decide whether two distinct vector types are a byte-identical
     /// `OpBitcast` reinterpret (equal total width).
@@ -1044,31 +891,6 @@ impl Emitter {
         })
     }
 
-    /// `OpInBoundsAccessChain` down a constant member path to one field of an aggregate the emitter
-    /// holds a pointer to.
-    fn emit_aggregate_field_pointer(
-        &mut self,
-        storage: StorageClass,
-        field_ty: &LlType,
-        ptr: Word,
-        access_path: &[u32],
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<Word, String> {
-        let field_ptr_ty = self.ptr_type_id(storage, field_ty)?;
-        let field_ptr = self.fresh();
-        let mut ops = vec![Operand::IdRef(ptr)];
-        for idx in access_path {
-            ops.push(Operand::IdRef(self.const_uint(*idx)?));
-        }
-        instructions.push(Self::inst(
-            Op::InBoundsAccessChain,
-            Some(field_ptr_ty),
-            Some(field_ptr),
-            ops,
-        ));
-        Ok(field_ptr)
-    }
-
     pub(in crate::native::emitter) fn emit_first_pointer_aggregate_reinterpret_load(
         &mut self,
         result_name: &str,
@@ -1097,24 +919,6 @@ impl Emitter {
                 ))
             }
         };
-        // The zero-offset member spelled as `bitcast ptr %p to ptr` rather than as a GEP arrives
-        // here with the AGGREGATE as its pointee, so it never reached the device-address branch in
-        // `emit_pointer_from_local_field_load` -- that branch keys off a field pointee. Descend to
-        // the field first and ask the same question, or a device address read through the bitcast
-        // spelling becomes a Private placeholder that no later pass can repair: the store recorded
-        // its source as a 64-bit address, and forwarding an integer into a pointer load is exactly
-        // what `recover_inlined_local_pointer_fields` declines to do.
-        if self.bda_forwards_local_pointer_field(result_name, result_ty) {
-            let field_ptr = self.emit_aggregate_field_pointer(
-                storage,
-                &LlType::Int(64),
-                ptr,
-                &access_path,
-                instructions,
-            )?;
-            self.emit_bda_address_from_field(result_name, field_ptr, instructions)?;
-            return Ok(true);
-        }
         let key = LocalPointerField {
             root: ptr,
             indices: access_path.clone(),
@@ -1132,8 +936,18 @@ impl Emitter {
             )?;
             return Ok(true);
         }
-        let field_ptr =
-            self.emit_aggregate_field_pointer(storage, &field_ty, ptr, &access_path, instructions)?;
+        let field_ptr_ty = self.ptr_type_id(storage, &field_ty)?;
+        let field_ptr = self.fresh();
+        let mut ops = vec![Operand::IdRef(ptr)];
+        for idx in access_path {
+            ops.push(Operand::IdRef(self.const_uint(idx)?));
+        }
+        instructions.push(Self::inst(
+            Op::InBoundsAccessChain,
+            Some(field_ptr_ty),
+            Some(field_ptr),
+            ops,
+        ));
 
         let result_type = self.type_id(result_ty)?;
         instructions.push(Self::inst(
@@ -1174,8 +988,9 @@ impl Emitter {
         let bitcast = !direct
             && matches!(
                 (&vector_ty, result_ty),
-                (LlType::Vector(..), LlType::Vector(..))
-                    if bitcast_width(&vector_ty).is_some()
+                (LlType::Vector(_, n), LlType::Vector(_, m))
+                    if n == m
+                        && bitcast_width(&vector_ty).is_some()
                         && bitcast_width(&vector_ty) == bitcast_width(result_ty)
             );
         if !direct && !bitcast {

@@ -9,21 +9,35 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
         match call.callee.as_str() {
-            "air.wg.barrier" | "air.simdgroup.barrier" => {
+            "air.simdgroup.barrier" => {
                 if call.args.len() != 2 {
-                    return Err(format!(
-                        "native emitter: {} expects 2 operands",
-                        call.callee
-                    ));
+                    return Err(
+                        "native emitter: air.simdgroup.barrier expects 2 operands".to_string()
+                    );
                 }
-                // The execution scope is the second operand, not the intrinsic name. The two
-                // intrinsics differ only in the scope Apple's `threadgroup_barrier` and
-                // `simdgroup_barrier` happen to pass, and AIR spells a threadgroup-wide barrier
-                // through the simdgroup intrinsic often enough to matter.
-                let execution = air_barrier_execution_scope(call)?;
-                let scope = self.const_uint(execution as u32)?;
+                let scope = self.const_uint(Scope::Subgroup as u32)?;
                 let memory_scope =
-                    self.const_uint(air_barrier_memory_scope(call, execution) as u32)?;
+                    self.const_uint(air_barrier_memory_scope(call, Scope::Subgroup) as u32)?;
+                let semantics = self.const_uint(air_barrier_memory_semantics(call).bits())?;
+                instructions.push(Self::inst(
+                    Op::ControlBarrier,
+                    None,
+                    None,
+                    vec![
+                        Operand::IdScope(scope),
+                        Operand::IdScope(memory_scope),
+                        Operand::IdMemorySemantics(semantics),
+                    ],
+                ));
+                Ok(true)
+            }
+            "air.wg.barrier" => {
+                if call.args.len() != 2 {
+                    return Err("native emitter: air.wg.barrier expects 2 operands".to_string());
+                }
+                let scope = self.const_uint(Scope::Workgroup as u32)?;
+                let memory_scope =
+                    self.const_uint(air_barrier_memory_scope(call, Scope::Workgroup) as u32)?;
                 let semantics = self.const_uint(air_barrier_memory_semantics(call).bits())?;
                 instructions.push(Self::inst(
                     Op::ControlBarrier,
@@ -41,13 +55,19 @@ impl Emitter {
                 if call.args.len() != 3 {
                     return Err("native emitter: air.atomic.fence expects 3 operands".to_string());
                 }
-                // Which memory a fence covers is its FIRST operand, exactly as it is for the two
-                // barriers above; the third names the scope over which that memory is ordered.
-                // Deriving the memory classes from the scope instead answered `mem_threadgroup`
-                // with device semantics and no `WORKGROUP_MEMORY` at all.
-                let scope_kind = air_fence_memory_scope(call);
+                let scope_kind = match air_i32_literal(&call.args[2].value) {
+                    Some(1) => Scope::Workgroup,
+                    _ => Scope::Device,
+                };
+                let semantics_kind = if scope_kind == Scope::Workgroup {
+                    MemorySemantics::ACQUIRE_RELEASE | MemorySemantics::WORKGROUP_MEMORY
+                } else {
+                    MemorySemantics::ACQUIRE_RELEASE
+                        | MemorySemantics::UNIFORM_MEMORY
+                        | MemorySemantics::CROSS_WORKGROUP_MEMORY
+                };
                 let scope = self.const_uint(scope_kind as u32)?;
-                let semantics = self.const_uint(air_barrier_memory_semantics(call).bits())?;
+                let semantics = self.const_uint(semantics_kind.bits())?;
                 instructions.push(Self::inst(
                     Op::MemoryBarrier,
                     None,
@@ -145,19 +165,9 @@ impl Emitter {
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
         match call.callee.as_str() {
-            // `llvm.agx2.cluster.num` names the PHYSICAL GPU cluster the threadgroup landed on,
-            // not any position within it. Device-measured on an M3 Max (`xcrun metal -x ir` over a
-            // hand-written AIR probe, since MSL has no spelling for the intrinsic): the value is
-            // identical for every thread of a threadgroup, and over 32768 threadgroups it took every
-            // value in 0..=36 with no dependence on the thread's coordinates. Vulkan exposes no
-            // physical cluster, and nothing about the invocation could reproduce one — a per-thread
-            // answer would make a predicate the hardware guarantees uniform diverge inside a
-            // threadgroup, which is worse than any single answer. Zero is the answer given, and it
-            // is one the device itself gives: it says this threadgroup ran on cluster 0, which is a
-            // legal execution of a value the hardware picks nondeterministically. The corpus uses it
-            // only as `icmp ult %n, 10` guarding a per-cluster slot claimed by an atomic cmpxchg,
-            // so the effect is that every threadgroup contends for slot 0 and one wins, as it would
-            // on a device with a single cluster.
+            // AGX2 numbers threadgroup lanes in physical 16-wide cluster rows. Preserve a typed
+            // sentinel here because the native emitter deliberately does not know Vulkan dispatch
+            // geometry; the interface pass replaces it using LocalInvocationId + LocalSize.
             "llvm.agx2.cluster.num" => {
                 if !call.args.is_empty() {
                     return Err(format!(
@@ -181,6 +191,7 @@ impl Emitter {
                     Some(result),
                     vec![Operand::IdRef(zero)],
                 ));
+                self.emit_sidecar.agx2_cluster_numbers.push(result);
                 Ok(true)
             }
             // `air.is_null_texture_<dim>(%tex)` asks whether a texture handle is the null texture.
@@ -348,6 +359,181 @@ impl Emitter {
                     Some(result_type),
                     Some(result),
                     vec![Operand::IdRef(ptr)],
+                ));
+                Ok(true)
+            }
+            "air.simd_any" | "air.simd_all" => {
+                if call.args.len() != 1 {
+                    return Err(format!("native emitter: {} expects 1 operand", call.callee));
+                }
+                let result_ty = self.resolve_type(&call.ret)?;
+                if !is_bool_type(&result_ty) {
+                    return Err(format!(
+                        "native emitter: {} returned {result_ty:?}",
+                        call.callee
+                    ));
+                }
+                let value_ty = self.resolve_type(&call.args[0].ty)?;
+                if !is_bool_type(&value_ty) {
+                    return Err(format!(
+                        "native emitter: {} value is {value_ty:?}",
+                        call.callee
+                    ));
+                }
+                let result_type = self.type_id(&result_ty)?;
+                let result = self.result_id(name, &result_ty)?;
+                let value =
+                    self.value_id_in(&call.args[0].value, &call.args[0].ty, instructions)?;
+                let scope = self.const_uint(Scope::Subgroup as u32)?;
+                let op = if call.callee == "air.simd_any" {
+                    Op::GroupNonUniformAny
+                } else {
+                    Op::GroupNonUniformAll
+                };
+                instructions.push(Self::inst(
+                    op,
+                    Some(result_type),
+                    Some(result),
+                    vec![Operand::IdScope(scope), Operand::IdRef(value)],
+                ));
+                Ok(true)
+            }
+            "air.simd_ballot.i64" => {
+                if call.args.len() != 1 {
+                    return Err("native emitter: air.simd_ballot.i64 expects 1 operand".to_string());
+                }
+                let result_ty = self.resolve_type(&call.ret)?;
+                if result_ty != LlType::Int(64) {
+                    return Err(format!(
+                        "native emitter: air.simd_ballot.i64 returned {result_ty:?}"
+                    ));
+                }
+                let predicate_ty = self.resolve_type(&call.args[0].ty)?;
+                if !is_bool_type(&predicate_ty) {
+                    return Err(format!(
+                        "native emitter: air.simd_ballot.i64 predicate is {predicate_ty:?}"
+                    ));
+                }
+
+                let uint = self.type_id(&LlType::Int(32))?;
+                let ulong = self.type_id(&LlType::Int(64))?;
+                let ballot_ty = LlType::Vector(Box::new(LlType::Int(32)), 4);
+                let ballot_type = self.type_id(&ballot_ty)?;
+                let result = self.result_id(name, &result_ty)?;
+                let predicate =
+                    self.value_id_in(&call.args[0].value, &call.args[0].ty, instructions)?;
+                let scope = self.const_uint(Scope::Subgroup as u32)?;
+
+                let ballot = self.fresh();
+                instructions.push(Self::inst(
+                    Op::GroupNonUniformBallot,
+                    Some(ballot_type),
+                    Some(ballot),
+                    vec![Operand::IdScope(scope), Operand::IdRef(predicate)],
+                ));
+
+                let lo32 = self.fresh();
+                instructions.push(Self::inst(
+                    Op::CompositeExtract,
+                    Some(uint),
+                    Some(lo32),
+                    vec![Operand::IdRef(ballot), Operand::LiteralBit32(0)],
+                ));
+                let hi32 = self.fresh();
+                instructions.push(Self::inst(
+                    Op::CompositeExtract,
+                    Some(uint),
+                    Some(hi32),
+                    vec![Operand::IdRef(ballot), Operand::LiteralBit32(1)],
+                ));
+
+                let lo64 = self.fresh();
+                instructions.push(Self::inst(
+                    Op::UConvert,
+                    Some(ulong),
+                    Some(lo64),
+                    vec![Operand::IdRef(lo32)],
+                ));
+                let hi64 = self.fresh();
+                instructions.push(Self::inst(
+                    Op::UConvert,
+                    Some(ulong),
+                    Some(hi64),
+                    vec![Operand::IdRef(hi32)],
+                ));
+
+                let shift = self.const_int(64, 32)?;
+                let shifted_hi = self.fresh();
+                instructions.push(Self::inst(
+                    Op::ShiftLeftLogical,
+                    Some(ulong),
+                    Some(shifted_hi),
+                    vec![Operand::IdRef(hi64), Operand::IdRef(shift)],
+                ));
+                instructions.push(Self::inst(
+                    Op::BitwiseOr,
+                    Some(ulong),
+                    Some(result),
+                    vec![Operand::IdRef(shifted_hi), Operand::IdRef(lo64)],
+                ));
+                Ok(true)
+            }
+            "air.simd_shuffle.u.i32" | "air.simd_shuffle.s.i32" => {
+                if call.args.len() != 2 {
+                    return Err(format!(
+                        "native emitter: {} expects 2 operands",
+                        call.callee
+                    ));
+                }
+                let result_ty = self.resolve_type(&call.ret)?;
+                if result_ty != LlType::Int(32) {
+                    return Err(format!(
+                        "native emitter: {} returned {result_ty:?}",
+                        call.callee
+                    ));
+                }
+                let value_ty = self.resolve_type(&call.args[0].ty)?;
+                if value_ty != LlType::Int(32) {
+                    return Err(format!(
+                        "native emitter: {} value is {value_ty:?}",
+                        call.callee
+                    ));
+                }
+                let lane_ty = self.resolve_type(&call.args[1].ty)?;
+                if !matches!(lane_ty, LlType::Int(_)) {
+                    return Err(format!(
+                        "native emitter: {} lane is {lane_ty:?}",
+                        call.callee
+                    ));
+                }
+                let result_type = self.type_id(&result_ty)?;
+                let result = self.result_id(name, &result_ty)?;
+                let value =
+                    self.value_id_in(&call.args[0].value, &call.args[0].ty, instructions)?;
+                let lane = self.value_id_in(&call.args[1].value, &call.args[1].ty, instructions)?;
+                let uint = self.type_id(&LlType::Int(32))?;
+                let invocation = if lane_ty == LlType::Int(32) {
+                    lane
+                } else {
+                    let converted = self.fresh();
+                    instructions.push(Self::inst(
+                        Op::UConvert,
+                        Some(uint),
+                        Some(converted),
+                        vec![Operand::IdRef(lane)],
+                    ));
+                    converted
+                };
+                let scope = self.const_uint(Scope::Subgroup as u32)?;
+                instructions.push(Self::inst(
+                    Op::GroupNonUniformShuffle,
+                    Some(result_type),
+                    Some(result),
+                    vec![
+                        Operand::IdScope(scope),
+                        Operand::IdRef(value),
+                        Operand::IdRef(invocation),
+                    ],
                 ));
                 Ok(true)
             }
@@ -616,12 +802,6 @@ impl Emitter {
     }
 }
 
-/// Which memories a barrier synchronizes, from AIR's `mem_flags` word.
-///
-/// `metal_compute`'s enum, confirmed one setter per probe kernel: `mem_device` is 1,
-/// `mem_threadgroup` 2, `mem_texture` 4, `mem_threadgroup_imageblock` 8. An imageblock is
-/// threadgroup memory -- the shared-cell lowering puts it in `Workgroup` storage -- so bit 3
-/// names the same semantic bit as bit 1 rather than a new one.
 fn air_barrier_memory_semantics(call: &LlCall) -> MemorySemantics {
     let flags = call
         .args
@@ -632,7 +812,7 @@ fn air_barrier_memory_semantics(call: &LlCall) -> MemorySemantics {
     if flags & 1 != 0 {
         semantics |= MemorySemantics::UNIFORM_MEMORY | MemorySemantics::CROSS_WORKGROUP_MEMORY;
     }
-    if flags & (2 | 8) != 0 {
+    if flags & 2 != 0 {
         semantics |= MemorySemantics::WORKGROUP_MEMORY;
     }
     if flags & 4 != 0 {
@@ -642,53 +822,6 @@ fn air_barrier_memory_semantics(call: &LlCall) -> MemorySemantics {
         semantics |= MemorySemantics::WORKGROUP_MEMORY;
     }
     semantics
-}
-
-/// The execution scope AIR states in a barrier's second operand: 1 threadgroup, 4 simdgroup.
-///
-/// Both barrier intrinsics carry it and both take both values. Apple's `threadgroup_barrier`
-/// compiles to `air.wg.barrier(flags, 1)` and `simdgroup_barrier` to
-/// `air.simdgroup.barrier(flags, 4)`, but AIR also spells a threadgroup-wide execution barrier
-/// through the simdgroup intrinsic: 42 such calls across 13 corpus sources. Reading the scope off
-/// the callee name instead of the operand made those synchronize one simdgroup where Metal
-/// synchronizes the whole threadgroup.
-///
-/// Only 1 and 4 appear in the corpus and only those two are documented by the headers, so any
-/// other value fails visibly rather than picking a scope for it.
-fn air_barrier_execution_scope(call: &LlCall) -> Result<Scope, String> {
-    match call.args.get(1).and_then(|arg| air_i32_literal(&arg.value)) {
-        Some(1) => Ok(Scope::Workgroup),
-        Some(4) => Ok(Scope::Subgroup),
-        Some(other) => Err(format!(
-            "native emitter: {} states execution scope {other}, which is neither AIR's threadgroup \
-             (1) nor its simdgroup (4)",
-            call.callee
-        )),
-        None => Err(format!(
-            "native emitter: {} has no constant execution scope operand",
-            call.callee
-        )),
-    }
-}
-
-/// The scope AIR states in `air.atomic.fence`'s third operand.
-///
-/// `atomic_thread_fence(flags, order, scope)` lowers to `air.atomic.fence(int(flags), int(order),
-/// int(scope))`, and `thread_scope` is `thread_scope_thread` 0, `thread_scope_threadgroup` 1,
-/// `thread_scope_device` 2 and `thread_scope_simdgroup` 4 — read one enumerator at a time out of
-/// the Metal front end, not out of the enum's declaration order, which does not match the values.
-///
-/// Corpus fences state only 2 and a legacy 3, the OpenCL-derived all-devices scope this Metal has
-/// dropped; both are Device, which is the widest scope a Vulkan shader can name. Anything else
-/// unrecognised is Device too: a wider fence orders strictly more than a narrower one, so guessing
-/// wide cannot lose an ordering the shader asked for.
-fn air_fence_memory_scope(call: &LlCall) -> Scope {
-    match call.args.get(2).and_then(|arg| air_i32_literal(&arg.value)) {
-        Some(0) => Scope::Invocation,
-        Some(1) => Scope::Workgroup,
-        Some(4) => Scope::Subgroup,
-        _ => Scope::Device,
-    }
 }
 
 fn air_barrier_memory_scope(call: &LlCall, default_scope: Scope) -> Scope {

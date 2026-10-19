@@ -18,11 +18,6 @@ pub(super) mod structured_order;
 
 pub(super) use clone_crossarm::rename_tokens;
 pub(in crate::native) use exit_check::EmittedDominators;
-
-/// Whether the source CFG has no natural loop at all.
-pub(super) fn loop_forest_is_empty(blocks: &[BodyBlock]) -> bool {
-    loopforest::analyze(blocks).loops.is_empty()
-}
 pub(super) use structured_emit::{
     cond_other_witness_lines, cond_phi_shared_witness_lines, construct_tree_gate_witness_lines,
     construct_tree_reject_reason, exceeds_local_structured_plan_budget,
@@ -33,15 +28,15 @@ pub(super) use structured_emit::{
     structured_reject_reason, CROSS_ARM_EDGE_MAX_BLOCKS,
 };
 
+#[cfg(test)]
+pub(super) use blocks::split_body_blocks;
 pub(super) use blocks::{
     funnel_shared_branch_dispatches, implicit_entry_block_name, index_branch_merges_by_header,
     infer_bounded_branch_merges_by_header, infer_branch_merges, infer_direct_branch_merges,
-    infer_loop_merges, infer_switch_merges, infer_switch_merges_bounded,
+    infer_direct_switch_merges, infer_loop_merges, infer_switch_merges,
     lower_unstructured_switches, refunnel_one_deep_shared_arm, split_source_body_blocks,
     switch_default_is_inferred_merge,
 };
-#[cfg(test)]
-pub(super) use blocks::{infer_direct_switch_merges, split_body_blocks};
 #[cfg(test)]
 pub(super) fn id_ref_operand(operand: &crate::spirv_module::Operand) -> Option<spirv::Word> {
     let crate::spirv_module::Operand::IdRef(id) = operand else {

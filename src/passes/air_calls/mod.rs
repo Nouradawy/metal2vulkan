@@ -15,10 +15,8 @@ mod float_imageblock;
 pub(in crate::passes) use float_imageblock::*;
 mod rawbyte_unary;
 pub(in crate::passes) use rawbyte_unary::*;
-mod matrix;
-pub(in crate::passes) use matrix::*;
-mod shuffle;
-pub(in crate::passes) use shuffle::*;
+mod matrix_shuffle;
+pub(in crate::passes) use matrix_shuffle::*;
 mod reduce_bitops;
 pub(in crate::passes) use reduce_bitops::*;
 mod bfloat_glsl;
@@ -26,12 +24,7 @@ pub(in crate::passes) use bfloat_glsl::*;
 mod tensor;
 pub(in crate::passes) use tensor::*;
 mod agx_emask;
-/// Splitting one AIR call site into its own region of basic blocks (shared by the lowerings that
-/// need control flow).
-mod block_split;
-mod imageblock_block_copy;
 pub(in crate::passes) use agx_emask::*;
-pub(in crate::passes) use imageblock_block_copy::*;
 
 fn copy_or_bitcast_result(
     result_type: Word,
@@ -121,54 +114,18 @@ fn splat_or_scalar(ctx: &mut Ctx, rty: Word, v: f32, n: u32) -> Word {
 }
 
 fn splat(ctx: &mut Ctx, vty: Word, scalar: Word, n: u32) -> Word {
-    ctx.const_composite(vty, vec![scalar; n as usize])
-}
-
-/// f32 (scalar or vN) type id for a lane count.
-pub(super) fn ty_f32_shaped(ctx: &mut Ctx, n: u32) -> Word {
-    if n > 1 {
-        ctx.ty_vecf(n)
-    } else {
-        ctx.ty_float()
+    let id = ctx.module.fresh_id();
+    let mut ops = vec![];
+    for _ in 0..n {
+        ops.push(Operand::IdRef(scalar));
     }
-}
-
-/// u32 (scalar or vN) type id for a lane count.
-pub(super) fn ty_u32_shaped(ctx: &mut Ctx, n: u32) -> Word {
-    if n > 1 {
-        ctx.ty_vec_uint(n)
-    } else {
-        ctx.ty_uint()
-    }
-}
-
-pub(super) fn ty_bool_shaped(ctx: &mut Ctx, n: u32) -> Word {
-    if n > 1 {
-        ctx.ty_vec_bool(n)
-    } else {
-        ctx.ty_bool()
-    }
-}
-
-/// A shift amount of 16, shaped to match an `n`-lane operand (vector shifts need a vector amount).
-pub(super) fn shift_amount_16(ctx: &mut Ctx, n: u32) -> Word {
-    let s = ctx.const_uint(16);
-    if n > 1 {
-        let vty = ctx.ty_vec_uint(n);
-        splat(ctx, vty, s, n)
-    } else {
-        s
-    }
-}
-
-pub(super) fn shaped_u32_const(ctx: &mut Ctx, n: u32, value: u32) -> Word {
-    let scalar = ctx.const_uint(value);
-    if n > 1 {
-        let vty = ctx.ty_vec_uint(n);
-        splat(ctx, vty, scalar, n)
-    } else {
-        scalar
-    }
+    ctx.new_globals.push(Instruction::new(
+        Op::ConstantComposite,
+        Some(vty),
+        Some(id),
+        ops,
+    ));
+    id
 }
 
 #[cfg(test)]
@@ -221,33 +178,7 @@ mod tests {
         ));
     }
 
-    /// A plain min/max/clamp symbol names Metal's NaN-aware function and must reach the GLSL op
-    /// that defines the NaN case; a `fast_` symbol names `fast::`, which defines neither NaN nor
-    /// infinity, and keeps the op whose NaN result SPIR-V leaves undefined.
-    #[test]
-    fn plain_minmax_is_nan_aware_and_fast_minmax_is_not() {
-        for (name, expected) in [
-            ("air.fmax.f32", GLSLstd450::NMax),
-            ("air.fmin.v4f16", GLSLstd450::NMin),
-            ("air.max.f16", GLSLstd450::NMax),
-            ("air.min.v3f32", GLSLstd450::NMin),
-            ("air.clamp.f16", GLSLstd450::NClamp),
-            ("llvm.maxnum.f32", GLSLstd450::NMax),
-            ("llvm.minnum.f16", GLSLstd450::NMin),
-            ("air.fast_fmax.f32", GLSLstd450::FMax),
-            ("air.fast_fmin.v4f32", GLSLstd450::FMin),
-            ("air.fast_clamp.f32", GLSLstd450::FClamp),
-        ] {
-            assert_eq!(glsl_extinst(name), Some(expected), "{name}");
-        }
-        // The rule rewrites only the three min/max/clamp ops; every other entry is untouched.
-        for name in ["air.sqrt.f32", "air.fast_exp.v4f32", "air.mix.f16"] {
-            let op = glsl_extinst(name).expect(name);
-            assert_eq!(nan_aware_if_precise(name, op), op, "{name}");
-        }
-    }
-
-    // ---- simd reduce clustering onto Metal's 32-lane simdgroup ---------------------------------
+    // ---- M-D2: simd reduce clustering (TransformOptions::simd_cluster32) ------------------------
 
     /// Look up the u32 value of an `OpConstant` id in the module (new_globals or types).
     fn const_uint_value(ctx: &Ctx, id: Word) -> Option<u32> {
@@ -261,14 +192,14 @@ mod tests {
             })
     }
 
-    /// A whole-subgroup `Reduce` becomes a `ClusteredReduce` with a trailing cluster-size operand
-    /// referencing the constant 32 (Metal's simdgroup width).
+    /// With clustering ON, a whole-subgroup `Reduce` becomes a `ClusteredReduce` with a trailing
+    /// cluster-size operand referencing the constant 32 (Metal's simdgroup width).
     #[test]
-    fn group_reduce_operands_clusters_every_reduce() {
+    fn group_reduce_operands_clusters_reduce_when_enabled() {
         let mut ctx = Ctx::new(Module::new());
         let scope = ctx.const_uint(Scope::Subgroup as u32);
         let value = ctx.const_uint(7);
-        let ops = group_reduce_operands(&mut ctx, scope, GroupOperation::Reduce, value);
+        let ops = group_reduce_operands(&mut ctx, scope, GroupOperation::Reduce, value, true);
         assert_eq!(
             ops.len(),
             4,
@@ -290,14 +221,33 @@ mod tests {
         );
     }
 
-    /// A scan is never turned into a clustered reduce — `ClusteredReduce` is a reduce-only group
-    /// operation, so `lower_simd_sum` corrects a scan by subtracting its partition prefix instead.
+    /// With clustering OFF (the default), the lowering is byte-identical to the historical
+    /// whole-subgroup `Reduce`: three operands, no cluster size, no capability delta.
+    #[test]
+    fn group_reduce_operands_plain_reduce_when_disabled() {
+        let mut ctx = Ctx::new(Module::new());
+        let scope = ctx.const_uint(Scope::Subgroup as u32);
+        let value = ctx.const_uint(7);
+        let ops = group_reduce_operands(&mut ctx, scope, GroupOperation::Reduce, value, false);
+        assert_eq!(
+            ops,
+            vec![
+                Operand::IdScope(scope),
+                Operand::GroupOperation(GroupOperation::Reduce),
+                Operand::IdRef(value),
+            ]
+        );
+    }
+
+    /// Scans are never clustered even with the flag on — `ClusteredReduce` is a reduce-only group
+    /// operation, so an inclusive/exclusive prefix scan keeps its whole-subgroup form.
     #[test]
     fn group_reduce_operands_never_clusters_scan() {
         let mut ctx = Ctx::new(Module::new());
         let scope = ctx.const_uint(Scope::Subgroup as u32);
         let value = ctx.const_uint(7);
-        let ops = group_reduce_operands(&mut ctx, scope, GroupOperation::InclusiveScan, value);
+        let ops =
+            group_reduce_operands(&mut ctx, scope, GroupOperation::InclusiveScan, value, true);
         assert_eq!(ops.len(), 3, "a scan is not turned into a clustered reduce");
         assert_eq!(
             ops[1],

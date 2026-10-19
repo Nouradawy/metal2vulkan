@@ -98,7 +98,6 @@ pub enum TextureFormat {
     Rgba8ui,
     Rgba16ui,
     Rgba8i,
-    Rgba16i,
 }
 
 impl TextureFormat {
@@ -121,14 +120,13 @@ impl TextureFormat {
             TextureFormat::Rgba8ui => ImageFormat::Rgba8ui,
             TextureFormat::Rgba16ui => ImageFormat::Rgba16ui,
             TextureFormat::Rgba8i => ImageFormat::Rgba8i,
-            TextureFormat::Rgba16i => ImageFormat::Rgba16i,
         }
     }
 
     /// Every format this ABI can name. [`TextureFormat::from_spirv_format`] inverts
     /// [`TextureFormat::to_spirv_format`] by searching this list, so a new variant belongs here as
     /// well as in that match.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 16] = [
         TextureFormat::R8,
         TextureFormat::Rgba8,
         TextureFormat::R16f,
@@ -145,7 +143,6 @@ impl TextureFormat {
         TextureFormat::Rgba8ui,
         TextureFormat::Rgba16ui,
         TextureFormat::Rgba8i,
-        TextureFormat::Rgba16i,
     ];
 
     /// The format a decorated storage image carries, or `None` for `ImageFormat::Unknown` and for
@@ -226,14 +223,10 @@ impl TextureShape {
     }
 }
 
-/// Decode a Metal texture argument/type name into its [`TextureShape`]. Matches what the interface
-/// pass uses to construct the emitted image type, including its multisample operand.
-///
-/// "Arrayed" is read ONCE, off the `_array` suffix, rather than from a per-dimension substring per
-/// arrayed spelling. The enumerated form had to name every combination and it missed one:
-/// `texture2d_ms_array` does not contain the substring `2d_array`, so it reflected as a plain
-/// multisample 2D texture while the emitted `OpTypeImage` was arrayed -- two derivations of one
-/// fact, disagreeing. `depth2d_ms_array` had the same hole.
+/// Decode a Metal texture argument/type name into its [`TextureShape`]. The dimensionality/arrayed
+/// classification is substring-order-sensitive (`1d_array` before `1d`, `cube_array` before `cube`)
+/// and matches what the interface pass uses to construct the emitted image type, including its
+/// multisample operand.
 pub fn texture_shape_from_name(name: &str) -> TextureShape {
     let (writable, array_ref) = texture_access_from_name(name);
     let array_length = texture_handle_array(name).flatten();
@@ -249,20 +242,23 @@ pub fn texture_shape_from_name(name: &str) -> TextureShape {
         .split_once('<')
         .map(|(h, _)| h)
         .unwrap_or(shape_name);
-    let dimension = if head.contains("texture_buffer") {
-        TextureDimension::Buffer
+    let (dimension, arrayed) = if head.contains("texture_buffer") {
+        (TextureDimension::Buffer, false)
+    } else if head.contains("1d_array") {
+        (TextureDimension::D1, true)
     } else if head.contains("1d") {
-        TextureDimension::D1
+        (TextureDimension::D1, false)
     } else if head.contains("3d") {
-        TextureDimension::D3
+        (TextureDimension::D3, false)
+    } else if head.contains("cube_array") {
+        (TextureDimension::Cube, true)
     } else if head.contains("cube") {
-        TextureDimension::Cube
+        (TextureDimension::Cube, false)
+    } else if head.contains("2d_array") {
+        (TextureDimension::D2, true)
     } else {
-        TextureDimension::D2
+        (TextureDimension::D2, false)
     };
-    // `texture_buffer` is the one name that cannot be arrayed, and it does not end in `_array`
-    // either, so the suffix answers every spelling on its own.
-    let arrayed = head.ends_with("_array");
     let multisampled = head.contains("_ms");
     let component = texture_component_from_name(shape_name);
     let storage_format = if writable {
@@ -329,18 +325,7 @@ fn storage_format_from_name(name: &str, component: TextureComponent) -> TextureF
                 TextureFormat::Rgba8ui
             }
         }
-        TextureComponent::Sint => {
-            // The signed default has to widen for `<short` exactly as the unsigned one does for
-            // `<ushort` just above. Without this branch a `texture2d<short, write>` was decorated
-            // `Rgba8i`, an 8-bit storage image for a 16-bit texture, so every component a shader
-            // wrote was truncated to the signed byte range; 5 of the 14579 local corpus sources
-            // reach it.
-            if name.contains("<short") {
-                TextureFormat::Rgba16i
-            } else {
-                TextureFormat::Rgba8i
-            }
-        }
+        TextureComponent::Sint => TextureFormat::Rgba8i,
     }
 }
 

@@ -11,6 +11,9 @@
 
 use super::blocks::block_successors;
 use super::BodyBlock;
+use crate::spirv_module::Block;
+use crate::spirv_module::Operand;
+use spirv::{Op, Word};
 use std::collections::{HashMap, HashSet};
 
 // How many source CFGs this thread has built, for the redundant-work regression checks.
@@ -176,8 +179,8 @@ pub(super) fn named_dominators<'a>(
                 .collect()
         })
         .collect();
-    let predecessors = crate::dominators::build_predecessors(&dense);
-    let (_, intervals, parents) = crate::dominators::dominance(&dense, &predecessors);
+    let predecessors = crate::native::dominators::build_predecessors(&dense);
+    let (_, intervals, parents) = crate::native::dominators::dominance(&dense, &predecessors);
     let named_idom = parents
         .iter()
         .enumerate()
@@ -325,7 +328,63 @@ pub(super) fn reachable_from(
 // layer; the passes-side copies stay separate because the passes layer must not depend on `native`
 // (that dependency would invert ownership). Behaviour is identical to the copies they replace.
 
-pub(in crate::native) use crate::spirv_module::block_successors_by_label as spirv_block_successors_by_label;
+/// Successor block labels of one owned `Block`, read from its terminator. Branch/BranchConditional
+/// arms in operand order; switch default + case targets sorted and deduped. Non-terminating or
+/// unstructured-terminator blocks yield no successors.
+pub(in crate::native) fn spirv_block_successors(block: &Block) -> Vec<Word> {
+    fn id_ref(operand: &Operand) -> Option<Word> {
+        match operand {
+            Operand::IdRef(id) => Some(*id),
+            _ => None,
+        }
+    }
+    let Some(inst) = block.instructions.last() else {
+        return Vec::new();
+    };
+    match inst.class.opcode {
+        Op::Branch => inst.operands.first().and_then(id_ref).into_iter().collect(),
+        Op::BranchConditional => inst
+            .operands
+            .iter()
+            .skip(1)
+            .take(2)
+            .filter_map(id_ref)
+            .collect(),
+        Op::Switch => {
+            let mut out = Vec::new();
+            if let Some(default) = inst.operands.get(1).and_then(id_ref) {
+                out.push(default);
+            }
+            let mut idx = 3;
+            while idx < inst.operands.len() {
+                if let Some(target) = inst.operands.get(idx).and_then(id_ref) {
+                    out.push(target);
+                }
+                idx += 2;
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Forward-edge adjacency of an owned SPIR-V function body keyed by block label id
+/// (via [`spirv_block_successors`]). Blocks without a label id are skipped.
+pub(in crate::native) fn spirv_block_successors_by_label(
+    blocks: &[Block],
+) -> HashMap<Word, Vec<Word>> {
+    blocks
+        .iter()
+        .filter_map(|block| {
+            Some((
+                block.label.as_ref()?.result_id?,
+                spirv_block_successors(block),
+            ))
+        })
+        .collect()
+}
 
 #[cfg(test)]
 mod tests {

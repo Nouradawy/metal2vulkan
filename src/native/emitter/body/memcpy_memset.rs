@@ -55,29 +55,11 @@ impl Emitter {
 
         if let Some(dst) = dst_raw {
             let dst_align = call.arg_aligns.first().copied().flatten();
-            // A destination with no SPIR-V pointer value of its own has exactly one alternative to
-            // this decomposition: `emit_typed_memcpy` copies the whole object into the `Private`
-            // placeholder that stands in for it, which writes the buffer nothing at all. Let the
-            // decomposition leave the source layout's inter-member padding alone rather than
-            // decline, since `llvm.memcpy` of an aggregate leaves those bytes undefined anyway --
-            // the surrounding shader writes the same struct member by member and never writes them.
-            let leave_source_padding = self.unmodeled_pointers.contains(dst_name);
-            if self.emit_typed_to_raw_memcpy(
+            return self.emit_typed_to_raw_memcpy(
                 &dst,
                 dst_align,
                 &call.args[1],
                 len,
-                leave_source_padding,
-                instructions,
-            )? {
-                return Ok(true);
-            }
-            return self.emit_raw_byte_run_memcpy(
-                &dst,
-                dst_align,
-                &call.args[1],
-                len,
-                true,
                 instructions,
             );
         }
@@ -113,169 +95,17 @@ impl Emitter {
                 }
                 return Ok(true);
             }
-            if self.emit_raw_to_typed_struct_memcpy(&call.args[0], &src, len, instructions)? {
-                return Ok(true);
-            }
-            let dst_align = call.arg_aligns.first().copied().flatten();
-            return self.emit_raw_byte_run_memcpy(
-                &src,
-                dst_align,
-                &call.args[0],
-                len,
-                false,
-                instructions,
-            );
+            return self.emit_raw_to_typed_struct_memcpy(&call.args[0], &src, len, instructions);
         }
         Ok(false)
     }
 
-    /// Copy a run of BYTES between a raw byte cursor and a typed pointer that names one `i8`
-    /// element of a longer local object -- `memcpy(&blob[0], &buffer_field, n)`, where the local is
-    /// an `[n x i8]` staging alloca. Both whole-object decompositions see only the single byte the
-    /// typed pointer names and decline, and the call then reached `drop_unmodeled_memcpy`, which
-    /// discarded it: a copy of a real descriptor-backed buffer that simply did not happen.
-    ///
-    /// A byte at a time would be correct and unaffordable -- a subword store into a device buffer is
-    /// an atomic read-modify-write loop. Group four consecutive `i8` lanes into one word instead, so
-    /// the raw side keeps its plain word access. That needs the length to be a whole number of words
-    /// and the cursor to be word-aligned; anything else declines, exactly as before.
-    fn emit_raw_byte_run_memcpy(
-        &mut self,
-        raw: &RawBufferOffset,
-        raw_align: Option<u64>,
-        typed: &TypedValue,
-        len: u64,
-        raw_is_destination: bool,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<bool, String> {
-        if !len.is_multiple_of(4) || !self.raw_pointer_word_aligned(raw) {
-            return Ok(false);
-        }
-        staged_emit(instructions, |instructions| {
-            let Some((element, count)) = self.gep_element_run(typed, len)? else {
-                return Ok(false);
-            };
-            if self.resolve_type(&element)? != LlType::Int(8) || u64::from(count) != len {
-                return Ok(false);
-            }
-            let uint_ty = self.type_id(&LlType::Int(32))?;
-            let byte_ty = self.type_id(&LlType::Int(8))?;
-            for word in 0..(len / 4) {
-                let mut lane_ptrs = Vec::with_capacity(4);
-                for lane in 0..4 {
-                    let index = u32::try_from(word * 4 + lane).map_err(|_| {
-                        "native emitter: byte-run memcpy lane index overflows".to_string()
-                    })?;
-                    let Some(ptr) =
-                        self.emit_gep_provenance_lane_ptr(typed, &element, index, instructions)?
-                    else {
-                        return Ok(false);
-                    };
-                    lane_ptrs.push(ptr);
-                }
-                if raw_is_destination {
-                    let mut assembled = None;
-                    for (lane, ptr) in lane_ptrs.into_iter().enumerate() {
-                        let byte = self.fresh();
-                        instructions.push(Self::inst(
-                            Op::Load,
-                            Some(byte_ty),
-                            Some(byte),
-                            vec![Operand::IdRef(ptr)],
-                        ));
-                        let widened = self.fresh();
-                        instructions.push(Self::inst(
-                            Op::UConvert,
-                            Some(uint_ty),
-                            Some(widened),
-                            vec![Operand::IdRef(byte)],
-                        ));
-                        let placed = if lane == 0 {
-                            widened
-                        } else {
-                            let shift = self.const_uint(lane as u32 * 8)?;
-                            let shifted = self.fresh();
-                            instructions.push(Self::inst(
-                                Op::ShiftLeftLogical,
-                                Some(uint_ty),
-                                Some(shifted),
-                                vec![Operand::IdRef(widened), Operand::IdRef(shift)],
-                            ));
-                            shifted
-                        };
-                        assembled = Some(match assembled {
-                            None => placed,
-                            Some(previous) => {
-                                let merged = self.fresh();
-                                instructions.push(Self::inst(
-                                    Op::BitwiseOr,
-                                    Some(uint_ty),
-                                    Some(merged),
-                                    vec![Operand::IdRef(previous), Operand::IdRef(placed)],
-                                ));
-                                merged
-                            }
-                        });
-                    }
-                    let Some(assembled) = assembled else {
-                        return Ok(false);
-                    };
-                    self.emit_raw_word_store_for_access(
-                        raw,
-                        word * 4,
-                        assembled,
-                        raw_align,
-                        instructions,
-                    )?;
-                } else {
-                    let value = self.emit_raw_word_load(raw, word * 4, instructions)?;
-                    for (lane, ptr) in lane_ptrs.into_iter().enumerate() {
-                        let placed = if lane == 0 {
-                            value
-                        } else {
-                            let shift = self.const_uint(lane as u32 * 8)?;
-                            let shifted = self.fresh();
-                            instructions.push(Self::inst(
-                                Op::ShiftRightLogical,
-                                Some(uint_ty),
-                                Some(shifted),
-                                vec![Operand::IdRef(value), Operand::IdRef(shift)],
-                            ));
-                            shifted
-                        };
-                        let narrowed = self.fresh();
-                        instructions.push(Self::inst(
-                            Op::UConvert,
-                            Some(byte_ty),
-                            Some(narrowed),
-                            vec![Operand::IdRef(placed)],
-                        ));
-                        instructions.push(Self::inst(
-                            Op::Store,
-                            None,
-                            None,
-                            vec![Operand::IdRef(ptr), Operand::IdRef(narrowed)],
-                        ));
-                    }
-                }
-            }
-            Ok(true)
-        })
-    }
-
-    /// Store a typed aggregate through a raw byte cursor, one 32-bit word per leaf.
-    ///
-    /// `leave_source_padding` admits a word set that does not cover every word of `len`. The walk
-    /// visits every leaf of the source type at its own layout offset, so a gap is inter-member
-    /// padding and never data; leaving those destination bytes unchanged is one of the undefined
-    /// values `llvm.memcpy` of an aggregate may leave there.
     pub(in crate::native::emitter) fn emit_typed_to_raw_memcpy(
         &mut self,
         dst: &RawBufferOffset,
         dst_align: Option<u64>,
         src: &TypedValue,
         len: u64,
-        leave_source_padding: bool,
         instructions: &mut Vec<Instruction>,
     ) -> Result<bool, String> {
         staged_emit(instructions, |instructions| {
@@ -309,76 +139,23 @@ impl Emitter {
                 return Ok(false);
             }
             words.sort_by_key(|(offset, _)| *offset);
-            if words.len() != (len / 4) as usize {
-                match self.typed_memcpy_words_with_raw_padding(src, len, words.clone())? {
-                    Some(words_with_padding) => words = words_with_padding,
-                    None if leave_source_padding => {}
-                    None => return Ok(false),
-                }
+            let expected_words = (len / 4) as usize;
+            if words.len() != expected_words {
+                let Some(words_with_padding) =
+                    self.typed_memcpy_words_with_raw_padding(src, len, words)?
+                else {
+                    return Ok(false);
+                };
+                words = words_with_padding;
             }
-            let mut previous = None;
-            for (offset, word) in words {
-                if !offset.is_multiple_of(4)
-                    || offset + 4 > len
-                    || previous.is_some_and(|previous| previous >= offset)
-                {
+            for (index, (offset, word)) in words.into_iter().enumerate() {
+                if offset != (index as u64) * 4 {
                     return Ok(false);
                 }
-                previous = Some(offset);
                 self.emit_raw_word_store_for_access(dst, offset, word, dst_align, instructions)?;
             }
             Ok(true)
         })
-    }
-
-    /// Copy a `memcpy` that spans MORE than the object either pointer names: `memcpy(&a[0], &b[k],
-    /// n * sizeof(T))` names one element on each side and copies `n`. The whole-object path below is
-    /// short by `n - 1` elements and says nothing about it — a 296-byte copy through two `i8` element
-    /// pointers came out as a single-byte `OpCopyMemory`. Walk the run through both pointers' own GEP
-    /// provenance, the same element-striding primitive [`Self::emit_element_run_zero_memset`] uses.
-    ///
-    /// Returns `false` — and `emit_typed_memcpy` then declines the call entirely, which hands it to
-    /// `drop_unmodeled_memcpy` and the retry tiers — when either side has no element-striding
-    /// provenance, when the two element types disagree, when the length does not divide evenly, or
-    /// when the element is a pointer. Declining is the point: the four corpus modules whose source
-    /// pointer is an unmodelled `Private` placeholder reach `drop_unmodeled_memcpy`, which is where
-    /// they belonged, instead of copying one byte out of a variable that addresses nothing.
-    fn emit_element_run_memcpy(
-        &mut self,
-        dst: &TypedValue,
-        src: &TypedValue,
-        len: u64,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<bool, String> {
-        let Some((dst_element, count)) = self.gep_element_run(dst, len)? else {
-            return Ok(false);
-        };
-        let Some((src_element, src_count)) = self.gep_element_run(src, len)? else {
-            return Ok(false);
-        };
-        if count != src_count || !types_compatible(&dst_element, &src_element) {
-            return Ok(false);
-        }
-        let LlType::Ptr(dst_addrspace) = self.resolve_type(&dst.ty)? else {
-            return Ok(false);
-        };
-        let dst_storage = self.pointer_storage_for(&dst.value, dst_addrspace)?;
-        let mut staged = Vec::new();
-        for lane in 0..count {
-            let Some(dst_ptr) =
-                self.emit_gep_provenance_lane_ptr(dst, &dst_element, lane, &mut staged)?
-            else {
-                return Ok(false);
-            };
-            let Some(src_ptr) =
-                self.emit_gep_provenance_lane_ptr(src, &src_element, lane, &mut staged)?
-            else {
-                return Ok(false);
-            };
-            self.emit_copy_memory(dst_ptr, src_ptr, dst_storage, &dst_element, &mut staged)?;
-        }
-        instructions.extend(staged);
-        Ok(true)
     }
 
     pub(in crate::native::emitter) fn typed_memcpy_words_with_raw_padding(
@@ -855,58 +632,6 @@ impl Emitter {
         Ok(Some((provenance.root, provenance.addrspace, base)))
     }
 
-    /// The type a pointer's own `getelementptr` chain names, when it has one. Distinct from
-    /// [`Self::pointer_pointee_for_value`]'s Function-storage view, which rewrites device pointers to
-    /// `Int(64)`; an access chain built from this provenance is typed by THIS type.
-    fn gep_provenance_element_type(&self, ptr: &TypedValue) -> Result<Option<LlType>, String> {
-        let LlValue::Local(name) = &ptr.value else {
-            return Ok(None);
-        };
-        let Some(provenance) = self.gep_provenance.get(name) else {
-            return Ok(None);
-        };
-        if provenance.indices.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(gep_pointee(
-            &provenance.source_ty,
-            &provenance.indices,
-        )?))
-    }
-
-    /// The element RUN a byte length addresses through `ptr`: the element type and how many of them
-    /// `len` covers, or `None` when the pointer does not address a contiguous run of them.
-    ///
-    /// The element type comes from the pointer's own `getelementptr` chain, not from
-    /// [`Self::pointer_pointee_for_value`]'s Function-storage view, because the striding primitive
-    /// ([`Self::emit_gep_provenance_lane_ptr`]) types its access chain from the GEP. A `ptr` element is
-    /// refused for exactly that reason: a `[N x ptr addrspace(1)]` local declares `Int(64)` slots while
-    /// its GEP names `Ptr`, so a chain built from the GEP cannot address the array the local is.
-    fn gep_element_run(
-        &mut self,
-        ptr: &TypedValue,
-        len: u64,
-    ) -> Result<Option<(LlType, u32)>, String> {
-        let Some(element) = self.gep_provenance_element_type(ptr)? else {
-            return Ok(None);
-        };
-        let element = self.resolve_type(&element)?;
-        if matches!(element, LlType::Ptr(_)) {
-            return Ok(None);
-        }
-        let (element_size, _) = self.raw_type_size_align(&element)?;
-        if element_size == 0 || !len.is_multiple_of(element_size) {
-            return Ok(None);
-        }
-        let Ok(count) = u32::try_from(len / element_size) else {
-            return Ok(None);
-        };
-        if !self.can_emit_gep_provenance_lane_ptrs(ptr, &element)? {
-            return Ok(None);
-        }
-        Ok(Some((element, count)))
-    }
-
     pub(in crate::native::emitter) fn emit_zero_memset(
         &mut self,
         call: &LlCall,
@@ -965,9 +690,6 @@ impl Emitter {
                 "native emitter: partial zero memset cuts through a scalar subobject of {storage_pointee:?}"
             ));
         }
-        if len > size && self.emit_element_run_zero_memset(&call.args[0], len, instructions)? {
-            return Ok(true);
-        }
         let ptr = self.value_id(&call.args[0].value, &call.args[0].ty)?;
         let zero = self.const_null(&storage_pointee)?;
         instructions.push(Self::inst(
@@ -976,47 +698,6 @@ impl Emitter {
             None,
             vec![Operand::IdRef(ptr), Operand::IdRef(zero)],
         ));
-        Ok(true)
-    }
-
-    /// Clear a `memset` that spans MORE than its pointee object: `memset(&a[k], 0, n * sizeof(T))`
-    /// names one element and clears `n` of them, and the single null store below is short by `n - 1`
-    /// elements. Walk the run through the destination's own GEP provenance instead — the same
-    /// element-striding primitive the vector loads use, which keeps `Function`/`Private` roots on
-    /// `OpInBoundsAccessChain` where `OpPtrAccessChain` is illegal.
-    ///
-    /// Returns `false` (the caller keeps its single store) when the run does not divide evenly into
-    /// elements, when the pointer's last index does not stride a contiguous array/vector element —
-    /// striding a struct member would walk into a differently typed neighbour — or when the element is
-    /// a pointer. That last one is the `[N x ptr addrspace(1)]` device-pointer table: the local
-    /// declares `Int(64)` slots, the GEP names `Ptr`, and the striding primitive types its chain from
-    /// the GEP, so it cannot address the array the local actually is. Zeroing a device pointer is the
-    /// separate unmodelled-placeholder problem and is left exactly as it was.
-    fn emit_element_run_zero_memset(
-        &mut self,
-        dst: &TypedValue,
-        len: u64,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<bool, String> {
-        let Some((element, count)) = self.gep_element_run(dst, len)? else {
-            return Ok(false);
-        };
-        let zero = self.const_null(&element)?;
-        let mut staged = Vec::new();
-        for lane in 0..count {
-            let Some(pointer) =
-                self.emit_gep_provenance_lane_ptr(dst, &element, lane, &mut staged)?
-            else {
-                return Ok(false);
-            };
-            staged.push(Self::inst(
-                Op::Store,
-                None,
-                None,
-                vec![Operand::IdRef(pointer), Operand::IdRef(zero)],
-            ));
-        }
-        instructions.extend(staged);
         Ok(true)
     }
 
@@ -1271,16 +952,6 @@ impl Emitter {
             let src_pointee = self.resolve_type(&src_pointee)?;
             let copy_pointee = function_storage_local_type(&src_pointee);
             let (copy_size, _) = self.raw_type_size_align(&copy_pointee)?;
-            if len > copy_size {
-                // The copy outruns the object its pointer names, so copying that object is short by
-                // `len / copy_size - 1` elements. See `emit_element_run_zero_memset`.
-                return self.emit_element_run_memcpy(
-                    &call.args[0],
-                    &call.args[1],
-                    len,
-                    instructions,
-                );
-            }
             if len < copy_size {
                 if !types_compatible(&dst_pointee, &src_pointee) {
                     return self.emit_prefix_source_struct_memcpy(
@@ -1333,7 +1004,7 @@ impl Emitter {
                 src_storage,
             )? {
                 let dst = self.value_id(&call.args[0].value, &call.args[0].ty)?;
-                self.emit_copy_memory(dst, src, dst_storage, &dst_pointee, instructions)?;
+                self.emit_copy_memory(dst, src, instructions);
                 return Ok(true);
             }
 
@@ -1502,47 +1173,18 @@ impl Emitter {
         Ok(true)
     }
 
-    /// Copy one whole object from `src` to `dst`.
-    ///
-    /// `OpCopyMemory` is the natural spelling and is what this emits everywhere it can. It cannot be
-    /// used when the DESTINATION is an interface-backed block: SPIRV-Cross's write analysis does not
-    /// count an `OpCopyMemory` as a write, so a `StorageBuffer` written only that way is rendered
-    /// `const device _N&` in MSL, the assignment into it does not compile, and MoltenVK answers
-    /// `create compute pipeline: Initialization of an object has failed`. `spirv-val` is happy with
-    /// the module either way, which is why this survived. An `OpLoad` plus an `OpStore` is the same
-    /// copy and SPIRV-Cross does count that.
     pub(in crate::native::emitter) fn emit_copy_memory(
-        &mut self,
+        &self,
         dst: Word,
         src: Word,
-        dst_storage: StorageClass,
-        pointee: &LlType,
         instructions: &mut Vec<Instruction>,
-    ) -> Result<(), String> {
-        if !is_interface_backed_copy_storage(dst_storage) {
-            instructions.push(Self::inst(
-                Op::CopyMemory,
-                None,
-                None,
-                vec![Operand::IdRef(dst), Operand::IdRef(src)],
-            ));
-            return Ok(());
-        }
-        let object_ty = self.type_id(&function_storage_local_type(pointee))?;
-        let object = self.fresh();
+    ) {
         instructions.push(Self::inst(
-            Op::Load,
-            Some(object_ty),
-            Some(object),
-            vec![Operand::IdRef(src)],
-        ));
-        instructions.push(Self::inst(
-            Op::Store,
+            Op::CopyMemory,
             None,
             None,
-            vec![Operand::IdRef(dst), Operand::IdRef(object)],
+            vec![Operand::IdRef(dst), Operand::IdRef(src)],
         ));
-        Ok(())
     }
 
     pub(in crate::native::emitter) fn emit_aggregate_memcpy(
@@ -1560,7 +1202,7 @@ impl Emitter {
             return Ok(true);
         }
         if self.can_emit_whole_copy_memory(dst_pointee, src_pointee, dst_storage, src_storage)? {
-            self.emit_copy_memory(dst, src, dst_storage, dst_pointee, instructions)?;
+            self.emit_copy_memory(dst, src, instructions);
             return Ok(true);
         }
 

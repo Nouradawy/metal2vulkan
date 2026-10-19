@@ -20,7 +20,7 @@
 //! on a module that CALLS `air.simdgroup_async_copy_2d` — a module the emitter rejects outright today
 //! (`unhandled air.* intrinsic`), so nothing that emits today is altered.
 
-use super::air_text::{split_args, LineBuffer};
+use std::fmt::Write as _;
 
 /// The 12-operand `air.simdgroup_async_copy_2d` call, decoded from its argument list.
 struct AsyncCopyCall {
@@ -131,6 +131,37 @@ pub(crate) fn lower_simdgroup_async_copy_owned(san_ll: String) -> String {
     }
 }
 
+struct LineBuffer {
+    text: String,
+    has_line: bool,
+}
+
+impl LineBuffer {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            text: String::with_capacity(capacity),
+            has_line: false,
+        }
+    }
+
+    fn begin_line(&mut self) {
+        if self.has_line {
+            self.text.push('\n');
+        }
+        self.has_line = true;
+    }
+
+    fn push(&mut self, line: &str) {
+        self.begin_line();
+        self.text.push_str(line);
+    }
+
+    fn push_fmt(&mut self, line: std::fmt::Arguments<'_>) {
+        self.begin_line();
+        let _ = self.text.write_fmt(line);
+    }
+}
+
 /// Emit the extractelements + helper call replacing one async-copy call. `%result` is kept as a dummy
 /// non-null pointer so downstream `store ptr %result` / event plumbing stays well-typed.
 fn emit_copy_call(out: &mut LineBuffer, indent: &str, call: &AsyncCopyCall, fresh: &mut u64) {
@@ -238,7 +269,13 @@ fn parse_async_copy(line: &str) -> Option<AsyncCopyCall> {
     if !result.starts_with('%') {
         return None;
     }
-    let args = split_args(super::air_text::call_arguments(line)?);
+    // The argument list is delimited by the call's OUTER parens. `rfind(')')` is the closing paren
+    // (the `#N` attribute group and `!noalias` metadata follow it), and `find('(')` skips the callee's
+    // `addrspace(3)`-style type parens because it lands on the first `(` — which is inside a type; use
+    // the LAST balanced top-level paren group instead.
+    let open = line.find('(')?;
+    let args_str = &line[open + 1..line.rfind(')')?];
+    let args = split_args(args_str);
     if args.len() != 12 {
         return None;
     }
@@ -256,6 +293,36 @@ fn parse_async_copy(line: &str) -> Option<AsyncCopyCall> {
     })
 }
 
+/// Split a call argument list on TOP-LEVEL commas, respecting `<...>` / `(...)` / `[...]` / `{...}`
+/// nesting — a constant vector operand `<2 x i64> <i64 8, i64 32>` contains an inner comma that must
+/// NOT split the argument.
+fn split_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut cur = String::new();
+    for ch in s.chars() {
+        match ch {
+            '<' | '(' | '[' | '{' => {
+                depth += 1;
+                cur.push(ch);
+            }
+            '>' | ')' | ']' | '}' => {
+                depth -= 1;
+                cur.push(ch);
+            }
+            ',' if depth == 0 => {
+                out.push(cur.trim().to_string());
+                cur.clear();
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur.trim().to_string());
+    }
+    out
+}
+
 /// The VALUE of a `<type> <value>` LLVM operand. A `<2 x i64>` vector operand's value is everything
 /// after that type token (a `%reg`, a `<i64 8, i64 32>` constant, or a `splat (i64 32)` constant); a
 /// scalar / pointer operand's value is its last whitespace token (past any `noundef`/`readonly`/
@@ -265,7 +332,7 @@ fn operand_value(arg: &str) -> String {
     if let Some(rest) = a.strip_prefix("<2 x i64>") {
         return rest.trim().to_string();
     }
-    super::air_text::last_token(a).to_string()
+    a.rsplit(' ').next().unwrap_or("").to_string()
 }
 
 /// The `%id` result of a `%id = call ...` line, if any.

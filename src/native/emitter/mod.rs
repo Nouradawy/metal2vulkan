@@ -1,7 +1,7 @@
 use super::cfg::{
     funnel_shared_branch_dispatches, index_branch_merges_by_header,
     infer_bounded_branch_merges_by_header, infer_branch_merges, infer_direct_branch_merges,
-    infer_loop_merges, infer_switch_merges, infer_switch_merges_bounded,
+    infer_direct_switch_merges, infer_loop_merges, infer_switch_merges,
     lower_unstructured_switches, privatize_reused_emitted_merge_targets,
     refunnel_one_deep_shared_arm, LoopMergeInfo,
 };
@@ -60,6 +60,12 @@ pub(super) struct Emitter {
     /// lets emission express that contraction explicitly as GLSL.std.450 `Fma`, independent of a
     /// downstream SPIR-V consumer's optimizer choices.
     fast_float_products: HashMap<String, (TypedValue, TypedValue)>,
+    fast_grouped_sums: HashMap<String, (Vec<(TypedValue, bool)>, Vec<(TypedValue, bool)>, bool)>,
+    /// Fast sum trees whose direct-product/difference-product topology requires explicit evaluation
+    /// partitions. Without these boundaries, an MSL round trip flattens the source AIR tree and
+    /// changes cancellation residuals even though both forms permit reassociation.
+    fast_partitioned_sums: HashMap<String, Vec<Vec<TypedValue>>>,
+    fast_grouped_sum_boundaries: HashSet<String>,
     /// Fast add results belonging to a long multiply-accumulate chain. Short source chains already
     /// retain AIR's contraction behavior through ordinary MSL expression lowering; explicit `Fma`
     /// is reserved for chains long enough that downstream expression materialization loses it.
@@ -190,30 +196,17 @@ pub(super) struct Emitter {
     param_values: HashSet<String>,
     inline_parameter_substitutions: Vec<(Word, Word)>,
     raw_buffer_params: HashSet<String>,
-    /// Constant descriptor-relative byte cursors passed to raw helper parameters, keyed by
-    /// `(callee, parameter)`. The emitted-helper inliner can then keep a non-zero caller GEP rooted
-    /// in the real StorageBuffer instead of the ordinary Private placeholder value.
-    raw_call_param_offsets: HashMap<(String, String), RawBufferOffset>,
-    /// `(callee, caller-local argument name)` for every helper call refused because its
-    /// descriptor-relative byte cursor cannot cross the call. See `EmissionFailure`.
-    cursor_call_sites: HashSet<(String, String)>,
-    /// Cached `(callee, parameter index)` pairs whose call sites cannot disagree about the byte
-    /// a `constant`-space cursor names. See `Emitter::constant_call_cursor_cannot_conflict`.
-    agreeing_constant_call_cursors: Option<HashSet<(String, usize)>>,
+    /// Residual helper raw-buffer parameters that some call site reaches through an address-changing
+    /// alias of a caller parameter (a GEP, phi, or select rather than the parameter itself). A raw
+    /// pointer's SSA value is only a placeholder; its address is the descriptor root plus a byte
+    /// cursor. Calls therefore pass the root as the pointer operand and append one `u32` byte-cursor
+    /// shadow for exactly these parameters, after any nullness shadows, and the callee folds that
+    /// shadow into the parameter's raw offset.
+    function_param_raw_cursors: HashSet<(String, usize)>,
     /// Current function's entry params declared `air.buffer` in kernel metadata (data pointers,
     /// never textures/samplers). Rebuilt per emit_function from `ir.metadata_data_buffer_params`.
     data_buffer_params: HashSet<String>,
     raw_offsets: HashMap<String, RawBufferOffset>,
-    /// Integer SSA values that are the ADDRESS of a descriptor-bound buffer plus a byte offset.
-    ///
-    /// `ptrtoint` a bound pointer, add to it, `inttoptr` it back: the round trip names a byte inside
-    /// the buffer it started in, and the address itself is never observed. Logical SPIR-V has no
-    /// pointer address, so the integer stays the zero
-    /// [`Self::emit_ptrtoint_resolved`](Emitter::emit_ptrtoint_resolved) already emits -- what is
-    /// carried here is which buffer and how far in, exactly as `raw_offsets` carries it for a
-    /// pointer, so the `inttoptr` can hand its result a real offset instead of a placeholder whose
-    /// loads read zero.
-    symbolic_buffer_addresses: HashMap<String, RawBufferOffset>,
     int_alignments: HashMap<String, u64>,
     unmodeled_pointers: HashSet<String>,
     /// AIR occasionally embeds a numeric Workgroup address directly in an atomic operand. Logical
@@ -580,6 +573,9 @@ impl Emitter {
             glsl_ext: None,
             values: HashMap::new(),
             fast_float_products: HashMap::new(),
+            fast_grouped_sums: HashMap::new(),
+            fast_partitioned_sums: HashMap::new(),
+            fast_grouped_sum_boundaries: HashSet::new(),
             fast_contract_adds: HashSet::new(),
             fast_uncontracted_sums: HashSet::new(),
             global_values: HashMap::new(),
@@ -631,12 +627,9 @@ impl Emitter {
             param_values: HashSet::new(),
             inline_parameter_substitutions: Vec::new(),
             raw_buffer_params: HashSet::new(),
-            raw_call_param_offsets: HashMap::new(),
-            cursor_call_sites: HashSet::new(),
-            agreeing_constant_call_cursors: None,
+            function_param_raw_cursors: HashSet::new(),
             data_buffer_params: HashSet::new(),
             raw_offsets: HashMap::new(),
-            symbolic_buffer_addresses: HashMap::new(),
             int_alignments: HashMap::new(),
             unmodeled_pointers: HashSet::new(),
             workgroup_i32_addresses: HashMap::new(),
@@ -903,6 +896,112 @@ impl Emitter {
         Ok(required)
     }
 
+    /// Select the residual helper raw-buffer parameters that need a byte-cursor shadow (see
+    /// [`Emitter::function_param_raw_cursors`]). A call site needs one when its argument is an
+    /// address-preserving alias of a caller parameter — the same relation raw-buffer propagation
+    /// follows — that is not provably the parameter's own address. Forwarding a caller parameter that
+    /// itself carries a cursor propagates the requirement to the callee. The decision is taken from
+    /// typed AIR before any function is emitted, so every call site and the callee agree on one
+    /// signature regardless of emission order.
+    pub(super) fn infer_function_param_raw_cursors(
+        &self,
+        functions: &[LlFunction],
+    ) -> HashSet<(String, usize)> {
+        let functions_by_name: HashMap<&str, &LlFunction> = functions
+            .iter()
+            .map(|function| (function.name.as_str(), function))
+            .collect();
+        let aliases: HashMap<&str, (HashMap<String, String>, HashMap<String, String>)> = functions
+            .iter()
+            .map(|function| {
+                (
+                    function.name.as_str(),
+                    (
+                        super::ir::pointer_param_alias_roots(function),
+                        super::ir::pointer_param_zero_offset_aliases(function),
+                    ),
+                )
+            })
+            .collect();
+        let mut required = HashSet::new();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for function in functions {
+                let (alias_roots, zero_offset_roots) = &aliases[function.name.as_str()];
+                for inst in function.carrier_insts() {
+                    let Some(call) = inst.call().as_ref() else {
+                        continue;
+                    };
+                    let Some(callee) = functions_by_name.get(call.callee.as_str()) else {
+                        continue;
+                    };
+                    if call.args.len() != callee.params.len() {
+                        continue;
+                    }
+                    for (index, (argument, (param, param_ty))) in
+                        call.args.iter().zip(&callee.params).enumerate()
+                    {
+                        let key = (callee.name.clone(), index);
+                        if required.contains(&key)
+                            || !self.raw_cursor_param_candidate(callee, index, param, param_ty)
+                        {
+                            continue;
+                        }
+                        let LlValue::Local(argument) = &argument.value else {
+                            continue;
+                        };
+                        if !alias_roots.contains_key(argument) {
+                            continue;
+                        }
+                        let needs_cursor = zero_offset_roots.get(argument).is_none_or(|root| {
+                            function
+                                .params
+                                .iter()
+                                .position(|(name, _)| name == root)
+                                .is_some_and(|caller_index| {
+                                    required.contains(&(function.name.clone(), caller_index))
+                                })
+                        });
+                        if needs_cursor {
+                            required.insert(key);
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        required
+    }
+
+    /// A helper parameter whose emitted binding is a descriptor- or Workgroup-rooted raw offset (the
+    /// same condition under which `emit_function` records `raw_offsets` for it), and which is not
+    /// already an address-carrying BDA parameter.
+    fn raw_cursor_param_candidate(
+        &self,
+        callee: &LlFunction,
+        index: usize,
+        param: &str,
+        param_ty: &LlType,
+    ) -> bool {
+        if self.ir.entry_functions.contains(&callee.name)
+            || !self
+                .ir
+                .raw_buffer_params
+                .contains(&(callee.name.clone(), param.to_string()))
+        {
+            return false;
+        }
+        match self.resolve_type(param_ty) {
+            Ok(LlType::Ptr(1)) => !self.bda_device_pointers,
+            Ok(LlType::Ptr(2)) => true,
+            Ok(LlType::Ptr(3)) => self
+                .concrete_vector_workgroup_raw_param_pointee(&callee.name, index, param)
+                .is_none(),
+            _ => false,
+        }
+    }
+
     fn local_call_arg_nonnull_values(
         &self,
         function: &LlFunction,
@@ -1105,23 +1204,6 @@ impl Emitter {
         }
     }
 
-    /// The owned facts every emitter failure carries. A retry selects its next representation from
-    /// these, so raising a failure anywhere in emission must not drop them.
-    fn emission_failure(&self, error: String) -> crate::emit_sidecar::EmissionFailure {
-        crate::emit_sidecar::EmissionFailure {
-            error,
-            rejected: Box::new(self.emission_rejections()),
-        }
-    }
-
-    fn emission_rejections(&self) -> crate::emit_sidecar::EmissionRejections {
-        crate::emit_sidecar::EmissionRejections {
-            ordinary_plan_functions: self.emit_sidecar.ordinary_plan_rejected_functions.clone(),
-            ownership_plan_functions: self.emit_sidecar.ownership_plan_rejected_functions.clone(),
-            cursor_call_sites: self.cursor_call_sites.clone(),
-        }
-    }
-
     pub(super) fn emit_with_sidecar(
         mut self,
         buffer_layouts: Option<&HashMap<u32, crate::meta::AirType>>,
@@ -1142,122 +1224,34 @@ impl Emitter {
         this.emit_sidecar.air_data_layout = air_data_layout;
         if this.used_device_address {
             if let Err(error) = this.lower_bda_null_aggregate_pointers() {
-                return Err(this.emission_failure(error));
+                return Err(crate::emit_sidecar::EmissionFailure {
+                    error,
+                    ordinary_plan_rejected_functions: this
+                        .emit_sidecar
+                        .ordinary_plan_rejected_functions
+                        .clone(),
+                    ownership_plan_rejected_functions: this
+                        .emit_sidecar
+                        .ownership_plan_rejected_functions
+                        .clone(),
+                });
             }
             if let Err(error) = this.lower_bda_address_operations_module() {
-                return Err(this.emission_failure(error));
+                return Err(crate::emit_sidecar::EmissionFailure {
+                    error,
+                    ordinary_plan_rejected_functions: this
+                        .emit_sidecar
+                        .ordinary_plan_rejected_functions
+                        .clone(),
+                    ownership_plan_rejected_functions: this
+                        .emit_sidecar
+                        .ownership_plan_rejected_functions
+                        .clone(),
+                });
             }
             this.switch_to_physical_storage_buffer64();
         }
-        this.align_physical_memory_accesses();
         Ok((this.module, this.emit_sidecar))
-    }
-
-    /// Attach the `Aligned` memory operand to every load and store through a
-    /// `PhysicalStorageBuffer` pointer that does not already carry one.
-    ///
-    /// Vulkan requires it, and `owned_cfg`'s memory-access contract refuses the module without it.
-    /// Every site that BUILDS a physical access attaches it itself, so this is a no-op for them --
-    /// measured, 0 of 14579 corpus sources change. What it is for is a physical pointer that
-    /// reaches an ORDINARY load or store: a `select` between two device addresses hands the
-    /// generic access path a physical pointer it did not construct, and the alternative to
-    /// legalizing it here is to decline the whole representation and read zero instead.
-    ///
-    /// The alignment is the pointee's natural one, the same rule
-    /// [`Self::device_addr_align`](Emitter::device_addr_align) applies to a device-address leaf.
-    fn align_physical_memory_accesses(&mut self) {
-        fn scalar_alignment(types: &HashMap<Word, &Instruction>, id: Word) -> u32 {
-            let Some(inst) = types.get(&id) else {
-                return 4;
-            };
-            match inst.class.opcode {
-                Op::TypeInt | Op::TypeFloat => match inst.operands.first() {
-                    Some(Operand::LiteralBit32(bits)) => (bits / 8).clamp(1, 8),
-                    _ => 4,
-                },
-                Op::TypeVector | Op::TypeMatrix | Op::TypeArray => match inst.operands.first() {
-                    Some(Operand::IdRef(element)) => scalar_alignment(types, *element),
-                    _ => 4,
-                },
-                Op::TypePointer => 8,
-                _ => 4,
-            }
-        }
-
-        let types: HashMap<Word, &Instruction> = self
-            .module
-            .types_global_values
-            .iter()
-            .filter_map(|inst| inst.result_id.map(|id| (id, inst)))
-            .collect();
-        let physical_pointer_alignment: HashMap<Word, u32> = self
-            .module
-            .types_global_values
-            .iter()
-            .filter(|inst| inst.class.opcode == Op::TypePointer)
-            .filter(|inst| {
-                matches!(
-                    inst.operands.first(),
-                    Some(Operand::StorageClass(StorageClass::PhysicalStorageBuffer))
-                )
-            })
-            .filter_map(|inst| {
-                let id = inst.result_id?;
-                let Some(Operand::IdRef(pointee)) = inst.operands.get(1) else {
-                    return None;
-                };
-                Some((id, scalar_alignment(&types, *pointee)))
-            })
-            .collect();
-        if physical_pointer_alignment.is_empty() {
-            return;
-        }
-
-        let mut pointer_alignment: HashMap<Word, u32> = HashMap::new();
-        for function in &self.module.functions {
-            for parameter in &function.parameters {
-                if let (Some(result), Some(ty)) = (parameter.result_id, parameter.result_type) {
-                    if let Some(align) = physical_pointer_alignment.get(&ty) {
-                        pointer_alignment.insert(result, *align);
-                    }
-                }
-            }
-            for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
-                if let (Some(result), Some(ty)) = (instruction.result_id, instruction.result_type) {
-                    if let Some(align) = physical_pointer_alignment.get(&ty) {
-                        pointer_alignment.insert(result, *align);
-                    }
-                }
-            }
-        }
-
-        for instruction in self
-            .module
-            .functions
-            .iter_mut()
-            .flat_map(|function| function.blocks.iter_mut())
-            .flat_map(|block| block.instructions.iter_mut())
-        {
-            // <pointer> for a load; <pointer> <object> for a store.
-            let operands_before_access = match instruction.class.opcode {
-                Op::Load => 1,
-                Op::Store => 2,
-                _ => continue,
-            };
-            if instruction.operands.len() != operands_before_access {
-                continue;
-            }
-            let Some(Operand::IdRef(pointer)) = instruction.operands.first() else {
-                continue;
-            };
-            let Some(alignment) = pointer_alignment.get(pointer).copied() else {
-                continue;
-            };
-            instruction
-                .operands
-                .push(Operand::MemoryAccess(MemoryAccess::ALIGNED));
-            instruction.operands.push(Operand::LiteralBit32(alignment));
-        }
     }
 
     fn lower_bda_address_operations_module(&mut self) -> Result<(), String> {
@@ -2788,7 +2782,17 @@ impl Emitter {
                 match $expression {
                     Ok(value) => value,
                     Err(error) => {
-                        return Err(self.emission_failure(error));
+                        return Err(crate::emit_sidecar::EmissionFailure {
+                            error,
+                            ordinary_plan_rejected_functions: self
+                                .emit_sidecar
+                                .ordinary_plan_rejected_functions
+                                .clone(),
+                            ownership_plan_rejected_functions: self
+                                .emit_sidecar
+                                .ownership_plan_rejected_functions
+                                .clone(),
+                        });
                     }
                 }
             };
@@ -2818,6 +2822,7 @@ impl Emitter {
         attempt!(self.infer_function_param_pointees(&functions));
         self.function_param_nonnull = attempt!(self.infer_function_param_nonnull(&functions));
         self.function_param_nullness = attempt!(self.infer_function_param_nullness(&functions));
+        self.function_param_raw_cursors = self.infer_function_param_raw_cursors(&functions);
         let entry_name = self
             .ir
             .entry_name
@@ -2867,7 +2872,10 @@ impl Emitter {
         // Match the SPIR-V version LLVM's Vulkan backend emitted for this pipeline.
         header.set_version(1, 4);
         self.module.header = Some(header);
-        let rejected = Box::new(self.emission_rejections());
+        let ordinary_plan_rejected_functions =
+            self.emit_sidecar.ordinary_plan_rejected_functions.clone();
+        let ownership_plan_rejected_functions =
+            self.emit_sidecar.ownership_plan_rejected_functions.clone();
         let module = self.module;
         let emit_sidecar = self.emit_sidecar;
         let inlined = crate::passes::inline_all_emitted_helpers(
@@ -2878,7 +2886,11 @@ impl Emitter {
         (self.module, self.emit_sidecar) = match inlined {
             Ok(inlined) => inlined,
             Err(error) => {
-                return Err(crate::emit_sidecar::EmissionFailure { error, rejected });
+                return Err(crate::emit_sidecar::EmissionFailure {
+                    error,
+                    ordinary_plan_rejected_functions,
+                    ownership_plan_rejected_functions,
+                });
             }
         };
         self.rewrite_private_scalar_offset_access_chains();
@@ -3288,7 +3300,12 @@ fn aggregate_pointer_leaf_paths(
     paths
 }
 
-use crate::spirv_module::ptr_access_chain_allowed_storage;
+fn ptr_access_chain_allowed_storage(storage: StorageClass) -> bool {
+    matches!(
+        storage,
+        StorageClass::Workgroup | StorageClass::StorageBuffer | StorageClass::PhysicalStorageBuffer
+    )
+}
 
 fn result_type_of_id(defs: &HashMap<Word, Instruction>, id: Word) -> Option<Word> {
     defs.get(&id).and_then(|inst| inst.result_type)

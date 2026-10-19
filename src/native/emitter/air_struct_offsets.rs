@@ -438,25 +438,45 @@ fn matrix_type_matches(
     array_len == cols && vector_type_matches(defs, vec_ty, scalar, rows)
 }
 
-use crate::spirv_module::array_type;
-
-use crate::spirv_module::type_int_width;
-
-use crate::spirv_module::type_float_width;
-
-/// Whether an emitted member AIR does not describe is the backend's own padding.
-///
-/// The Metal front end spells a hole between two members as bytes: `[N x i8]` for a run, and a
-/// BARE `i8` for a single byte, which is what a `char` followed by a two-byte member produces
-/// (`re::BreakthroughPlanarInstanceData` declares `char cullMode` at 180 and
-/// `ushort clippingOffset` at 182, and LLVM emits `float, i8, i8, i16`). Recognising only the
-/// array spelling made the single byte look like a member AIR forgot to declare, which discarded
-/// the whole struct's declared offsets. Padding is only ever consulted after the member fails to
-/// match the AIR member at the cursor, so a genuine one-byte member is matched as itself first.
-fn is_backend_padding_array(defs: &HashMap<Word, Instruction>, ty: Word) -> bool {
-    if type_int_width(defs, ty) == Some(8) {
-        return true;
+fn array_type(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<(Word, u32)> {
+    let def = defs.get(&ty)?;
+    if def.class.opcode != Op::TypeArray {
+        return None;
     }
+    let elem = match def.operands.first()? {
+        Operand::IdRef(elem) => *elem,
+        _ => return None,
+    };
+    let len_const = match def.operands.get(1)? {
+        Operand::IdRef(len_const) => *len_const,
+        _ => return None,
+    };
+    let len = defs
+        .get(&len_const)
+        .and_then(|constant| match constant.operands.first() {
+            Some(Operand::LiteralBit32(len)) => Some(*len),
+            _ => None,
+        })?;
+    Some((elem, len))
+}
+
+fn type_int_width(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<u32> {
+    let def = defs.get(&ty)?;
+    (def.class.opcode == Op::TypeInt).then(|| match def.operands.first() {
+        Some(Operand::LiteralBit32(width)) => *width,
+        _ => 32,
+    })
+}
+
+fn type_float_width(defs: &HashMap<Word, Instruction>, ty: Word) -> Option<u32> {
+    let def = defs.get(&ty)?;
+    (def.class.opcode == Op::TypeFloat).then(|| match def.operands.first() {
+        Some(Operand::LiteralBit32(width)) => *width,
+        _ => 32,
+    })
+}
+
+fn is_backend_padding_array(defs: &HashMap<Word, Instruction>, ty: Word) -> bool {
     let Some((elem, _len)) = array_type(defs, ty) else {
         return false;
     };

@@ -178,7 +178,12 @@ fn pointer_root(ptr: Word, sources: &HashMap<Word, Word>) -> Option<Word> {
     None
 }
 
-use super::atomic_loop::id_ref_at;
+fn id_ref_at(inst: &Instruction, index: usize) -> Option<Word> {
+    match inst.operands.get(index) {
+        Some(Operand::IdRef(id)) => Some(*id),
+        _ => None,
+    }
+}
 
 fn is_atomic_op(op: Op) -> bool {
     matches!(

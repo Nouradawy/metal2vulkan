@@ -20,10 +20,8 @@ pub mod air_intrinsics;
 pub(crate) mod air_static_init;
 pub mod as_shadow;
 mod construction;
-mod dominators;
 mod emission_order;
 mod emit_sidecar;
-mod emitted_effects;
 pub mod env_vars;
 mod fc_air_specialize;
 mod fc_specialize;
@@ -111,10 +109,10 @@ pub fn translate_sanitized_native(
 /// Apply the shared pre-emit AIR lowering before any representation derives stage metadata or emits
 /// from the module. Alternate constructions re-emit the supplied text directly, so using the
 /// original intrinsic-bearing text would make the representations observe different programs.
-/// Floor-safe: each member is a no-op unless the module names what it lowers, and both shapes are
-/// ones the emitter otherwise mistranslates or rejects outright.
-fn lower_air_text_if_enabled(san_ll: &str) -> Cow<'_, str> {
-    native::lower_air_text(san_ll)
+/// Floor-safe: `lower_simdgroup_async_copy` is a no-op unless the module calls
+/// `air.simdgroup_async_copy_2d` (such modules fail the emitter outright otherwise).
+fn lower_async_copy_if_enabled(san_ll: &str) -> Cow<'_, str> {
+    native::lower_simdgroup_async_copy(san_ll)
 }
 
 fn reject_unsupported_metal_linked_functions(san_ll: &str) -> Result<(), String> {
@@ -127,79 +125,6 @@ fn reject_unsupported_metal_linked_functions(san_ll: &str) -> Result<(), String>
         );
     }
     Ok(())
-}
-
-/// Refuse a module whose every observable write was removed by folding a function constant the
-/// caller supplied no value for.
-///
-/// AIR states no default for a `[[function_constant]]`: its `air.fc_initializer` global is
-/// `externally_initialized … undef`, and `meta::globals` reads that as zero so an off-by-default
-/// region folds away before it can hold something Logical SPIR-V cannot express. That folding is
-/// load-bearing and stays — disabling it costs 106 of the 14579 local corpus sources and still
-/// leaves 53 of the 55 modules this check names with no image write. But the zero it reads is a
-/// value AIR never gave, and when it is what removed every last write, the module we would hand a
-/// caller cannot write the texture its AIR writes. Refuse instead of reporting success: 55 sources,
-/// 28 of which regain an image write as soon as any value is substituted for their constants.
-///
-/// Values supplied through [`fc_air_specialize::specialize_air_function_constants`] rewrite the
-/// initializer they are given, so a specialized module has nothing left for this to fire on and a
-/// caller who asked for the empty variant still gets it.
-fn reject_function_constant_erased_effects(san_ll: &str, module: &Module) -> Result<(), String> {
-    if !emitted_effects::air_declares_an_observable_write(san_ll) {
-        return Ok(());
-    }
-    if emitted_effects::module_has_an_observable_effect(module) {
-        return Ok(());
-    }
-    let unsupplied = meta::function_constants_without_a_supplied_value(san_ll);
-    if unsupplied.is_empty() {
-        return Ok(());
-    }
-    let named = unsupplied
-        .iter()
-        .take(4)
-        .map(|constant| format!("{} (index {})", constant.name, constant.index))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(format!(
-        "the entry writes a texture or a device buffer, but no write survived folding {} function \
-         constant(s) the caller supplied no value for -- {named}. AIR declares no default for a \
-         function constant, so the zero folded in its place is a value the shader never asked for; \
-         emitting the module would silently do nothing where Metal writes",
-        unsupplied.len(),
-    ))
-}
-
-/// Refuse a module whose every write went into an imageblock this translator has no tile model for.
-///
-/// A Metal imageblock is threadgroup tile memory that the render pass resolves into its attachments
-/// when the tile completes. Vulkan has no resolve step and this translator has no attachment to
-/// resolve into, so `native::emitter::body::calls` stages imageblock cells in per-invocation
-/// `Private` (or per-threadgroup `Workgroup`) memory. 143 of the 14579 local corpus sources store
-/// into an imageblock; 66 of them go on to write a texture or a device buffer, and for those this
-/// says nothing. For 16 the staging array IS the program -- Metal's tile CLEAR kernels and the
-/// `xdr::*_block` converters -- and the module validates, reflects no resource at all, and a
-/// consumer that dispatches it clears nothing. (The remaining 61 are refused for other reasons.)
-///
-/// Stated on its own cause rather than folded into
-/// [`reject_function_constant_erased_effects`]: that one names function-constant folding as the
-/// thing that removed the writes, and needs an unsupplied constant to be honest about it. Ten of
-/// these sixteen declare no function constant at all, and for the other six the constants are not
-/// what emptied the module.
-fn reject_imageblock_only_effects(san_ll: &str, module: &Module) -> Result<(), String> {
-    if !emitted_effects::air_declares_an_imageblock_write(san_ll) {
-        return Ok(());
-    }
-    if emitted_effects::module_has_an_observable_effect(module) {
-        return Ok(());
-    }
-    Err(
-        "the entry's only write is into an imageblock, which this translator stages in \
-         per-invocation or per-threadgroup memory because Vulkan has no tile-resolve step; \
-         emitting the module would hand a caller a dispatch that writes nothing where Metal \
-         resolves the tile into its attachments"
-            .to_string(),
-    )
 }
 
 fn options_for_air(
@@ -217,6 +142,12 @@ fn options_for_air(
     options.validate_runtime_storage_images()?;
     if san_ll.contains("air.compile.denorms_disable") {
         options.denorm_flush_to_zero_f32 = true;
+    }
+    // AIR's simdgroup ABI is 32 lanes. Vulkan implementations may expose wider native subgroups
+    // (MoltenVK commonly exposes 64), so subgroup reductions/scans must retain 32-lane partitions
+    // instead of silently adopting the driver's width.
+    if san_ll.contains("@air.simd_") {
+        options.simd_cluster32 = true;
     }
     Ok(options)
 }
@@ -464,32 +395,6 @@ pub fn translate_sanitized_native_specialized_with_options(
     )
 }
 
-/// [`translate_sanitized_native_specialized_with_options`] plus the reflection facade.
-///
-/// A caller that binds the resulting module needs the reflection OF that module, not one built from
-/// the AIR alone: [`reflect_sanitized`] constructs no module, so the facts only the finished module
-/// can answer -- the image type behind a texture binding, the address table, synthesized
-/// placeholder descriptors -- stay at their AIR-text approximation there. See
-/// [`translate_reflected`].
-pub fn translate_sanitized_native_specialized_reflected_with_options(
-    san_ll: &str,
-    stage: passes::Stage,
-    tmp: &Path,
-    options: passes::TransformOptions,
-    function_constants: &[(u32, Vec<u8>)],
-) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
-    let datalayout = layout::AirDataLayout::from_ir(san_ll)?;
-    let specialized =
-        fc_air_specialize::specialize_air_function_constants(san_ll, function_constants)?;
-    translate_sanitized_native_reflected_with_layout(
-        specialized.as_ref(),
-        stage,
-        tmp,
-        options,
-        datalayout,
-    )
-}
-
 /// Translate an owned sanitized AIR module while allowing superseded preprocessing input to be
 /// released before typed parsing. This is byte- and error-equivalent to
 /// [`translate_sanitized_native_with_options`], but lowers peak memory for large modules that need a
@@ -501,7 +406,7 @@ pub fn translate_sanitized_native_owned_with_options(
     options: passes::TransformOptions,
 ) -> Result<Vec<u8>, String> {
     let datalayout = layout::AirDataLayout::from_ir(&san_ll)?;
-    let lowered = native::lower_air_text_owned(san_ll);
+    let lowered = native::lower_simdgroup_async_copy_owned(san_ll);
     translate_sanitized_native_pre_lowered_with_layout(&lowered, stage, tmp, options, datalayout)
 }
 
@@ -512,15 +417,14 @@ fn translate_sanitized_native_with_options_and_layout(
     options: passes::TransformOptions,
     datalayout: Option<layout::AirDataLayout>,
 ) -> Result<Vec<u8>, String> {
-    // Lower `air.simdgroup_async_copy_2d` (+ its event/wait pair) to an explicit strided tile copy,
-    // and a dynamic-length `llvm.memcpy` to a byte loop, before metadata parsing or emission, so the
-    // primary and alternate representations see the same ordinary LLVM. Each rewrite is a no-op
-    // unless the module contains what it lowers. See `native::async_copy` and
-    // `native::dynamic_memcpy` and their structural regression tests.
+    // Lower `air.simdgroup_async_copy_2d` (+ its event/wait pair) to an explicit strided tile copy
+    // before metadata parsing or emission, so the primary and alternate representations see the
+    // same ordinary LLVM. The rewrite is a no-op unless the module calls the intrinsic, which the
+    // emitter otherwise rejects. See `native::async_copy` and its structural regression tests.
     if env_vars::retry_debug() {
         eprintln!("[retry-debug] translate: AIR pre-lowering start");
     }
-    let lowered = lower_air_text_if_enabled(san_ll);
+    let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_ref();
     if env_vars::retry_debug() {
         eprintln!("[retry-debug] translate: AIR pre-lowering complete");
@@ -623,27 +527,6 @@ pub fn translate_sanitized_native_linked_specialized_with_options(
     )
 }
 
-/// [`translate_sanitized_native_linked_specialized_with_options`] plus the reflection facade. See
-/// [`translate_sanitized_native_specialized_reflected_with_options`] for why a caller that binds the
-/// module wants this reflection rather than [`reflect_sanitized_specialized`]'s.
-pub fn translate_sanitized_native_linked_specialized_reflected_with_options(
-    san_ll: &str,
-    stage: passes::Stage,
-    tmp: &Path,
-    options: passes::TransformOptions,
-    linkage: &linked_functions::LinkedFunctionLinkage,
-    function_constants: &[(u32, Vec<u8>)],
-) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
-    let specialized = specialize_linked_module(san_ll, stage, linkage)?;
-    translate_sanitized_native_specialized_reflected_with_options(
-        &specialized,
-        stage,
-        tmp,
-        options,
-        function_constants,
-    )
-}
-
 /// Like [`translate`] but also returns the [`reflect::ShaderReflection`] needed to integrate the
 /// resulting module.
 ///
@@ -713,7 +596,7 @@ pub fn reflect_sanitized(
     stage: passes::Stage,
     options: passes::TransformOptions,
 ) -> Result<reflect::ShaderReflection, String> {
-    let lowered = lower_air_text_if_enabled(san_ll);
+    let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_ref();
     let stage_meta = parse_stage_meta(san_ll, stage);
     let options = options_for_air(san_ll, options)?;
@@ -777,7 +660,7 @@ fn translate_sanitized_native_reflected_with_layout(
     options: passes::TransformOptions,
     datalayout: Option<layout::AirDataLayout>,
 ) -> Result<(Vec<u8>, reflect::ShaderReflection), String> {
-    let lowered = lower_air_text_if_enabled(san_ll);
+    let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_ref();
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
@@ -835,7 +718,7 @@ fn translate_sanitized_native_reflected_with_layout(
 pub fn translate_native_no_retry(san_ll: &str, stage: passes::Stage) -> Result<Vec<u8>, String> {
     // Mirror the pre-spirv-val prologue of `translate_sanitized_native_with_options` exactly so BC
     // measures the bytes production would actually validate: async-copy lowering, then stage meta.
-    let lowered = lower_air_text_if_enabled(san_ll);
+    let lowered = lower_async_copy_if_enabled(san_ll);
     reject_unsupported_metal_linked_functions(&lowered)?;
     let stage_meta = parse_stage_meta(&lowered, stage);
     translate_native_no_retry_with_meta(
@@ -918,7 +801,7 @@ pub fn translate_native_primary_validated(
     stage: passes::Stage,
     tmp: &Path,
 ) -> Result<Vec<u8>, String> {
-    let lowered = lower_air_text_if_enabled(san_ll);
+    let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_ref();
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
@@ -1153,21 +1036,6 @@ fn finish_module(
         // intermediate module.
         passes::canonicalize_ids(&mut out);
     }
-    // CFG construction can delete the only instruction that needed a capability -- an
-    // `OpDemoteToHelperInvocation` in a block the structurizer proves unreachable is the measured
-    // case. Every earlier cleanup ran on a module that still had it, so the capability survives a
-    // liveness snapshot taken before this boundary; this is the first point at which the module is
-    // the one that ships. See `drop_unrequired_capabilities`.
-    passes::drop_unreferenced_scalar_types(&mut out);
-    passes::drop_unused_scalar_width_capabilities(&mut out);
-    passes::drop_unrequired_capabilities(&mut out);
-    // Vulkan reads an undecorated storage buffer as a demand: a graphics-stage module that declares
-    // one requires `fragmentStoresAndAtomics` / `vertexPipelineStoresAndAtomics` from every consumer
-    // whether or not a store exists. State the buffers this module provably never writes. This runs
-    // last because the answer is about the module that ships -- every instruction-deleting step
-    // above can remove the only store through a descriptor, and a decoration attached before them
-    // would describe a module that no longer exists.
-    reflect::decorate_unwritten_descriptors(&mut out);
     if let Some(failure) = native::owned_module_failure(&out) {
         if let Some(path) = env_vars::retry_dump() {
             let _ = std::fs::write(path, assemble_finished_module(&out));
@@ -1199,7 +1067,7 @@ pub fn translate_raw_tiers_probe(
     stage: passes::Stage,
     tmp: &Path,
 ) -> Vec<Result<Vec<u8>, String>> {
-    let lowered = lower_air_text_if_enabled(san_ll);
+    let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_ref();
     if let Err(error) = reject_unsupported_metal_linked_functions(san_ll) {
         return vec![Err(error.clone()), Err(error)];
@@ -1271,7 +1139,7 @@ pub fn translate_bda_probe(
     stage: passes::Stage,
     tmp: &Path,
 ) -> Result<Vec<u8>, String> {
-    let lowered = lower_air_text_if_enabled(san_ll);
+    let lowered = lower_async_copy_if_enabled(san_ll);
     let san_ll = lowered.as_ref();
     reject_unsupported_metal_linked_functions(san_ll)?;
     let stage_meta = parse_stage_meta(san_ll, stage);
@@ -1367,8 +1235,8 @@ fn translate_sanitized_with_meta_prevalidated_carrier(
             rc.finish_primary_carrier(emitted)
         }
         Err(failure) => {
-            rc.remember_ordinary_plan_rejection_set(&failure.rejected.ordinary_plan_functions);
-            rc.remember_ownership_plan_rejection_set(&failure.rejected.ownership_plan_functions);
+            rc.remember_ordinary_plan_rejection_set(&failure.ordinary_plan_rejected_functions);
+            rc.remember_ownership_plan_rejection_set(&failure.ownership_plan_rejected_functions);
             Err(failure.error)
         }
     };
@@ -1393,8 +1261,6 @@ fn translate_sanitized_with_meta_prevalidated_carrier(
             let _ = std::fs::write(path, &constructed.bytes);
         }
         tools::spirv_val_bytes(&constructed.bytes, tmp)?;
-        reject_function_constant_erased_effects(san_ll, &constructed.module)?;
-        reject_imageblock_only_effects(san_ll, &constructed.module)?;
         if retry_debug_on {
             eprintln!("[retry-debug] constructed module validated in-translate");
         }
@@ -1425,41 +1291,6 @@ pub fn canonicalize_spirv_bytes(spv: &[u8]) -> Result<Vec<u8>, String> {
         .iter()
         .flat_map(|w| w.to_le_bytes())
         .collect())
-}
-
-pub use passes::loop_budget::{LoopBudgetReport, DEFAULT_LOOP_BUDGET};
-
-/// Bound every loop in an emitted SPIR-V byte stream to `budget` iterations per entry.
-///
-/// A committed GPU command buffer cannot be cancelled, so an unbounded loop in translated SPIR-V
-/// pins the GPU until reboot and, on macOS, starves WindowServer into a watchdog kill. Callers that
-/// dispatch translated modules to a real device must run this first; the returned report says
-/// whether the module had loops at all, so a budget-exceeded run can be reported as such rather
-/// than mistaken for a byte mismatch.
-pub fn instrument_spirv_loop_budget(
-    spv: &[u8],
-    budget: u32,
-) -> Result<(Vec<u8>, LoopBudgetReport), String> {
-    let mut module = load_owned_module(spv).map_err(|e| format!("SPIR-V load: {e:?}"))?;
-    let report = passes::loop_budget::instrument_loop_budget(&mut module, budget);
-    let bytes: Vec<u8> = module
-        .assemble()
-        .iter()
-        .flat_map(|w| w.to_le_bytes())
-        .collect();
-    // Reusing a loop's own exit edge cannot disturb the CFG, so only the guard-block fallback needs
-    // checking. Validating here rather than at the call site means no caller can dispatch a module
-    // this pass broke: an invalid module becomes a failed case, never a wedged GPU.
-    if report.needs_revalidation() {
-        tools::spirv_val_bytes(&bytes, &std::env::temp_dir()).map_err(|error| {
-            format!(
-                "loop budget rewrote {} loop header(s) to return on exhaustion and the result does \
-                 not validate, so the module is not safe to dispatch: {error}",
-                report.loops_bounded_via_early_return
-            )
-        })?;
-    }
-    Ok((bytes, report))
 }
 
 /// Disassemble SPIR-V bytes to spvasm text (for golden fixtures / debugging).

@@ -57,6 +57,20 @@ pub(in crate::passes) fn decorate_interpolation(
 }
 
 /// Apply a decoration that takes no literal operands.
+/// `Index` on a fragment output: the dual-source blend source (`[[color(N), index(1)]]`).
+pub(in crate::passes) fn decorate_index(module: &mut Module, id: Word, index: u32) {
+    module.annotations.push(Instruction::new(
+        Op::Decorate,
+        None,
+        None,
+        vec![
+            Operand::IdRef(id),
+            Operand::Decoration(Decoration::Index),
+            Operand::LiteralBit32(index),
+        ],
+    ));
+}
+
 pub(in crate::passes) fn decorate_with(module: &mut Module, id: Word, decoration: Decoration) {
     module.annotations.push(Instruction::new(
         Op::Decorate,

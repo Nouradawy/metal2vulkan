@@ -73,7 +73,6 @@ impl TirBlock {
             // The lighter incoming-values view is filled by `recompute_phi_uses` below.
             data: Box::new(TirInstDetails {
                 fast_math: false,
-                float_math_mode: None,
                 payload: TirInstData::Phi {
                     parse_error: None,
                     incoming: Some((ty.clone(), incomings.to_vec())),

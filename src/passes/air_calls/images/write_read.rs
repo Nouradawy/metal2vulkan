@@ -20,21 +20,10 @@ pub(in crate::passes) fn lower_write(
     if args.len() < 3 {
         return Err("air.write_texture missing image/coord/texel".into());
     }
-    // The stable AIR intrinsic symbol defines the call's operand ABI. A texture handle loaded from
-    // an array or routed through a local carrier can lose the top-level resource side-table entry,
-    // but `_2d_array` still unambiguously says that arg2 is the layer and arg3 is the texel. It is
-    // also the shape any recovered image operand has to be able to address, so read it first.
-    let (dim, arrayed) = intrinsic_texture_shape(name)
-        .ok_or_else(|| format!("unsupported air.write_texture intrinsic shape: {name}"))?;
     let mut img = resolve_image_value(ctx, args[0]);
     if !image_is_storage(ctx, img) {
-        if let Some(storage_img) =
-            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Storage)
-        {
+        if let Some(storage_img) = single_storage_image_for_private_write(ctx, img) {
             img = storage_img;
-        } else if texture_operand_is_absent(ctx, img) {
-            // An absent resource stores nowhere -- the write half of the read fold below.
-            return lower_absent_texture_write(ctx);
         } else {
             // Not a storage image (e.g. a texture also sampled, bound as Sampled=1) -> can't
             // OpImageWrite.
@@ -46,6 +35,12 @@ pub(in crate::passes) fn lower_write(
     }
     ctx.require_runtime_storage_image_use(img, RuntimeStorageImageUse::Write)?;
     let mut out = vec![];
+
+    // The stable AIR intrinsic symbol defines the call's operand ABI. A texture handle loaded from
+    // an array or routed through a local carrier can lose the top-level resource side-table entry,
+    // but `_2d_array` still unambiguously says that arg2 is the layer and arg3 is the texel.
+    let (dim, arrayed) = write_intrinsic_shape(name)
+        .ok_or_else(|| format!("unsupported air.write_texture intrinsic shape: {name}"))?;
     let (_, _, comp) = image_shape_or_recorded(ctx, img);
     if crate::env_vars::tex_dbg() {
         let tys: Vec<String> = args
@@ -125,6 +120,21 @@ pub(in crate::passes) fn lower_write(
         ],
     ));
     Ok(out)
+}
+
+fn write_intrinsic_shape(name: &str) -> Option<(Dim, bool)> {
+    let shape = name.strip_prefix("air.write_texture_")?.split('.').next()?;
+    Some(match shape {
+        "1d" => (Dim::Dim1D, false),
+        "1d_array" => (Dim::Dim1D, true),
+        "2d" => (Dim::Dim2D, false),
+        "2d_array" => (Dim::Dim2D, true),
+        "3d" => (Dim::Dim3D, false),
+        "cube" => (Dim::DimCube, false),
+        "cube_array" => (Dim::DimCube, true),
+        "buffer" | "buffer_1d" => (Dim::DimBuffer, false),
+        _ => return None,
+    })
 }
 
 fn preserve_defined_texel_lanes(
@@ -263,7 +273,7 @@ fn texel_lane_is_statically_undef(
 /// the AIR result shape when needed.
 pub(in crate::passes) fn lower_read(
     ctx: &mut Ctx,
-    name: &str,
+    _name: &str,
     res: Option<Word>,
     rty: Option<Word>,
     args: &[Word],
@@ -285,10 +295,8 @@ pub(in crate::passes) fn lower_read(
     // Distinguish by whether a1 is the integer COORD (no-sampler) or a sampler value (with-sampler):
     // the coord is an integer scalar/vector; a sampler is a pointer/sampler type.
     let mut img = resolve_image_value(ctx, args[0]);
-    if texture_operand_is_absent(ctx, img) {
-        if let Some(sampled_img) =
-            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Sampled)
-        {
+    if texture_operand_is_private_pointer(ctx, img) {
+        if let Some(sampled_img) = single_sampled_image_for_private_read(ctx, img) {
             img = sampled_img;
         } else {
             return lower_null_texture_result(ctx, res, rty);
@@ -451,7 +459,7 @@ pub(in crate::passes) fn lower_read(
 /// RGBA8-backed harness image, extract component 0, and rebuild AIR's `{float, i8}` result shape.
 pub(in crate::passes) fn lower_read_depth(
     ctx: &mut Ctx,
-    name: &str,
+    _name: &str,
     res: Option<Word>,
     rty: Option<Word>,
     args: &[Word],
@@ -465,10 +473,8 @@ pub(in crate::passes) fn lower_read_depth(
         return Err("air.read_depth missing texture/coord".into());
     }
     let mut img = resolve_image_value(ctx, args[0]);
-    if texture_operand_is_absent(ctx, img) {
-        if let Some(sampled_img) =
-            recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Sampled)
-        {
+    if texture_operand_is_private_pointer(ctx, img) {
+        if let Some(sampled_img) = single_sampled_image_for_private_read(ctx, img) {
             img = sampled_img;
         } else {
             return lower_null_texture_result(ctx, res, rty);
@@ -488,25 +494,22 @@ pub(in crate::passes) fn lower_read_depth(
         return Err("air.read_depth on non-float texture".into());
     }
 
-    // AIR read_depth forms mirror read_texture behind one extra scalar operand that sits between the
-    // texture (or sampler) and the coordinate. That operand is NOT the sample index: it is `1` at
-    // every corpus call site of every form, including the non-multisample ones, which have no sample
-    // to name. The sample index of a multisample depth read sits exactly where read_texture puts it,
-    // in the slot after the coordinate and after `layer` -- the same slot a non-multisample read
-    // spends on `lod`. Array forms insert `layer` immediately after the coord, e.g.
-    // `air.read_depth_2d_array.f32(tex, sampler, 1, coord, layer, offset, lod, access)`:
+    // AIR read_depth forms mirror read_texture, with an extra sample-index operand before the coord
+    // on depth reads. Array forms insert a scalar `layer` operand immediately AFTER the coord (same
+    // placement read_texture uses), e.g. `air.read_depth_2d_array.f32(tex, sampler, sample_index,
+    // coord, layer, offset, lod, access)`:
     //   * no-sampler: (texture, coord, lod, access) -> coord=a1, lod=a2
     //     array: (texture, coord, layer, lod, access) -> coord=a1, layer=a2, lod=a3
-    //   * no-sampler/leading scalar: (texture, 1, coord, lod, access) -> coord=a2, lod=a3
-    //     array: (texture, 1, coord, layer, lod, access) -> coord=a2, layer=a3, lod=a4
-    //   * with-sampler: (texture, sampler, 1, coord, offset, lod, access) -> coord=a3, lod=a5
-    //     array (+offset): (texture, sampler, 1, coord, layer, offset, lod, access)
+    //   * no-sampler/sample-index: (texture, sample_index, coord, lod, access) -> coord=a2, lod=a3
+    //     array: (texture, sample_index, coord, layer, lod, access) -> coord=a2, layer=a3, lod=a4
+    //   * with-sampler: (texture, sampler, sample_index, coord, offset, lod, access) -> coord=a3, lod=a5
+    //     array (+offset): (texture, sampler, sample_index, coord, layer, offset, lod, access)
     //       -> coord=a3, layer=a4, lod=a6
-    //   * with-sampler/no-offset: (texture, sampler, 1, coord, lod, access) -> coord=a3, lod=a4
-    //     array/no-offset: (texture, sampler, 1, coord, layer, lod, access)
+    //   * with-sampler/no-offset: (texture, sampler, sample_index, coord, lod, access) -> coord=a3, lod=a4
+    //     array/no-offset: (texture, sampler, sample_index, coord, layer, lod, access)
     //       -> coord=a3, layer=a4, lod=a5
-    let (coord, layer, lod) = if value_is_int_or_intvec(ctx, args[1]) {
-        // No-sampler: a1 is the coord, unless a1 is the leading scalar before a vector coord.
+    let (coord, layer, lod, sample_index) = if value_is_int_or_intvec(ctx, args[1]) {
+        // No-sampler: a1 is the coord, unless a1 is a scalar sample-index before a vector coord.
         let coord_idx = if vector_shape(ctx, args[1]).is_none()
             && args
                 .get(2)
@@ -516,30 +519,35 @@ pub(in crate::passes) fn lower_read_depth(
         } else {
             1
         };
+        let sample_index = (coord_idx == 2).then_some(args[1]);
         let coord = *args.get(coord_idx).ok_or("air.read_depth missing coord")?;
         if arrayed {
             (
                 coord,
                 args.get(coord_idx + 1).copied(),
                 args.get(coord_idx + 2).copied(),
+                sample_index,
             )
         } else {
-            (coord, None, args.get(coord_idx + 1).copied())
+            (coord, None, args.get(coord_idx + 1).copied(), sample_index)
         }
     } else {
         let coord = *args.get(3).ok_or("air.read_depth missing coord")?;
+        let sample_index = args.get(2).copied();
         if arrayed {
             // layer at a4; an optional offset sits between layer and lod (8 args ⇒ offset present).
             (
                 coord,
                 args.get(4).copied(),
                 args.get(if args.len() >= 8 { 6 } else { 5 }).copied(),
+                sample_index,
             )
         } else {
             (
                 coord,
                 None,
                 args.get(if args.len() >= 7 { 5 } else { 4 }).copied(),
+                sample_index,
             )
         }
     };
@@ -557,8 +565,9 @@ pub(in crate::passes) fn lower_read_depth(
     let color = ctx.module.fresh_id();
     let mut ops = vec![Operand::IdRef(img), Operand::IdRef(coord32)];
     if image_value_is_multisampled(ctx, img) {
-        // The slot a single-sample read spends on `lod` is the sample index on a multisample one.
-        let sample = lod.ok_or("air.read_depth multisample read missing sample index")?;
+        let sample = sample_index
+            .or(lod)
+            .ok_or("air.read_depth multisample read missing sample index")?;
         let sample32 = coerce_image_coord32(ctx, sample, &mut out, "air.read_depth sample")?;
         ops.push(Operand::ImageOperands(spirv::ImageOperands::SAMPLE));
         ops.push(Operand::IdRef(sample32));
@@ -599,4 +608,29 @@ pub(in crate::passes) fn lower_read_depth(
         ));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_intrinsic_symbol_owns_the_operand_shape() {
+        assert_eq!(
+            write_intrinsic_shape("air.write_texture_2d.i16.v4f32"),
+            Some((Dim::Dim2D, false))
+        );
+        assert_eq!(
+            write_intrinsic_shape("air.write_texture_2d_array.v4f32"),
+            Some((Dim::Dim2D, true))
+        );
+        assert_eq!(
+            write_intrinsic_shape("air.write_texture_cube_array.v4f32"),
+            Some((Dim::DimCube, true))
+        );
+        assert_eq!(
+            write_intrinsic_shape("air.write_texture_buffer_1d.u.v4i32"),
+            Some((Dim::DimBuffer, false))
+        );
+    }
 }

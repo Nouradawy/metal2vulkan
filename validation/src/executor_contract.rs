@@ -1,7 +1,4 @@
-use crate::case::{
-    AuthoredCase, DeviceBufferArrayResource, OutputSelection, Primitive, Stage, TextureFormat,
-    ThreadgroupMemoryResource,
-};
+use crate::case::{AuthoredCase, OutputSelection, Primitive, Stage, TextureFormat};
 use crate::requirement::ToolingRequirement;
 use metal2vulkan::{
     meta::{TextureDimension, TextureFormat as ReflectedTextureFormat},
@@ -10,7 +7,6 @@ use metal2vulkan::{
         SamplerReduction, ShaderReflection,
     },
 };
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub fn air_call_counts(ll: &str) -> BTreeMap<String, usize> {
@@ -145,11 +141,7 @@ pub fn unsupported_reflection_requirements(
             // and nothing for the Metal oracle to encode. The module still reads through it, so
             // leaving the binding out of the layout is not an option either -- the row is honestly
             // not executable until the harness can supply a deterministic placeholder resource.
-            // The Vulkan executor supplies an all-zero one-texel placeholder for a synthesized
-            // null texture, so that row is executable. A synthesized read sampler still has no
-            // placeholder behind it.
-            ResourceKind::SynthesizedNullTexture => {}
-            ResourceKind::SynthesizedReadSampler => {
+            ResourceKind::SynthesizedNullTexture | ResourceKind::SynthesizedReadSampler => {
                 requirements.insert(ToolingRequirement::SynthesizedPlaceholderDescriptor);
             }
         }
@@ -190,7 +182,6 @@ pub fn unsupported_reflection_requirements(
                         | ReflectedTextureFormat::Rgba8ui
                         | ReflectedTextureFormat::Rgba16ui
                         | ReflectedTextureFormat::Rgba8i
-                        | ReflectedTextureFormat::Rgba16i
                 )
             }) {
                 requirements.insert(ToolingRequirement::StorageTextureFormatLiteral);
@@ -457,153 +448,13 @@ pub fn require_reflection(
     Ok(())
 }
 
-/// Metal's granularity for a threadgroup-memory allocation, in bytes.
-///
-/// `MTLComputeCommandEncoder`'s `setThreadgroupMemoryLength:atIndex:` asserts on anything else --
-/// measured, not assumed: running an authored case that declares 4 bytes under
-/// `METAL_DEVICE_WRAPPER_TYPE=1` fails with `-[MTLDebugComputeCommandEncoder
-/// setThreadgroupMemoryLength:atIndex:]:799: failed assertion 'length(4) must be a multiple of 16
-/// bytes.'`. Without the validation layer the driver accepts the call, so an authored length that
-/// Metal cannot allocate executes and records evidence anyway.
-///
-/// The Metal executor passes the authored length straight to that API, so the length a manifest
-/// declares IS the length Metal is asked for and has to be one Metal can allocate. Rounding it up
-/// inside the executor instead would hand Metal a different size from the one the manifest states
-/// and from the one the Vulkan candidate reads.
-pub const METAL_THREADGROUP_MEMORY_GRANULARITY: u32 = 16;
-
-/// Why a threadgroup-memory declaration is not one a Metal compute encoder can bind, or `None`.
-///
-/// One rule, consulted by [`require_case`] at both executors' entry and by the authored-case
-/// checker before install, so an unallocatable length cannot reach the store from either side.
-pub fn threadgroup_memory_length_error(
-    resource: &ThreadgroupMemoryResource,
-    context: &str,
-) -> Option<String> {
-    if resource.length == 0 {
-        return Some(format!(
-            "{context} threadgroup memory {} declares zero bytes, which satisfies the reflected requirement without allocating anything",
-            resource.binding
-        ));
-    }
-    if !resource
-        .length
-        .is_multiple_of(METAL_THREADGROUP_MEMORY_GRANULARITY)
-    {
-        return Some(format!(
-            "{context} threadgroup memory {} declares {} bytes, which Metal cannot allocate: a threadgroup-memory length must be a multiple of {METAL_THREADGROUP_MEMORY_GRANULARITY} bytes",
-            resource.binding, resource.length
-        ));
-    }
-    None
-}
-
-/// Why a device-buffer array does not author every element it declares, or `None`.
-///
-/// Metal binds element `i` of the array at buffer index `binding + i` and requires all `length` of
-/// them: a slot the manifest leaves out is not bound at all, and
-/// `validateComputeFunctionArguments` refuses the dispatch with `missing Buffer binding at index 2
-/// for buffers.2[0]`. Without `MTL_DEBUG_LAYER=1` the driver dispatches anyway and the shader
-/// reads undefined memory through the empty slot while the case still reports `qualified`.
-///
-/// There is no honest value to substitute for an unauthored operand, so this refuses. Contrast
-/// [`buffer_bytes_padded_to_declared_size`], which pads a *declared size*: that padding lies past
-/// everything the manifest describes, while a missing array element is a resource the manifest
-/// claims exists and never says anything about.
-///
-/// One rule, consulted by [`require_case`] at both executors' entry and by the authored-case
-/// checker before install, so an incomplete array cannot reach the store from either side.
-pub fn device_buffer_array_completeness_error(
-    resource: &DeviceBufferArrayResource,
-    context: &str,
-) -> Option<String> {
-    let authored = resource
-        .elements
-        .iter()
-        .map(|element| element.index)
-        .collect::<BTreeSet<_>>();
-    let missing = (0..resource.length)
-        .filter(|index| !authored.contains(index))
-        .map(|index| index.to_string())
-        .collect::<Vec<_>>();
-    if missing.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{context} device-buffer array {} declares {} elements but authors no bytes for element{} {}",
-        resource.binding,
-        resource.length,
-        if missing.len() == 1 { "" } else { "s" },
-        missing.join(", ")
-    ))
-}
-
-/// The bytes to bind for a buffer argument, padded to the size AIR declares for it.
-///
-/// A case authors only the bytes its shader reads, which is routinely far fewer than the
-/// argument's declared struct -- one byte against the 264 of `params`, sixteen against the 1179628
-/// of `spanTable`. Both APIs size a binding from the declaration rather than from the use, and
-/// Metal's validation layer refuses the short one outright:
-///
-/// ```text
-/// argument params[0] from Buffer(29) with offset(0) and length(1) has space for 1 bytes,
-/// but argument has a length(264).
-/// ```
-///
-/// Without that layer it binds the short buffer anyway and any read past the end is undefined.
-/// Padding the *binding* leaves the authored bytes at the front and does not author the padding:
-/// a case whose result depends on it is reading bytes it never declared, and now reads a stable
-/// zero on both executors rather than whatever followed each allocation.
-///
-/// Never shortens. A runtime `array_ref` declares no size at all, and a case may legitimately
-/// author more than the declaration.
-pub fn buffer_bytes_padded_to_declared_size(
-    authored: &[u8],
-    declared_size: Option<usize>,
-) -> Cow<'_, [u8]> {
-    match declared_size {
-        Some(size) if size > authored.len() => {
-            let mut padded = Vec::with_capacity(size);
-            padded.extend_from_slice(authored);
-            padded.resize(size, 0);
-            Cow::Owned(padded)
-        }
-        _ => Cow::Borrowed(authored),
-    }
-}
-
-/// The declared byte size of the `[[buffer(n)]]` argument at `metal_index`, as AIR states it
-/// through `air.arg_type_size`. `None` when the entry declares no buffer there, or declares one
-/// whose extent is not a fixed object.
-pub fn reflected_buffer_declared_size(
-    reflection: &ShaderReflection,
-    metal_index: u32,
-) -> Option<usize> {
-    reflection
-        .bindings
-        .iter()
-        .find(|binding| binding.kind == ResourceKind::Buffer && binding.metal_index == metal_index)
-        .and_then(|binding| binding.declared_size)
-        .map(|size| size as usize)
-}
-
 /// Shared capability boundary for the literal Metal and Vulkan executors.
 ///
 /// Unsupported manifest resources are rejected as a whole; no runner may drop them or synthesize
 /// defaults while executing the supported literal-resource subset.
 pub fn require_case(case: &AuthoredCase, executor: &str) -> Result<(), String> {
-    for resource in &case.device_buffer_arrays {
-        if let Some(error) = device_buffer_array_completeness_error(resource, executor) {
-            return Err(error);
-        }
-    }
     match case.stage {
         Stage::Kernel => {
-            for resource in &case.threadgroup_memory {
-                if let Some(error) = threadgroup_memory_length_error(resource, executor) {
-                    return Err(error);
-                }
-            }
             if !case.vertex_inputs.is_empty() {
                 return Err(format!(
                     "{executor} kernel execution does not accept vertex inputs"
@@ -633,16 +484,8 @@ pub fn require_case(case: &AuthoredCase, executor: &str) -> Result<(), String> {
             }
         }
         Stage::Fragment | Stage::Vertex => {
-            // A custom fragment imageblock is an attachment. It lives in the pass's tile memory
-            // and both executors already raster a fragment pass that has no color or depth
-            // attachment at all -- the Metal one by setting explicit raster dimensions, the Vulkan
-            // one by building a subpass with none. Requiring a color attachment beside it would
-            // require authoring a render target the shader never writes, which the resource
-            // contract rejects because reflection does not declare one: the two rules together
-            // made every fragment entry whose only output is a custom imageblock unauthorable.
             if case.render_targets.is_empty()
                 && case.depth_stencil.is_none()
-                && case.fragment_imageblock.is_none()
                 && !(case.stage == Stage::Fragment && matches!(case.output, OutputSelection::None))
                 && !case.is_rasterization_disabled_vertex()
             {
@@ -678,18 +521,6 @@ pub fn require_case(case: &AuthoredCase, executor: &str) -> Result<(), String> {
                         .map(|attachment| attachment.dimensions)
                 })
                 .unwrap_or([1, 1]);
-            // The imageblock is sized by the pass, not the other way round. Without this an
-            // attachment-less case could author a plane larger than the 1x1 region both executors
-            // raster and compare bytes the shader never covered.
-            if case
-                .fragment_imageblock
-                .as_ref()
-                .is_some_and(|imageblock| imageblock.dimensions != dimensions)
-            {
-                return Err(format!(
-                    "{executor} custom fragment imageblock dimensions must match the pass attachments"
-                ));
-            }
             for target in &case.render_targets {
                 if target.dimensions != dimensions {
                     return Err(format!(
@@ -720,69 +551,8 @@ pub fn require_case(case: &AuthoredCase, executor: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn device_buffer_array(
-        binding: u32,
-        length: u32,
-        indices: &[u32],
-    ) -> DeviceBufferArrayResource {
-        DeviceBufferArrayResource {
-            binding,
-            length,
-            elements: indices
-                .iter()
-                .map(|index| crate::case::DeviceBufferArrayElementResource {
-                    index: *index,
-                    role: crate::case::ResourceRole::Input,
-                    bytes_b64: Some("AAAAAA==".into()),
-                    initial_bytes_b64: None,
-                })
-                .collect(),
-        }
-    }
-
-    /// Metal requires every element of a device-buffer array bound, so a manifest that declares
-    /// more elements than it authors has to be refused rather than left to read undefined memory.
-    #[test]
-    fn a_device_buffer_array_must_author_every_element_it_declares() {
-        let complete = |length, indices: &[u32]| {
-            device_buffer_array_completeness_error(
-                &device_buffer_array(0, length, indices),
-                "manifest",
-            )
-        };
-        assert_eq!(complete(3, &[0, 1, 2]), None);
-        assert_eq!(complete(0, &[]), None);
-        assert_eq!(complete(2, &[1, 0]), None);
-        let one = complete(3, &[0, 1]).expect("element 2 is unauthored");
-        assert!(one.ends_with("authors no bytes for element 2"), "{one}");
-        let two =
-            device_buffer_array_completeness_error(&device_buffer_array(4, 4, &[1]), "manifest")
-                .expect("elements 0, 2 and 3 are unauthored");
-        assert!(
-            two.starts_with("manifest device-buffer array 4 declares 4 elements"),
-            "{two}"
-        );
-        assert!(two.ends_with("no bytes for elements 0, 2, 3"), "{two}");
-    }
-
-    /// Both APIs size a buffer binding from the argument's declaration, not from the bytes a case
-    /// chose to author. Padding must extend the binding without disturbing the authored prefix,
-    /// and must never shorten it: a runtime `array_ref` has no declared size at all, and a case
-    /// may author more than the declaration.
-    #[test]
-    fn a_buffer_binding_is_padded_to_the_declared_size_and_never_shortened() {
-        let padded = buffer_bytes_padded_to_declared_size;
-        assert_eq!(padded(&[1, 2, 3], Some(6)).as_ref(), &[1, 2, 3, 0, 0, 0]);
-        assert_eq!(padded(&[1, 2, 3], Some(3)).as_ref(), &[1, 2, 3]);
-        assert_eq!(padded(&[1, 2, 3], Some(2)).as_ref(), &[1, 2, 3]);
-        assert_eq!(padded(&[1, 2, 3], None).as_ref(), &[1, 2, 3]);
-        assert!(matches!(padded(&[1, 2, 3], Some(3)), Cow::Borrowed(_)));
-        assert!(matches!(padded(&[1, 2, 3], Some(4)), Cow::Owned(_)));
-    }
     use crate::case::{
         BufferResource, Comparison, DepthStencilResource, Dispatch, Draw, ExecutionSafety,
-        FragmentImageblockFormat, FragmentImageblockMemberResource, FragmentImageblockResource,
         FunctionConstant, OutputSelection, Primitive, RenderTargetResource, ResourceRole,
         ScalarType, TextureFormat, TextureResource, TextureType, VertexObservation,
     };
@@ -865,28 +635,6 @@ mod tests {
             dimensions: [1, 1, 1],
         };
         assert!(require_case(&case, "test executor").is_ok());
-    }
-
-    #[test]
-    fn a_threadgroup_memory_length_metal_cannot_allocate_is_refused_at_the_executor() {
-        let mut case = case();
-        case.threadgroup_memory = vec![crate::case::ThreadgroupMemoryResource {
-            binding: 0,
-            length: METAL_THREADGROUP_MEMORY_GRANULARITY,
-        }];
-        assert!(require_case(&case, "test executor").is_ok());
-
-        // Measured against Metal's own validation layer: the encoder asserts on a length that is
-        // not a multiple of sixteen, so no runner may pass one through.
-        case.threadgroup_memory[0].length = METAL_THREADGROUP_MEMORY_GRANULARITY - 1;
-        assert!(require_case(&case, "test executor")
-            .unwrap_err()
-            .contains("must be a multiple of 16 bytes"));
-
-        case.threadgroup_memory[0].length = 0;
-        assert!(require_case(&case, "test executor")
-            .unwrap_err()
-            .contains("zero bytes"));
     }
 
     #[test]
@@ -1080,11 +828,10 @@ mod tests {
     }
 
     #[test]
-    fn a_synthesized_null_texture_is_executable_and_a_read_sampler_is_not() {
+    fn a_synthesized_placeholder_descriptor_is_an_unsupported_requirement() {
         // `air.get_null_texture_2d()` whose handle is read: the translator binds a real image at a
-        // binding no Metal argument produces. The Vulkan executor now writes an all-zero one-texel
-        // placeholder there, so the row is executable; only a synthesized read sampler still has
-        // nothing behind it.
+        // binding no Metal argument produces, so the Vulkan executor has nothing authored to write
+        // there and the Metal oracle has nothing to encode. Both sides must say so.
         let ll = r#"
 define void @k(ptr addrspace(1) %out) {
 entry:
@@ -1116,16 +863,22 @@ declare i32 @air.get_width_texture_2d(ptr addrspace(1), i32)
         )
         .expect("the placeholder-reading kernel translates");
         let _ = std::fs::remove_dir_all(&tmp);
-        let placeholder = reflection
+        assert!(reflection
             .bindings
             .iter()
-            .position(|binding| binding.kind == ResourceKind::SynthesizedNullTexture)
-            .expect("the placeholder the module reads through is reported");
-        assert!(unsupported_reflection_requirements(&reflection).is_empty());
+            .any(|binding| binding.kind == ResourceKind::SynthesizedNullTexture));
+        assert!(unsupported_reflection_requirements(&reflection)
+            .contains(&ToolingRequirement::SynthesizedPlaceholderDescriptor));
 
-        let mut sampler = reflection.clone();
-        sampler.bindings[placeholder].kind = ResourceKind::SynthesizedReadSampler;
-        assert!(unsupported_reflection_requirements(&sampler)
+        // Reflection built without a module never sees the placeholder, so this requirement is a
+        // property of reflected translation and must not appear from metadata alone.
+        let metadata_only = metal2vulkan::reflect_sanitized(
+            ll,
+            metal2vulkan::passes::Stage::Kernel,
+            metal2vulkan::passes::TransformOptions::default(),
+        )
+        .expect("metadata-only reflection");
+        assert!(!unsupported_reflection_requirements(&metadata_only)
             .contains(&ToolingRequirement::SynthesizedPlaceholderDescriptor));
     }
 
@@ -1211,51 +964,6 @@ define float @frag() { ret float 5.000000e-01 }
         });
         assert!(
             require_reflection(&case, &stencil_ll, &stencil_reflection, "test executor").is_ok()
-        );
-    }
-
-    /// A fragment entry whose only output is a custom imageblock has no attachment to author: AIR
-    /// declares no render target, and the resource contract rejects one the reflection does not
-    /// name. Both executors already raster an attachment-free fragment pass, so the imageblock is
-    /// the attachment -- and it is sized by the pass, not the other way round.
-    #[test]
-    fn a_custom_fragment_imageblock_is_the_attachment_and_takes_the_pass_dimensions() {
-        let imageblock = |dimensions: [u32; 2]| FragmentImageblockResource {
-            dimensions,
-            members: vec![FragmentImageblockMemberResource {
-                semantic: "color".into(),
-                format: FragmentImageblockFormat::Half4,
-                role: ResourceRole::InOut,
-                bytes_b64: None,
-                initial_bytes_b64: Some("AAAAAAAAAAA=".into()),
-            }],
-        };
-        let mut case = case();
-        case.stage = Stage::Fragment;
-        case.buffers = vec![];
-        case.render_targets = vec![];
-        case.output = OutputSelection::FragmentImageblock {
-            semantic: "color".into(),
-            origin: [0, 0],
-            dimensions: [1, 1],
-        };
-        assert!(
-            require_case(&case, "test executor")
-                .unwrap_err()
-                .contains("requires at least one attachment"),
-            "an output with no attachment and no imageblock is still refused"
-        );
-        case.fragment_imageblock = Some(imageblock([1, 1]));
-        require_case(&case, "test executor")
-            .expect("a custom fragment imageblock is an attachment");
-        // The attachment-free pass rasters 1x1, so a larger plane would compare bytes no fragment
-        // ever covered.
-        case.fragment_imageblock = Some(imageblock([2, 2]));
-        assert!(
-            require_case(&case, "test executor")
-                .unwrap_err()
-                .contains("imageblock dimensions must match"),
-            "a plane larger than the pass is refused"
         );
     }
 

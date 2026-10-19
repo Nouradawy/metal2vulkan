@@ -311,60 +311,35 @@ impl Emitter {
         let Some(key) = self.local_pointer_field_key(ptr)? else {
             return Ok(false);
         };
-        if self.bda_forwards_local_pointer_field(result_name, result_ty) {
+        if self.bda_device_pointers
+            && matches!(result_ty, LlType::Ptr(1))
+            && self.bda_forward_addresses.contains(result_name)
+        {
             let pointer = self.value_id_in(&ptr.value, &ptr.ty, instructions)?;
-            self.emit_bda_address_from_field(result_name, pointer, instructions)?;
+            let address_type = self.type_id(&LlType::Int(64))?;
+            let address = self.result_id(&bda_address_name(result_name), &LlType::Int(64))?;
+            instructions.push(Self::inst(
+                Op::Load,
+                Some(address_type),
+                Some(address),
+                vec![Operand::IdRef(pointer)],
+            ));
+            self.bda_address_values.insert(address);
+            self.bda_direct_addresses
+                .insert(result_name.to_string(), address);
+            let mut raw = RawBufferOffset::root(format!(".bda_{address}"), 1);
+            raw.device_addr_base = Some(address);
+            self.raw_offsets.insert(result_name.to_string(), raw);
+            self.pointer_storage
+                .insert(result_name.to_string(), StorageClass::PhysicalStorageBuffer);
+            self.pointer_pointees
+                .insert(result_name.to_string(), LlType::Int(8));
+            self.emit_device_address_nullness(result_name, address, instructions)?;
+            self.used_device_address = true;
             return Ok(true);
         }
         self.emit_pointer_from_local_field_key(result_name, result, result_ty, &key, instructions)?;
         Ok(true)
-    }
-
-    /// True when a pointer read out of a LOCAL aggregate field is a device address this module
-    /// forwards, i.e. the field holds an `i64` payload that is really a `device` pointer. Both
-    /// spellings of the field access have to ask the same question: LLVM writes the zero-offset
-    /// member either as a GEP or as a bare `bitcast`, and only the GEP arrives with the field's own
-    /// `i64` pointee attached.
-    pub(in crate::native::emitter) fn bda_forwards_local_pointer_field(
-        &self,
-        result_name: &str,
-        result_ty: &LlType,
-    ) -> bool {
-        self.bda_device_pointers
-            && matches!(result_ty, LlType::Ptr(1))
-            && self.bda_forward_addresses.contains(result_name)
-    }
-
-    /// Read the 64-bit device address a local aggregate field holds and register the result as an
-    /// address-rooted pointer. `field_pointer` must already point AT the field (an `i64` payload),
-    /// not at the aggregate containing it.
-    pub(in crate::native::emitter) fn emit_bda_address_from_field(
-        &mut self,
-        result_name: &str,
-        field_pointer: Word,
-        instructions: &mut Vec<Instruction>,
-    ) -> Result<(), String> {
-        let address_type = self.type_id(&LlType::Int(64))?;
-        let address = self.result_id(&bda_address_name(result_name), &LlType::Int(64))?;
-        instructions.push(Self::inst(
-            Op::Load,
-            Some(address_type),
-            Some(address),
-            vec![Operand::IdRef(field_pointer)],
-        ));
-        self.bda_address_values.insert(address);
-        self.bda_direct_addresses
-            .insert(result_name.to_string(), address);
-        let mut raw = RawBufferOffset::root(format!(".bda_{address}"), 1);
-        raw.device_addr_base = Some(address);
-        self.raw_offsets.insert(result_name.to_string(), raw);
-        self.pointer_storage
-            .insert(result_name.to_string(), StorageClass::PhysicalStorageBuffer);
-        self.pointer_pointees
-            .insert(result_name.to_string(), LlType::Int(8));
-        self.emit_device_address_nullness(result_name, address, instructions)?;
-        self.used_device_address = true;
-        Ok(())
     }
 
     pub(in crate::native::emitter) fn emit_pointer_from_local_field_key(

@@ -499,6 +499,7 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition> 
             | "air.get_primitive_acceleration_structure_instance_acceleration_structure"
             | "air.get_data_pointer_instance_acceleration_structure"
             | "air.imageblock_data"
+            | "air.rhadd.u.i16"
     ) {
         return Some(Lowered);
     }
@@ -561,19 +562,9 @@ pub fn air_intrinsic_disposition(name: &str) -> Option<AirIntrinsicDisposition> 
             "air.ctz",
             "air.clz",
             "air.mul_hi.u",
-            "air.mul_hi.s",
-            "air.mad_hi.u",
-            "air.mad_hi.s",
             "air.mad_sat.s",
-            "air.mad_sat.u",
             "air.add_sat.u",
-            "air.add_sat.s",
             "air.sub_sat.u",
-            "air.sub_sat.s",
-            "air.hadd.u",
-            "air.hadd.s",
-            "air.rhadd.u",
-            "air.rhadd.s",
             "air.convert",
             "air.dfdx",
             "air.fast_dfdx",

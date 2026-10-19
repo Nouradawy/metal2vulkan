@@ -6,9 +6,8 @@
 //! current source CFG rather than matching workload identities.
 
 use super::{
-    analyze, block_successors, collect_value_locals, conditional_branch_targets, passthrough,
-    route_passthrough, substitute_cross_slot_value, synthetic_block, BlockRole, BodyBlock,
-    StructuredPlan, ValueSlot, CROSS_ARM_EDGE_MAX_BLOCKS,
+    analyze, block_successors, conditional_branch_targets, synthetic_block, BlockRole, BodyBlock,
+    StructuredPlan, CROSS_ARM_EDGE_MAX_BLOCKS,
 };
 use std::collections::{HashMap, HashSet};
 

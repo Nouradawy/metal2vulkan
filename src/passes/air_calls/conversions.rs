@@ -1,6 +1,5 @@
 //! `air.convert` lowering helpers owned by the AIR-call subsystem.
 
-use super::bfloat_glsl::{narrow_f32_to_bf16, widen_bf16_to_f32};
 use super::*;
 
 /// True if a type token (e.g. `i1`, `v3i1`) denotes a BOOL: an `i1` scalar/vector, with the `1` not
@@ -42,8 +41,6 @@ fn int_splat_or_scalar(ctx: &mut Ctx, rty: Word, iv: i64, n: u32) -> Word {
 
 /// air.convert.<dstkind><...>.<srckind>... -> OpConvert* on the result type. Kinds: f=float,
 /// s=signed int, u=unsigned int. We read the first and last kind letters off the mangled name.
-/// `air.convert.<dstkind><dsttype>.<srckind><srctype>` -> the SPIR-V conversion its kinds name.
-/// Wide (>4-lane) AIR vectors are handled here and everything else in [`lower_convert_narrow`].
 pub(super) fn lower_convert(
     ctx: &mut Ctx,
     name: &str,
@@ -51,15 +48,9 @@ pub(super) fn lower_convert(
     rty: Word,
     args: &[Word],
 ) -> Result<Vec<Instruction>, String> {
-    // AIR vectors wider than four lanes have no SPIR-V vector type, so the emitter represents them
-    // as arrays -- and no conversion instruction accepts an aggregate. Replay the conversion one
-    // exact lane at a time and reconstruct the wide value. The lane conversion is the SAME
-    // lowering the narrow path uses, applied to a name whose type tokens have had their `v<N>`
-    // prefix stripped: this arm used to carry its own kind-to-opcode table, which was a second
-    // derivation of the same fact and disagreed with the first one about bfloat (whose SPIR-V type
-    // is `OpTypeInt 16`, so a wide `f`->`f` convert into it picked `OpFConvert` and was rejected)
-    // and about a signed/unsigned pair of equal width (which is a bitcast only when the widths
-    // match).
+    // AIR vectors wider than four lanes are represented as SPIR-V arrays. Conversion instructions
+    // do not accept aggregate types, so replay the scalar conversion independently for every exact
+    // lane and reconstruct the wide value.
     if args.len() == 1
         && type_def_of(ctx, rty).is_some_and(|definition| definition.class.opcode == Op::TypeArray)
     {
@@ -74,7 +65,36 @@ pub(super) fn lower_convert(
                 "{name} wide source/result lane mismatch: {source_lanes} vs {result_lanes}"
             ));
         }
-        let lane_name = scalarized_convert_name(name);
+        let parts = name
+            .trim_start_matches("air.convert.")
+            .split('.')
+            .collect::<Vec<_>>();
+        let kinds = parts
+            .iter()
+            .filter(|part| part.len() == 1)
+            .filter_map(|part| match part.chars().next()? {
+                kind @ ('f' | 's' | 'u') => Some(kind),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let (Some(&dst), Some(&src)) = (kinds.first(), kinds.last()) else {
+            return Err(format!("cannot parse wide convert kinds from {name}"));
+        };
+        let opcode = match (dst, src) {
+            ('f', 'u') => Op::ConvertUToF,
+            ('f', 's') => Op::ConvertSToF,
+            ('u', 'f') => Op::ConvertFToU,
+            ('s', 'f') => Op::ConvertFToS,
+            ('u', 'u') => Op::UConvert,
+            ('s', 's') => Op::SConvert,
+            ('f', 'f') => Op::FConvert,
+            ('u', 's') | ('s', 'u') => Op::Bitcast,
+            _ => {
+                return Err(format!(
+                    "unhandled wide convert kinds {src}->{dst} in {name}"
+                ))
+            }
+        };
         let mut out = Vec::new();
         let mut converted = Vec::with_capacity(result_lanes as usize);
         for lane in 0..result_lanes {
@@ -85,19 +105,30 @@ pub(super) fn lower_convert(
                 Some(source),
                 vec![Operand::IdRef(args[0]), Operand::LiteralBit32(lane)],
             ));
-            // The extract is not in the module yet, so publish its type on the phase map the
-            // narrow lowering reads its source shape from.
-            ctx.phase_value_types
-                .get_or_insert_with(Default::default)
-                .insert(source, source_element);
             let result = ctx.module.fresh_id();
-            out.extend(lower_convert_narrow(
-                ctx,
-                &lane_name,
-                result,
-                result_element,
-                &[source],
-            )?);
+            let source = if src == 's' {
+                let signed_ty = integer_type_like(ctx, source_element, true)?;
+                if signed_ty == source_element {
+                    source
+                } else {
+                    let signed = ctx.module.fresh_id();
+                    out.push(Instruction::new(
+                        Op::Bitcast,
+                        Some(signed_ty),
+                        Some(signed),
+                        vec![Operand::IdRef(source)],
+                    ));
+                    signed
+                }
+            } else {
+                source
+            };
+            out.push(Instruction::new(
+                opcode,
+                Some(result_element),
+                Some(result),
+                vec![Operand::IdRef(source)],
+            ));
             converted.push(Operand::IdRef(result));
         }
         out.push(Instruction::new(
@@ -108,17 +139,6 @@ pub(super) fn lower_convert(
         ));
         return Ok(out);
     }
-    lower_convert_narrow(ctx, name, res, rty, args)
-}
-
-/// One `air.convert` whose result is a scalar or a SPIR-V vector (at most four lanes).
-fn lower_convert_narrow(
-    ctx: &mut Ctx,
-    name: &str,
-    res: Word,
-    rty: Word,
-    args: &[Word],
-) -> Result<Vec<Instruction>, String> {
     // `air.convert` names are `air.convert.<dstkind>.<dsttype>.<srckind>.<srctype>`. An `i1` token is a
     // BOOL; whether it is the DEST type or the SOURCE type decides the lowering direction.
     // e.g. air.convert.f.v3f32.u.v3i1 (i1 = src) / air.convert.u.i1.f.f32 (i1 = dst).
@@ -199,25 +219,6 @@ fn lower_convert_narrow(
     if token_is_bf16(src_type) || token_is_bf16(dst_type) {
         return lower_convert_bf16(ctx, res, rty, args, dst_type, src_type, dst, src);
     }
-    // The 8-bit float formats are the same shape of problem as bf16 -- no SPIR-V type, carried as
-    // `i8` bits -- and unlike bf16 nothing here models them. Left to the `f`/`f` arm below they
-    // become an `OpFConvert` over an integer operand, which the owned check refuses several phases
-    // later with a shape complaint that names neither the family nor the reason. Refuse by name.
-    //
-    // What it would take to model them is an exact bit rule, not an approximation: e5m2 shares
-    // fp16's five exponent bits and bias, e4m3fn does not and has no infinities. Neither can be
-    // settled on this machine -- the installed Metal toolchain has no 8-bit float type, so there is
-    // no oracle to check a decode against.
-    if let Some(token) = [src_type, dst_type]
-        .into_iter()
-        .find(|token| token_is_narrow_float(token))
-    {
-        return Err(format!(
-            "{name} converts the 8-bit float format {}, which has no SPIR-V type and no modelled \
-             bit layout here",
-            scalarize_convert_token(token)
-        ));
-    }
     if (dst, src) == ('f', 's') {
         let mut out = Vec::new();
         let (signed, _) = bitcast_to_integer_signedness(ctx, &mut out, args[0], true)?;
@@ -249,19 +250,11 @@ fn lower_convert_narrow(
         out.push(instruction);
         return Ok(out);
     }
-    // A float-to-integer convert is emitted bare, at EVERY destination width. SPIR-V leaves an
-    // out-of-range or NaN input undefined, so this is a statement about Metal, and it is
-    // device-measured rather than assumed (Apple M3 Max / macOS 26.5.2): Metal's cast SATURATES at
-    // every width and sends NaN to zero. `uint(+inf)` is 4294967295, `int(-inf)` is -2147483648,
-    // `ushort(70000)` is 65535, `short(-32769)` is -32768, `char(255)` is 127, and every NaN is 0
-    // -- and SPIRV-Cross renders these as exactly that MSL cast, so the contract is reproduced by
-    // construction. All 72 rows of `float-to-integer-saturates-at-every-width` Match on that.
-    //
-    // The narrow widths used to wrap the input in an `FClamp` first, which was wrong twice. Metal's
-    // `clamp(NaN, lo, hi)` returns `lo`, so a signed narrow destination answered -32768 or -128
-    // where Metal answers 0. And the clamp edges are spelled in the SOURCE float type, which for a
-    // half source cannot hold a 16-bit destination's own maximum: `short(half(40000))` came back
-    // 32752 instead of 32767, on 3071 of the 65536 halves. Both are gone with the clamp.
+    if matches!((dst, src), ('u' | 's', 'f')) {
+        if let Some(out) = lower_float_to_narrow_int_convert(ctx, res, rty, args[0], dst)? {
+            return Ok(out);
+        }
+    }
     let op = match (dst, src) {
         ('f', 'u') => Op::ConvertUToF,
         ('u', 'f') => Op::ConvertFToU,
@@ -279,6 +272,69 @@ fn lower_convert_narrow(
         Some(res),
         vec![Operand::IdRef(args[0])],
     )])
+}
+
+fn lower_float_to_narrow_int_convert(
+    ctx: &mut Ctx,
+    res: Word,
+    rty: Word,
+    value: Word,
+    dst: char,
+) -> Result<Option<Vec<Instruction>>, String> {
+    let dst_width = scalar_bit_width(ctx, rty);
+    if dst_width == 0 || dst_width >= 32 {
+        return Ok(None);
+    }
+    let src_ty = value_result_type(ctx, value).ok_or("air.convert float source has no type")?;
+    let src_elem = element_type(ctx, src_ty);
+    let Some(src_def) = type_def_of(ctx, src_elem) else {
+        return Err("air.convert float source type is undefined".into());
+    };
+    if src_def.class.opcode != Op::TypeFloat {
+        return Ok(None);
+    }
+
+    let (lo, hi) = float_to_int_bounds(dst, dst_width)?;
+    let n = vector_len(ctx, src_ty);
+    let lo = splat_or_scalar(ctx, src_ty, lo, n);
+    let hi = splat_or_scalar(ctx, src_ty, hi, n);
+    let clamped = ctx.module.fresh_id();
+    let ext = ctx.glsl();
+    let op = if dst == 'u' {
+        Op::ConvertFToU
+    } else {
+        Op::ConvertFToS
+    };
+    Ok(Some(vec![
+        Instruction::new(
+            Op::ExtInst,
+            Some(src_ty),
+            Some(clamped),
+            vec![
+                Operand::IdRef(ext),
+                Operand::LiteralExtInstInteger(GLSLstd450::FClamp as u32),
+                Operand::IdRef(value),
+                Operand::IdRef(lo),
+                Operand::IdRef(hi),
+            ],
+        ),
+        Instruction::new(op, Some(rty), Some(res), vec![Operand::IdRef(clamped)]),
+    ]))
+}
+
+fn float_to_int_bounds(dst: char, width: u32) -> Result<(f32, f32), String> {
+    if width == 0 || width >= 32 {
+        return Err(format!("unsupported narrow float convert width {width}"));
+    }
+    match dst {
+        'u' => Ok((0.0, ((1u64 << width) - 1) as f32)),
+        's' => {
+            let min = -(1i64 << (width - 1)) as f32;
+            let max = ((1i64 << (width - 1)) - 1) as f32;
+            Ok((min, max))
+        }
+        _ => Err(format!("unsupported float-to-int convert kind {dst}")),
+    }
 }
 
 fn bitcast_to_integer_signedness(
@@ -416,39 +472,8 @@ fn literal_u32(op: Option<&Operand>) -> Option<u32> {
 
 /// True if a convert type token denotes a bf16 (`bf16`, `v2bf16`, `v4bf16`, ...). bf16 is modeled as
 /// `OpTypeInt 16` storage, so it needs widen/narrow around float conversions.
-/// A convert type token with its vector prefix removed: `v8bf16` -> `bf16`, `v3i1` -> `i1`,
-/// `f32` -> `f32`. Used to re-spell a wide `air.convert` as the per-lane convert it decomposes into.
-fn scalarize_convert_token(tok: &str) -> &str {
-    let Some(rest) = tok.strip_prefix('v') else {
-        return tok;
-    };
-    let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    if digits == 0 {
-        tok
-    } else {
-        &rest[digits..]
-    }
-}
-
-/// The same `air.convert` name with every type token scalarized.
-fn scalarized_convert_name(name: &str) -> String {
-    let tokens = name
-        .trim_start_matches("air.convert.")
-        .split('.')
-        .map(scalarize_convert_token)
-        .collect::<Vec<_>>();
-    format!("air.convert.{}", tokens.join("."))
-}
-
 fn token_is_bf16(tok: &str) -> bool {
     tok.contains("bf16")
-}
-
-/// True if a convert type token denotes one of LLVM's 8-bit float formats (`f8e5m2`, `f8e4m3`,
-/// `f8e4m3fn`, and their `v8...` vector spellings). They reach AIR as `i8` and SPIR-V has no type
-/// for them.
-fn token_is_narrow_float(tok: &str) -> bool {
-    tok.contains("f8e")
 }
 
 /// Lane count encoded in a convert type token: `v4f32` -> 4, `bf16` / `f32` -> 1.
@@ -464,196 +489,213 @@ fn token_lanes(tok: &str) -> u32 {
         .unwrap_or(1)
 }
 
-/// The largest f32 strictly below `2^k`, as its bit pattern: exponent `k - 1` with an all-ones
-/// significand. Used as the clamp bound for a float -> integer round trip of a `k`-bit range.
-fn largest_f32_below_pow2(k: u32) -> f32 {
-    f32::from_bits(((k - 1 + 127) << 23) | 0x007f_ffff)
+/// f32 (scalar or vN) type id for a lane count.
+fn ty_f32_shaped(ctx: &mut Ctx, n: u32) -> Word {
+    if n > 1 {
+        ctx.ty_vecf(n)
+    } else {
+        ctx.ty_float()
+    }
 }
 
-/// An integer zero shaped like `int_ty` (scalar, or a splat for an `n`-lane vector).
-fn shaped_int_zero(ctx: &mut Ctx, int_ty: Word, n: u32) -> Word {
-    let elem = element_type(ctx, int_ty);
-    let scalar = ctx.const_int_of(elem, 0);
+/// u32 (scalar or vN) type id for a lane count.
+fn ty_u32_shaped(ctx: &mut Ctx, n: u32) -> Word {
     if n > 1 {
-        splat(ctx, int_ty, scalar, n)
+        ctx.ty_vec_uint(n)
+    } else {
+        ctx.ty_uint()
+    }
+}
+
+fn ty_bool_shaped(ctx: &mut Ctx, n: u32) -> Word {
+    if n > 1 {
+        ctx.ty_vec_bool(n)
+    } else {
+        ctx.ty_bool()
+    }
+}
+
+/// A shift amount of 16, shaped to match an `n`-lane operand (vector shifts need a vector amount).
+fn shift_amount_16(ctx: &mut Ctx, n: u32) -> Word {
+    let s = ctx.const_uint(16);
+    if n > 1 {
+        let vty = ctx.ty_vec_uint(n);
+        splat(ctx, vty, s, n)
+    } else {
+        s
+    }
+}
+
+fn shaped_u32_const(ctx: &mut Ctx, n: u32, value: u32) -> Word {
+    let scalar = ctx.const_uint(value);
+    if n > 1 {
+        let vty = ctx.ty_vec_uint(n);
+        splat(ctx, vty, scalar, n)
     } else {
         scalar
     }
 }
 
-/// Round `f32val` -- the round-to-nearest-even f32 of the integer `int_val` -- TO ODD, so that a
-/// following round-to-nearest-even narrowing to bf16 lands on the same value a single correctly
-/// rounded integer -> bf16 conversion would.
-///
-/// bf16 keeps 8 significant bits and f32 keeps 24, so converting a wide integer through f32 rounds
-/// twice. An integer just past a bf16 midpoint can round back exactly ONTO that midpoint in f32 and
-/// then be sent the other way by ties-to-even: `bfloat(33685505u)` is 0x4C01 on Metal and 0x4C00
-/// through an f32 intermediate. Round-to-odd is the standard cure -- an odd f32 significand is never
-/// itself a bf16 value or a bf16 midpoint (those have at least the low 15 significand bits clear),
-/// so the second rounding can no longer see a tie that the first one manufactured, and it keeps the
-/// side of the midpoint the true integer was on.
-///
-/// The two bracketing f32 values of an inexact conversion are `t` (toward zero) and `t + ulp`, and
-/// exactly one of them has an odd significand; this picks it. `int_val` is only inexact when it has
-/// more than 24 significant bits, so callers skip this for sources narrower than 32 bits.
-fn round_int_to_odd_f32(
+/// Widen a bf16 bit pattern (modeled as int16, scalar or vN) to f32: bf16 is the top 16 bits of an
+/// f32, so `f32 = bitcast<float>(zext_u32(bits) << 16)`.
+fn widen_bf16_to_f32(ctx: &mut Ctx, out: &mut Vec<Instruction>, bits: Word, n: u32) -> Word {
+    let u32_ty = ty_u32_shaped(ctx, n);
+    let f32_ty = ty_f32_shaped(ctx, n);
+    let widened = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(u32_ty),
+        Some(widened),
+        vec![Operand::IdRef(bits)],
+    ));
+    let shamt = shift_amount_16(ctx, n);
+    let shifted = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftLeftLogical,
+        Some(u32_ty),
+        Some(shifted),
+        vec![Operand::IdRef(widened), Operand::IdRef(shamt)],
+    ));
+    let f = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::Bitcast,
+        Some(f32_ty),
+        Some(f),
+        vec![Operand::IdRef(shifted)],
+    ));
+    f
+}
+
+/// Narrow an f32 (scalar or vN) to a bf16 bit pattern, writing `res`/`rty` (the int16 storage type).
+/// LLVM `fptrunc float to bfloat` rounds to nearest-even, so add the bf16 rounding bias before
+/// taking the top 16 bits.
+fn narrow_f32_to_bf16(
     ctx: &mut Ctx,
     out: &mut Vec<Instruction>,
-    int_val: Word,
-    int_ty: Word,
     f32val: Word,
-    signed: bool,
     n: u32,
-) -> Word {
-    let f32_ty = ty_f32_shaped(ctx, n);
+    rty: Word,
+    res: Word,
+) {
     let u32_ty = ty_u32_shaped(ctx, n);
-    let bool_ty = ty_bool_shaped(ctx, n);
-    let width = scalar_bit_width(ctx, int_ty);
-
-    // Clamp before the round trip: nearest-even can carry a source at the very top of the integer
-    // range up to 2^width (unsigned) or 2^(width-1) (signed), and OpConvertFToU/S does not define
-    // an out-of-range operand. Every value the clamp moves is inexact and rounds to odd anyway --
-    // the bound's own significand is all ones -- so clamping does not change any answer.
-    let bound_pow2 = if signed { width - 1 } else { width };
-    let bound = splat_or_scalar(ctx, f32_ty, largest_f32_below_pow2(bound_pow2), n);
-    let ext = ctx.glsl();
-    let clamped = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::ExtInst,
-        Some(f32_ty),
-        Some(clamped),
-        vec![
-            Operand::IdRef(ext),
-            Operand::LiteralExtInstInteger(GLSLstd450::FMin as u32),
-            Operand::IdRef(f32val),
-            Operand::IdRef(bound),
-        ],
-    ));
-
-    // OpConvertFToS/U truncates toward zero, so `back` is the exact integer value of `clamped`.
-    let back = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        if signed {
-            Op::ConvertFToS
-        } else {
-            Op::ConvertFToU
-        },
-        Some(int_ty),
-        Some(back),
-        vec![Operand::IdRef(clamped)],
-    ));
-    let exact = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::IEqual,
-        Some(bool_ty),
-        Some(exact),
-        vec![Operand::IdRef(back), Operand::IdRef(int_val)],
-    ));
-
-    // Did nearest-even round AWAY from zero? For a non-negative source that is `back > int_val`;
-    // for a negative one the magnitude grew when `back < int_val`.
-    let away = if signed {
-        let zero = shaped_int_zero(ctx, int_ty, n);
-        let non_negative = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::SGreaterThanEqual,
-            Some(bool_ty),
-            Some(non_negative),
-            vec![Operand::IdRef(int_val), Operand::IdRef(zero)],
-        ));
-        let greater = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::SGreaterThan,
-            Some(bool_ty),
-            Some(greater),
-            vec![Operand::IdRef(back), Operand::IdRef(int_val)],
-        ));
-        let less = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::SLessThan,
-            Some(bool_ty),
-            Some(less),
-            vec![Operand::IdRef(back), Operand::IdRef(int_val)],
-        ));
-        let away = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::Select,
-            Some(bool_ty),
-            Some(away),
-            vec![
-                Operand::IdRef(non_negative),
-                Operand::IdRef(greater),
-                Operand::IdRef(less),
-            ],
-        ));
-        away
-    } else {
-        let away = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::UGreaterThan,
-            Some(bool_ty),
-            Some(away),
-            vec![Operand::IdRef(back), Operand::IdRef(int_val)],
-        ));
-        away
-    };
-
-    // f32 is sign-magnitude, so subtracting one from the bit pattern steps the MAGNITUDE down one
-    // ulp for either sign (a zero significand borrows into the exponent, which is exactly the next
-    // smaller magnitude). Step down when nearest-even rounded away, then set the significand's low
-    // bit: that names the odd member of the bracketing pair.
-    let bits = ctx.module.fresh_id();
+    let as_u32 = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::Bitcast,
         Some(u32_ty),
-        Some(bits),
-        vec![Operand::IdRef(clamped)],
+        Some(as_u32),
+        vec![Operand::IdRef(f32val)],
+    ));
+    let shamt = shift_amount_16(ctx, n);
+    let high = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftRightLogical,
+        Some(u32_ty),
+        Some(high),
+        vec![Operand::IdRef(as_u32), Operand::IdRef(shamt)],
     ));
     let one = shaped_u32_const(ctx, n, 1);
-    let stepped_down = ctx.module.fresh_id();
+    let lsb = ctx.module.fresh_id();
     out.push(Instruction::new(
-        Op::ISub,
+        Op::BitwiseAnd,
         Some(u32_ty),
-        Some(stepped_down),
-        vec![Operand::IdRef(bits), Operand::IdRef(one)],
+        Some(lsb),
+        vec![Operand::IdRef(high), Operand::IdRef(one)],
     ));
-    let toward_zero = ctx.module.fresh_id();
+    let bias_base = shaped_u32_const(ctx, n, 0x7fff);
+    let bias = ctx.module.fresh_id();
     out.push(Instruction::new(
-        Op::Select,
+        Op::IAdd,
         Some(u32_ty),
-        Some(toward_zero),
-        vec![
-            Operand::IdRef(away),
-            Operand::IdRef(stepped_down),
-            Operand::IdRef(bits),
-        ],
+        Some(bias),
+        vec![Operand::IdRef(bias_base), Operand::IdRef(lsb)],
     ));
-    let odd = ctx.module.fresh_id();
+    let rounded = ctx.module.fresh_id();
     out.push(Instruction::new(
-        Op::BitwiseOr,
+        Op::IAdd,
         Some(u32_ty),
-        Some(odd),
-        vec![Operand::IdRef(toward_zero), Operand::IdRef(one)],
+        Some(rounded),
+        vec![Operand::IdRef(as_u32), Operand::IdRef(bias)],
     ));
+    let shifted = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::ShiftRightLogical,
+        Some(u32_ty),
+        Some(shifted),
+        vec![Operand::IdRef(rounded), Operand::IdRef(shamt)],
+    ));
+    let shifted = select_canonical_bfloat_nan_bits(ctx, out, as_u32, shifted, n);
+    out.push(Instruction::new(
+        Op::UConvert,
+        Some(rty),
+        Some(res),
+        vec![Operand::IdRef(shifted)],
+    ));
+}
+
+fn select_canonical_bfloat_nan_bits(
+    ctx: &mut Ctx,
+    out: &mut Vec<Instruction>,
+    bits: Word,
+    narrowed: Word,
+    n: u32,
+) -> Word {
+    let u32_ty = ty_u32_shaped(ctx, n);
+    let bool_ty = ty_bool_shaped(ctx, n);
+    let exp_mask = shaped_u32_const(ctx, n, 0x7f80_0000);
+    let mant_mask = shaped_u32_const(ctx, n, 0x007f_ffff);
+    let zero = shaped_u32_const(ctx, n, 0);
+
+    let exp_bits = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(u32_ty),
+        Some(exp_bits),
+        vec![Operand::IdRef(bits), Operand::IdRef(exp_mask)],
+    ));
+    let exp_all_ones = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::IEqual,
+        Some(bool_ty),
+        Some(exp_all_ones),
+        vec![Operand::IdRef(exp_bits), Operand::IdRef(exp_mask)],
+    ));
+
+    let mant_bits = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::BitwiseAnd,
+        Some(u32_ty),
+        Some(mant_bits),
+        vec![Operand::IdRef(bits), Operand::IdRef(mant_mask)],
+    ));
+    let mant_nonzero = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::INotEqual,
+        Some(bool_ty),
+        Some(mant_nonzero),
+        vec![Operand::IdRef(mant_bits), Operand::IdRef(zero)],
+    ));
+
+    let is_nan = ctx.module.fresh_id();
+    out.push(Instruction::new(
+        Op::LogicalAnd,
+        Some(bool_ty),
+        Some(is_nan),
+        vec![Operand::IdRef(exp_all_ones), Operand::IdRef(mant_nonzero)],
+    ));
+
+    let canonical_nan = shaped_u32_const(ctx, n, 0x7fc0);
     let selected = ctx.module.fresh_id();
     out.push(Instruction::new(
         Op::Select,
         Some(u32_ty),
         Some(selected),
         vec![
-            Operand::IdRef(exact),
-            Operand::IdRef(bits),
-            Operand::IdRef(odd),
+            Operand::IdRef(is_nan),
+            Operand::IdRef(canonical_nan),
+            Operand::IdRef(narrowed),
         ],
     ));
-    let result = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::Bitcast,
-        Some(f32_ty),
-        Some(result),
-        vec![Operand::IdRef(selected)],
-    ));
-    result
+    selected
 }
 
 /// Lower an `air.convert` whose source and/or dest is bf16. The conversion is split around an f32
@@ -705,27 +747,25 @@ fn lower_convert_bf16(
                     id
                 }
             }
-            // Integer source. The f32 hop is exact for anything narrower than 32 bits (f32 keeps
-            // 24 significant bits), but a wider source can round twice on the way to bf16 -- so
-            // round the intermediate TO ODD first when the destination is bf16.
-            _ => {
-                let signed = src_kind == 's';
+            's' => {
                 let id = ctx.module.fresh_id();
                 out.push(Instruction::new(
-                    if signed {
-                        Op::ConvertSToF
-                    } else {
-                        Op::ConvertUToF
-                    },
+                    Op::ConvertSToF,
                     Some(f32_ty),
                     Some(id),
                     vec![Operand::IdRef(arg)],
                 ));
-                if dst_is_bf16 && scalar_bit_width(ctx, src_ty) >= 32 {
-                    round_int_to_odd_f32(ctx, &mut out, arg, src_ty, id, signed, n)
-                } else {
-                    id
-                }
+                id
+            }
+            _ => {
+                let id = ctx.module.fresh_id();
+                out.push(Instruction::new(
+                    Op::ConvertUToF,
+                    Some(f32_ty),
+                    Some(id),
+                    vec![Operand::IdRef(arg)],
+                ));
+                id
             }
         }
     };

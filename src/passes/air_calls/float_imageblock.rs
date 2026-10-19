@@ -363,54 +363,52 @@ pub(in crate::passes) fn lower_float_math(
             ),
         ]);
     }
-    // `sinpi`/`cospi` are NOT `sin(pi*x)`/`cos(pi*x)`; see `lower_metal_pi_scaled_sin_cos`.
+    // `cospi/sinpi/tanpi(x) = {cos,sin,tan}(pi*x)` and `exp10(x) = exp2(x*log2(10))` have no direct
+    // GLSL.std.450 op; build them as a constant pre-multiply followed by the base transcendental.
+    // Scalar f16/f32 only (the observed signatures); a vector form FALLBACKs honestly.
     if (name.starts_with("air.cospi.") || name.starts_with("air.fast_cospi.")) && args.len() == 1 {
-        return lower_metal_pi_scaled_sin_cos(ctx, res, rty, args[0], PiScaled::Cos);
+        return lower_premul_glsl_unary(
+            ctx,
+            res,
+            rty,
+            args[0],
+            std::f32::consts::PI,
+            GLSLstd450::Cos,
+        );
     }
     if (name.starts_with("air.sinpi.") || name.starts_with("air.fast_sinpi.")) && args.len() == 1 {
-        return lower_metal_pi_scaled_sin_cos(ctx, res, rty, args[0], PiScaled::Sin);
+        return lower_premul_glsl_unary(
+            ctx,
+            res,
+            rty,
+            args[0],
+            std::f32::consts::PI,
+            GLSLstd450::Sin,
+        );
     }
-    // `tanpi` is NOT `tan(pi*x)` either, and by a wider margin than sinpi/cospi; see
-    // `lower_metal_pi_scaled_sin_cos`.
     if (name.starts_with("air.tanpi.") || name.starts_with("air.fast_tanpi.")) && args.len() == 1 {
-        return lower_metal_pi_scaled_sin_cos(ctx, res, rty, args[0], PiScaled::Tan);
+        return lower_premul_glsl_unary(
+            ctx,
+            res,
+            rty,
+            args[0],
+            std::f32::consts::PI,
+            GLSLstd450::Tan,
+        );
     }
-    // GLSL.std.450 has no Exp10, so this composes one. Which composition does not matter for
-    // accuracy: `powr(10,x)`, `pow(10,x)` and `exp2(x * log2(10))` are all BIT-IDENTICAL to Metal's
-    // `exp10` -- on all 2077 float arguments of a sweep over [-40,40] plus the round integers, and
-    // on all 63488 finite halves (device-measured, Apple M3 Max / macOS 26.5.2, one spelling per
-    // kernel). `Pow(10, x)` is chosen because it is one instruction instead of two and works on
-    // vectors, which the pre-multiply form did not.
-    //
-    // Metal does NOT return the exact round powers: `exp10(2)` is 99.99999 and `exp10(3)` is
-    // 999.9998, under both the default fast math and `Pow`. Reproducing that is the contract.
     if (name.starts_with("air.exp10.") || name.starts_with("air.fast_exp10.")) && args.len() == 1 {
-        let ext = ctx.glsl();
-        let n = vector_len(ctx, rty);
-        let ten = splat_or_scalar(ctx, rty, 10.0, n);
-        return Ok(vec![Instruction::new(
-            Op::ExtInst,
-            Some(rty),
-            Some(res),
-            vec![
-                Operand::IdRef(ext),
-                Operand::LiteralExtInstInteger(GLSLstd450::Pow as u32),
-                Operand::IdRef(ten),
-                Operand::IdRef(args[0]),
-            ],
-        )]);
+        return lower_premul_glsl_unary(
+            ctx,
+            res,
+            rty,
+            args[0],
+            std::f32::consts::LOG2_10,
+            GLSLstd450::Exp2,
+        );
     }
-    // Metal's fmod is the EXPRESSION `x - y * trunc(x / y)`, not the exact C remainder, and this
-    // is the one hand-rolled wrapper here that must NOT be replaced by the primitive that looks
-    // like it. SPIR-V's `OpFRem` is the exact remainder with the dividend's sign -- textbook C
-    // `fmod` -- and `OpFMod` is the floor-style modulus; both would be wrong. Once the quotient is
-    // large enough to round, Metal's answer is the residue of a ROUNDED trunc, which is nowhere
-    // near the exact remainder: measured on this repository's reference GPU by the authored
-    // `kernel_fast_fmod_large_quotient`, `fast::fmod(1e10, 3)` is -512 where the exact remainder is
-    // 1, `fast::fmod(1e20, 3)` is -4398046511104 where it is 2, and `fast::fmod(1e6, 0.1)` is
-    // -0.0149 where it is 0.0851. SPIRV-Cross renders these four instructions back into literally
-    // `x - (y * trunc(x / y))`, which is why the candidate reproduces Metal bit for bit. 504 corpus
-    // sources call this family. The same operations are valid for scalar and vector float types.
+    // Metal's fmod follows C fmod semantics: x - y * trunc(x / y). GLSL.std.450 only exposes
+    // Modf, and SPIR-V's OpFMod uses floor-style modulus semantics, so build the trunc form
+    // explicitly. The same operations are valid for scalar and vector float types.
     if name.starts_with("air.fast_fmod.") || name.starts_with("air.fmod.") {
         if args.len() != 2 {
             return Err(format!("{name} expects two operands"));
@@ -450,23 +448,31 @@ pub(in crate::passes) fn lower_float_math(
             ),
         ]);
     }
-    // GLSL.std.450 has no Log10 either, and here the composition DOES matter. Metal's `log10` is
-    // not `log(x) / ln(10)`: device-measured on an Apple M3 Max / macOS 26.5.2, that form
-    // disagrees with `log10` on 1995 of a 2011-argument float sweep, and it is visibly wrong at
-    // the arguments a shader is most likely to pass -- `log10(100)` comes back 1.9999999 where
-    // Metal returns exactly 2. `log2(x) * log10(2)` agrees on all 2011, and reproduces every edge:
-    // `+-0` -> `-inf`, `+inf` -> `+inf`, a negative argument and `-inf` -> NaN.
-    //
-    // At half width the multiply must NOT be done in half -- see `lower_scaled_glsl_unary`.
+    // GLSL.std.450 has natural Log but no Log10. Metal's log10(x) is log(x) / ln(10); build the
+    // divisor with the same scalar/vector shape as the result type.
     if (name.starts_with("air.fast_log10.") || name.starts_with("air.log10.")) && args.len() == 1 {
-        return lower_post_scaled_glsl_unary(
-            ctx,
-            res,
-            rty,
-            args[0],
-            std::f32::consts::LOG10_2,
-            GLSLstd450::Log2,
-        );
+        let ext = ctx.glsl();
+        let logged = ctx.module.fresh_id();
+        let n = vector_len(ctx, rty);
+        let ln10 = splat_or_scalar(ctx, rty, std::f32::consts::LN_10, n);
+        return Ok(vec![
+            Instruction::new(
+                Op::ExtInst,
+                Some(rty),
+                Some(logged),
+                vec![
+                    Operand::IdRef(ext),
+                    Operand::LiteralExtInstInteger(GLSLstd450::Log as u32),
+                    Operand::IdRef(args[0]),
+                ],
+            ),
+            Instruction::new(
+                Op::FDiv,
+                Some(rty),
+                Some(res),
+                vec![Operand::IdRef(logged), Operand::IdRef(ln10)],
+            ),
+        ]);
     }
     // Integer min/max use GLSL's integer ext-inst variants. The generic `air.min`/`air.max`
     // matcher below is float-only; using FMin/FMax for e.g. `air.min.s.i16` emits invalid
@@ -532,9 +538,9 @@ pub(in crate::passes) fn lower_float_math(
     // invalid OpExtInst.
     if args.len() == 3 {
         let ternary_minmax = if name.contains("fmax3") {
-            Some(GLSLstd450::FMax)
+            Some(GLSLstd450::NMax)
         } else if name.contains("fmin3") {
-            Some(GLSLstd450::FMin)
+            Some(GLSLstd450::NMin)
         } else if name.starts_with("air.max3.u.") {
             Some(GLSLstd450::UMax)
         } else if name.starts_with("air.min3.u.") {
@@ -545,8 +551,7 @@ pub(in crate::passes) fn lower_float_math(
             Some(GLSLstd450::SMin)
         } else {
             None
-        }
-        .map(|op| nan_aware_if_precise(name, op));
+        };
         if let Some(op) = ternary_minmax {
             let ext = ctx.glsl();
             let tmp = ctx.module.fresh_id();
@@ -578,10 +583,6 @@ pub(in crate::passes) fn lower_float_math(
     }
     if name.contains("fmedian3") && args.len() == 3 {
         let ext = ctx.glsl();
-        // `fmedian3` is built out of the same `fmin`/`fmax` the plain symbol names, so it carries
-        // the same NaN contract; see `nan_aware_if_precise`.
-        let fmin = nan_aware_if_precise(name, GLSLstd450::FMin);
-        let fmax = nan_aware_if_precise(name, GLSLstd450::FMax);
         let min_ab = ctx.module.fresh_id();
         let max_ab = ctx.module.fresh_id();
         let min_max_ab_c = ctx.module.fresh_id();
@@ -592,7 +593,7 @@ pub(in crate::passes) fn lower_float_math(
                 Some(min_ab),
                 vec![
                     Operand::IdRef(ext),
-                    Operand::LiteralExtInstInteger(fmin as u32),
+                    Operand::LiteralExtInstInteger(GLSLstd450::NMin as u32),
                     Operand::IdRef(args[0]),
                     Operand::IdRef(args[1]),
                 ],
@@ -603,7 +604,7 @@ pub(in crate::passes) fn lower_float_math(
                 Some(max_ab),
                 vec![
                     Operand::IdRef(ext),
-                    Operand::LiteralExtInstInteger(fmax as u32),
+                    Operand::LiteralExtInstInteger(GLSLstd450::NMax as u32),
                     Operand::IdRef(args[0]),
                     Operand::IdRef(args[1]),
                 ],
@@ -614,7 +615,7 @@ pub(in crate::passes) fn lower_float_math(
                 Some(min_max_ab_c),
                 vec![
                     Operand::IdRef(ext),
-                    Operand::LiteralExtInstInteger(fmin as u32),
+                    Operand::LiteralExtInstInteger(GLSLstd450::NMin as u32),
                     Operand::IdRef(max_ab),
                     Operand::IdRef(args[2]),
                 ],
@@ -625,7 +626,7 @@ pub(in crate::passes) fn lower_float_math(
                 Some(res),
                 vec![
                     Operand::IdRef(ext),
-                    Operand::LiteralExtInstInteger(fmax as u32),
+                    Operand::LiteralExtInstInteger(GLSLstd450::NMax as u32),
                     Operand::IdRef(min_ab),
                     Operand::IdRef(min_max_ab_c),
                 ],
@@ -653,34 +654,28 @@ pub(in crate::passes) fn lower_float_math(
     }
     // GLSL.std.450 ext-inst math.
     if let Some(glsl_op) = glsl_extinst(name) {
-        if args.len() == 1
-            && glsl_op == GLSLstd450::Round
-            && (is_f32_scalar_or_vector(ctx, rty) || is_half_scalar_or_vector(ctx, rty))
-        {
-            return Ok(lower_metal_round(ctx, res, rty, args[0]));
-        }
         if args.len() == 1 && matches!(glsl_op, GLSLstd450::Round | GLSLstd450::RoundEven) {
-            return Ok(half_glsl_op(ctx, glsl_op, res, rty, args));
+            return Ok(half_glsl_unary(ctx, glsl_op, res, rty, args[0]));
         }
-        // A half `Tanh`/`Atan2` reaches Metal's `fast::` variant through SPIRV-Cross while the float
-        // one reaches `precise::`; see `half_glsl_op`. `fast::tanh(44)` is 0 and `fast::tanh(50)` is
-        // NaN where the oracle's `tanh(half)` is 1.0, so the half width is a different function and
-        // the op has to be computed at float width to be the one AIR named. Only for the PRECISE
-        // symbol: `air.fast_atan2.f16` is asking for exactly the `fast::` variant the half width
-        // already reaches, and widening it would walk away from the function it named.
-        if matches!(glsl_op, GLSLstd450::Tanh | GLSLstd450::Atan2)
-            && !name.starts_with("air.fast_")
-            && args.len() == usize::from(glsl_op == GLSLstd450::Atan2) + 1
-        {
-            return Ok(half_glsl_op(ctx, glsl_op, res, rty, args));
+        if args.len() == 2 && is_air_math(name, "pow") {
+            // Metal's `pow(x, y)` widens to the sign-magnitude form `pow(|x|, y)` rather than the
+            // IEEE `exp2(y*log2(x))` that yields NaN for x < 0: Apple goldens carry a finite
+            // magnitude for a negative base (the value's sign is reapplied downstream by the shader,
+            // e.g. a later multiply). GLSL Pow leaves x < 0 undefined (NaN on the Apple GPU via
+            // MoltenVK), so emit the abs form. The half path widens to float around the pow; the f32
+            // FAST variant emits the abs-pow directly. Non-negative base is unchanged (|x| == x), so
+            // no currently-passing case regresses. `powr` (x >= 0 by contract) never reaches here.
+            if is_half_scalar_or_vector(ctx, rty) {
+                return Ok(half_abs_pow(ctx, res, rty, args[0], args[1]));
+            }
+            if name.starts_with("air.fast_pow.") && is_f32_scalar_or_vector(ctx, rty) {
+                return Ok(f32_abs_pow(ctx, res, rty, args[0], args[1]));
+            }
         }
-        // GLSL Pow cannot be handed a negative base; Metal's `pow` defines one. `powr` (x >= 0 by
-        // contract) is a different AIR symbol and keeps the plain ext-inst below.
-        if args.len() == 2
-            && is_air_math(name, "pow")
-            && (is_half_scalar_or_vector(ctx, rty) || is_f32_scalar_or_vector(ctx, rty))
-        {
-            return Ok(lower_metal_pow(ctx, res, rty, args[0], args[1]));
+        if args.len() == 3 && matches!(glsl_op, GLSLstd450::FMix) {
+            return Ok(lower_endpoint_preserving_mix(
+                ctx, res, rty, args[0], args[1], args[2],
+            ));
         }
         let ext = ctx.glsl();
         let mut ops = vec![
@@ -697,15 +692,14 @@ pub(in crate::passes) fn lower_float_math(
             ops,
         )]);
     }
-    // saturate(x) = clamp(x, 0, 1); needs synthesized 0/1 constants of the result ELEMENT type
+    // saturate(x) = NClamp(x, 0, 1) — Metal's clamp is fmin(fmax(x, 0), 1), so saturate(NaN) is 0,
+    // which FClamp leaves undefined. Needs synthesized 0/1 constants of the result ELEMENT type
     // (half `air.saturate.f16` -> half 0/1; float -> float 0/1; else spirv-val rejects the mismatch).
     if name.contains("saturate") && args.len() == 1 {
         let ext = ctx.glsl();
-        // `saturate` is `clamp(x, 0, 1)` and carries the plain clamp's NaN contract with it.
-        let clamp = nan_aware_if_precise(name, GLSLstd450::FClamp);
         let (zero, one) = scalar_zero_one(ctx, rty);
-        // The clamp on a vector takes vector clamp operands; GLSL accepts scalar edges only for
-        // scalar x. For vectors we must splat — build constant composites.
+        // FClamp on a vector takes vector clamp operands; but GLSL FClamp accepts scalar edges only
+        // for scalar x. For vectors we must splat — build constant composites.
         let (lo, hi) = clamp_edges(ctx, rty, zero, one);
         return Ok(vec![Instruction::new(
             Op::ExtInst,
@@ -713,7 +707,7 @@ pub(in crate::passes) fn lower_float_math(
             Some(res),
             vec![
                 Operand::IdRef(ext),
-                Operand::LiteralExtInstInteger(clamp as u32),
+                Operand::LiteralExtInstInteger(GLSLstd450::NClamp as u32),
                 Operand::IdRef(args[0]),
                 Operand::IdRef(lo),
                 Operand::IdRef(hi),
@@ -724,497 +718,75 @@ pub(in crate::passes) fn lower_float_math(
     Err(format!("unhandled air.* intrinsic: {name}"))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PiScaled {
-    Sin,
-    Cos,
-    Tan,
-}
-
-/// Metal's `sinpi(x)` and `cospi(x)` are NOT `sin(float(pi) * x)` and `cos(float(pi) * x)`.
-///
-/// `float(pi)` is 3.1415927410125732, which is 8.74e-08 above pi, so the pre-multiply puts the
-/// argument that far past the zero crossing and the answer at every half-integer -- the arguments
-/// a shader is most likely to pass -- is a small number instead of an exact 0 or +-1. Measured on
-/// this repository's reference GPU against `precise::sinpi`/`precise::cospi`: `sinpi(1)` is -0.0 on
-/// device and the pre-multiply gives -8.74e-08, `cospi(0.5)` is 0.0 and gives -4.37e-08,
-/// `cospi(100.5)` is 0.0 and gives -1.03e-05. Worse, the pre-multiply hands a LARGE argument to
-/// `sin`/`cos`, which flushes to 0.0 above float(pi/2)*2^22 (see `lower_fast_trig`), so
-/// `cospi(1e7)` came back 0.0 where Metal answers 1.0. Over an 80-point grid of the two functions
-/// the pre-multiply was wrong in 40 lanes; the reduction below is wrong in 6, all by one ULP at
-/// arguments that are not multiples of 0.5.
-///
-/// Both functions have period 2, and 2 is a power of two, so the reduction is EXACT:
-///
-/// ```text
-/// x2 = x - 2*roundEven(x/2)          in [-1, 1], exact
-/// n  = roundEven(2*x2)               in {-2,-1,0,1,2}
-/// r  = x2 - n/2                      in [-0.25, 0.25], exact
-/// sinpi(x) = [sin, cos, -sin, -cos][n mod 4](pi*r)
-/// cospi(x) = [cos, -sin, -cos, sin][n mod 4](pi*r)
-/// ```
-///
-/// `n` never leaves {-2,-1,0,1,2}, so the quadrant is selected by three float compares rather than
-/// an integer conversion that would overflow for a large `x`. Only `pi*r` is inexact, and `|r|` is
-/// at most 0.25, which is why a half-integer argument lands on an exact 0 or +-1: `r` is 0 there
-/// and `sin(0)`/`cos(0)` are exact.
-///
-/// Two measured sign details. `sinpi` returns -0.0 at odd integers, which the `-sin(pi*r)` arm
-/// reproduces because IEEE negation of +0.0 is -0.0. `cospi` returns +0.0 at EVERY half-integer,
-/// including the ones whose quadrant arm is a negated sine, where the sine is +0.0; that arm
-/// therefore selects the +0.0 constant when the residue is 0. Writing it as `0.0 - sin(pi*r)`
-/// instead is not enough: Metal's compiler folds `0.0 - x` back into a negation under its default
-/// no-signed-zeros fast math, and five lanes came back -0.0 when it was tried.
-///
-/// A non-finite argument answers the canonical quiet NaN 0x7fc00000, which is what Metal returns
-/// for all of `+-inf` and NaN. Without the guard the reduction would answer +-0.0 there, because
-/// `x - x` is NaN and MSL's `sin` flushes a NaN to 0.0.
-///
-/// `tanpi(x)` is the quotient of the two, and is where the pre-multiply is most visibly wrong.
-/// `tan(float(pi) * x)` is not merely imprecise: it has no pole at all, because `float(pi)*0.5`
-/// misses pi/2. Device-measured over 4091 arguments -- a 1/1000 grid on [-2,2] plus the quarter
-/// integers and the edges -- `tan(pi*x)` disagrees with `tanpi` on 3184, and at the half-integers
-/// it returns a large finite number of the WRONG SIGN where Metal returns an infinity:
-/// `tanpi(0.5)` is +inf and `tan(pi*0.5)` is -2.28e7. `sinpi(x)/cospi(x)` disagrees on 98, none by
-/// more than 1e-5 relative, and reproduces every pole, both signed zeros, the large arguments
-/// (`tanpi(12345.5)` is -inf), `+-inf` and NaN exactly.
-///
-/// Dividing the two selected quadrant arms is what puts the poles in: at a half-integer the
-/// residue is 0, so the numerator is an exact +-1 and the denominator is the +0.0 the cospi arm
-/// already selects there, and IEEE division gives the correctly signed infinity. At an integer the
-/// numerator is the -0.0 the sinpi arm gives and the denominator is +-1, so `tanpi` is an exact
-/// signed zero. Nothing about the pole handling is written down here twice -- it falls out of the
-/// two arms that were already device-verified.
-///
-/// `precise::tanpi` and `fast::tanpi` agree on all 4092 measured arguments, so both AIR spellings
-/// take this one lowering.
-fn lower_metal_pi_scaled_sin_cos(
+fn lower_endpoint_preserving_mix(
     ctx: &mut Ctx,
     res: Word,
     rty: Word,
     x: Word,
-    which: PiScaled,
-) -> Result<Vec<Instruction>, String> {
-    let float_ty = float_equivalent(ctx, rty);
-    match type_def_of(ctx, float_ty) {
-        Some(def) if def.class.opcode == Op::TypeFloat => {}
-        _ => return Err("pi-scaled sine/cosine currently supports scalar float only".to_string()),
-    }
+    y: Word,
+    t: Word,
+) -> Vec<Instruction> {
     let ext = ctx.glsl();
-    let bool_ty = ctx.ty_bool();
-    let half = ctx.const_float(0.5);
-    let two = ctx.const_float(2.0);
-    let pi = ctx.const_float(std::f32::consts::PI);
-    let zero = ctx.const_float(0.0);
-    let one = ctx.const_float(1.0);
-    let minus_one = ctx.const_float(-1.0);
-    let infinity = ctx.const_float(f32::INFINITY);
-    let quiet_nan = ctx.const_float(f32::from_bits(0x7fc0_0000));
-    let mut out = Vec::new();
-
-    let emit =
-        |ctx: &mut Ctx, out: &mut Vec<Instruction>, op: Op, operands: Vec<Operand>| -> Word {
-            let id = ctx.module.fresh_id();
-            out.push(Instruction::new(op, Some(float_ty), Some(id), operands));
-            id
-        };
-    let xf = if float_ty == rty {
-        x
-    } else {
-        emit(ctx, &mut out, Op::FConvert, vec![Operand::IdRef(x)])
-    };
-
-    let round_even = |ctx: &mut Ctx, out: &mut Vec<Instruction>, value: Word| -> Word {
-        let id = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::ExtInst,
-            Some(float_ty),
-            Some(id),
-            vec![
-                Operand::IdRef(ext),
-                Operand::LiteralExtInstInteger(GLSLstd450::RoundEven as u32),
-                Operand::IdRef(value),
-            ],
-        ));
-        id
-    };
-
-    // x2 = x - 2*roundEven(x/2): both multiplications are by a power of two and the subtraction
-    // cancels to at most 1, so nothing here rounds.
-    let scaled = emit(
-        ctx,
-        &mut out,
-        Op::FMul,
-        vec![Operand::IdRef(xf), Operand::IdRef(half)],
-    );
-    let whole = round_even(ctx, &mut out, scaled);
-    let doubled = emit(
-        ctx,
-        &mut out,
-        Op::FMul,
-        vec![Operand::IdRef(whole), Operand::IdRef(two)],
-    );
-    let reduced = emit(
-        ctx,
-        &mut out,
-        Op::FSub,
-        vec![Operand::IdRef(xf), Operand::IdRef(doubled)],
-    );
-    let twice = emit(
-        ctx,
-        &mut out,
-        Op::FMul,
-        vec![Operand::IdRef(reduced), Operand::IdRef(two)],
-    );
-    let quadrant = round_even(ctx, &mut out, twice);
-    let offset = emit(
-        ctx,
-        &mut out,
-        Op::FMul,
-        vec![Operand::IdRef(quadrant), Operand::IdRef(half)],
-    );
-    let residue = emit(
-        ctx,
-        &mut out,
-        Op::FSub,
-        vec![Operand::IdRef(reduced), Operand::IdRef(offset)],
-    );
-    let angle = emit(
-        ctx,
-        &mut out,
-        Op::FMul,
-        vec![Operand::IdRef(pi), Operand::IdRef(residue)],
-    );
-
-    let sine = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::ExtInst,
-        Some(float_ty),
-        Some(sine),
-        vec![
-            Operand::IdRef(ext),
-            Operand::LiteralExtInstInteger(GLSLstd450::Sin as u32),
-            Operand::IdRef(angle),
-        ],
-    ));
-    let cosine = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::ExtInst,
-        Some(float_ty),
-        Some(cosine),
-        vec![
-            Operand::IdRef(ext),
-            Operand::LiteralExtInstInteger(GLSLstd450::Cos as u32),
-            Operand::IdRef(angle),
-        ],
-    ));
-
-    let compare =
-        |ctx: &mut Ctx, out: &mut Vec<Instruction>, quadrant: Word, against: Word| -> Word {
-            let id = ctx.module.fresh_id();
-            out.push(Instruction::new(
-                Op::FOrdEqual,
-                Some(bool_ty),
-                Some(id),
-                vec![Operand::IdRef(quadrant), Operand::IdRef(against)],
-            ));
-            id
-        };
-    let at_zero = compare(ctx, &mut out, quadrant, zero);
-    let at_one = compare(ctx, &mut out, quadrant, one);
-    let at_minus_one = compare(ctx, &mut out, quadrant, minus_one);
-
-    // `quadrant` is +-2 in the arm each of these falls through to, and +-2 select the same value.
-    let sine_arms = |ctx: &mut Ctx, out: &mut Vec<Instruction>| -> (Word, Word, Word, Word) {
-        let negated_sine = emit(ctx, out, Op::FNegate, vec![Operand::IdRef(sine)]);
-        let negated_cosine = emit(ctx, out, Op::FNegate, vec![Operand::IdRef(cosine)]);
-        (sine, cosine, negated_cosine, negated_sine)
-    };
-    // Metal's cospi answers +0.0 at EVERY half-integer, including the ones whose quadrant arm is a
-    // negated sine, and the sine is +0.0 there. Neither `-sin` nor `0.0 - sin` survives that:
-    // negation makes -0.0, and Metal's compiler folds `0.0 - x` back into a negation under its
-    // default no-signed-zeros fast math. Select the +0.0 constant on the residue instead, which is
-    // the only argument at which the two differ.
-    let cosine_arms = |ctx: &mut Ctx, out: &mut Vec<Instruction>| -> (Word, Word, Word, Word) {
-        let negated_sine = emit(ctx, out, Op::FNegate, vec![Operand::IdRef(sine)]);
-        let at_axis = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FOrdEqual,
-            Some(bool_ty),
-            Some(at_axis),
-            vec![Operand::IdRef(residue), Operand::IdRef(zero)],
-        ));
-        let signed_zero = emit(
-            ctx,
-            out,
-            Op::Select,
-            vec![
-                Operand::IdRef(at_axis),
-                Operand::IdRef(zero),
-                Operand::IdRef(negated_sine),
-            ],
-        );
-        let negated_cosine = emit(ctx, out, Op::FNegate, vec![Operand::IdRef(cosine)]);
-        (cosine, signed_zero, sine, negated_cosine)
-    };
-    let pick_quadrant = |ctx: &mut Ctx,
-                         out: &mut Vec<Instruction>,
-                         (arm_zero, arm_one, arm_minus_one, arm_two): (Word, Word, Word, Word)|
-     -> Word {
-        let inner = emit(
-            ctx,
-            out,
-            Op::Select,
-            vec![
-                Operand::IdRef(at_minus_one),
-                Operand::IdRef(arm_minus_one),
-                Operand::IdRef(arm_two),
-            ],
-        );
-        let middle = emit(
-            ctx,
-            out,
-            Op::Select,
-            vec![
-                Operand::IdRef(at_one),
-                Operand::IdRef(arm_one),
-                Operand::IdRef(inner),
-            ],
-        );
-        emit(
-            ctx,
-            out,
-            Op::Select,
-            vec![
-                Operand::IdRef(at_zero),
-                Operand::IdRef(arm_zero),
-                Operand::IdRef(middle),
-            ],
-        )
-    };
-    let selected = match which {
-        PiScaled::Sin => {
-            let arms = sine_arms(ctx, &mut out);
-            pick_quadrant(ctx, &mut out, arms)
-        }
-        PiScaled::Cos => {
-            let arms = cosine_arms(ctx, &mut out);
-            pick_quadrant(ctx, &mut out, arms)
-        }
-        PiScaled::Tan => {
-            let sin_arms = sine_arms(ctx, &mut out);
-            let numerator = pick_quadrant(ctx, &mut out, sin_arms);
-            let cos_arms = cosine_arms(ctx, &mut out);
-            let denominator = pick_quadrant(ctx, &mut out, cos_arms);
-            emit(
-                ctx,
-                &mut out,
-                Op::FDiv,
-                vec![Operand::IdRef(numerator), Operand::IdRef(denominator)],
-            )
-        }
-    };
-
-    let magnitude = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::ExtInst,
-        Some(float_ty),
-        Some(magnitude),
-        vec![
-            Operand::IdRef(ext),
-            Operand::LiteralExtInstInteger(GLSLstd450::FAbs as u32),
-            Operand::IdRef(xf),
-        ],
-    ));
-    let finite = ctx.module.fresh_id();
-    out.push(Instruction::new(
-        Op::FOrdLessThan,
-        Some(bool_ty),
-        Some(finite),
-        vec![Operand::IdRef(magnitude), Operand::IdRef(infinity)],
-    ));
-    let guarded = if float_ty == rty {
-        res
-    } else {
-        ctx.module.fresh_id()
-    };
-    out.push(Instruction::new(
-        Op::Select,
-        Some(float_ty),
-        Some(guarded),
-        vec![
-            Operand::IdRef(finite),
-            Operand::IdRef(selected),
-            Operand::IdRef(quiet_nan),
-        ],
-    ));
-    if float_ty != rty {
-        out.push(Instruction::new(
-            Op::FConvert,
-            Some(rty),
-            Some(res),
-            vec![Operand::IdRef(guarded)],
-        ));
-    }
-    Ok(out)
-}
-
-/// Metal's `round(x)` rounds a `.5` fraction AWAY FROM ZERO — `round(2.5) == 3.0` and
-/// `round(-2.5) == -3.0` — while GLSL.std.450 `Round` leaves the tie direction to the
-/// implementation ("presumably the direction that is fastest"), so a round-half-to-even driver
-/// answers `2.0` for the same input. Emit the deterministic form instead:
-///
-/// ```text
-/// t = trunc(x); d = x - t; round(x) = t + (d >= 0.5 ? 1.0 : d <= -0.5 ? -1.0 : +0.0)
-/// ```
-///
-/// The `+0.0` arm also reproduces the measured Apple-GPU detail that a zero-magnitude result is
-/// `+0.0` even for a negative input (`round(-1e-20)` and `round(-0.0)` both answer `+0.0`), because
-/// IEEE `-0.0 + 0.0` is `+0.0`. NaN and the infinities pass through: both compares are ordered, so
-/// `adj` is `+0.0` and `t + 0.0` is `t`. A half operand computes in f32 and narrows back, which is
-/// exact — every half whose magnitude is below 2048 rounds to an integer a half can hold, and every
-/// half at or above 2048 is already integral.
-fn lower_metal_round(ctx: &mut Ctx, res: Word, rty: Word, x: Word) -> Vec<Instruction> {
-    let float_ty = float_equivalent(ctx, rty);
-    let lanes = vector_len(ctx, float_ty);
+    let lanes = vector_len(ctx, rty);
     let bool_ty = if lanes == 1 {
         ctx.ty_bool()
     } else {
         ctx.ty_vec_bool(lanes)
     };
-    let ext = ctx.glsl();
-    let up_edge = splat_or_scalar(ctx, float_ty, 0.5, lanes);
-    let down_edge = splat_or_scalar(ctx, float_ty, -0.5, lanes);
-    let plus_one = splat_or_scalar(ctx, float_ty, 1.0, lanes);
-    let minus_one = splat_or_scalar(ctx, float_ty, -1.0, lanes);
-    let zero = splat_or_scalar(ctx, float_ty, 0.0, lanes);
-    let mut out = Vec::new();
-    // A half operand widens to f32 for the arithmetic; an f32 operand is already in shape.
-    let xf = if float_ty == rty {
-        x
-    } else {
-        let widened = ctx.module.fresh_id();
-        out.push(Instruction::new(
-            Op::FConvert,
-            Some(float_ty),
-            Some(widened),
-            vec![Operand::IdRef(x)],
-        ));
-        widened
-    };
-    let truncated = ctx.module.fresh_id();
-    let remainder = ctx.module.fresh_id();
-    let reaches_up = ctx.module.fresh_id();
-    let reaches_down = ctx.module.fresh_id();
-    let down_or_zero = ctx.module.fresh_id();
-    let adjust = ctx.module.fresh_id();
-    let rounded = if float_ty == rty {
-        res
-    } else {
-        ctx.module.fresh_id()
-    };
-    out.extend([
+    let (zero, one) = scalar_zero_one(ctx, rty);
+    let (zero, one) = clamp_edges(ctx, rty, zero, one);
+    let raw = ctx.module.fresh_id();
+    let is_zero = ctx.module.fresh_id();
+    let is_one = ctx.module.fresh_id();
+    let zero_selected = ctx.module.fresh_id();
+    vec![
         Instruction::new(
             Op::ExtInst,
-            Some(float_ty),
-            Some(truncated),
+            Some(rty),
+            Some(raw),
             vec![
                 Operand::IdRef(ext),
-                Operand::LiteralExtInstInteger(GLSLstd450::Trunc as u32),
-                Operand::IdRef(xf),
+                Operand::LiteralExtInstInteger(GLSLstd450::FMix as u32),
+                Operand::IdRef(x),
+                Operand::IdRef(y),
+                Operand::IdRef(t),
             ],
         ),
         Instruction::new(
-            Op::FSub,
-            Some(float_ty),
-            Some(remainder),
-            vec![Operand::IdRef(xf), Operand::IdRef(truncated)],
-        ),
-        Instruction::new(
-            Op::FOrdGreaterThanEqual,
+            Op::FOrdEqual,
             Some(bool_ty),
-            Some(reaches_up),
-            vec![Operand::IdRef(remainder), Operand::IdRef(up_edge)],
-        ),
-        Instruction::new(
-            Op::FOrdLessThanEqual,
-            Some(bool_ty),
-            Some(reaches_down),
-            vec![Operand::IdRef(remainder), Operand::IdRef(down_edge)],
+            Some(is_zero),
+            vec![Operand::IdRef(t), Operand::IdRef(zero)],
         ),
         Instruction::new(
             Op::Select,
-            Some(float_ty),
-            Some(down_or_zero),
+            Some(rty),
+            Some(zero_selected),
             vec![
-                Operand::IdRef(reaches_down),
-                Operand::IdRef(minus_one),
-                Operand::IdRef(zero),
+                Operand::IdRef(is_zero),
+                Operand::IdRef(x),
+                Operand::IdRef(raw),
             ],
+        ),
+        Instruction::new(
+            Op::FOrdEqual,
+            Some(bool_ty),
+            Some(is_one),
+            vec![Operand::IdRef(t), Operand::IdRef(one)],
         ),
         Instruction::new(
             Op::Select,
-            Some(float_ty),
-            Some(adjust),
-            vec![
-                Operand::IdRef(reaches_up),
-                Operand::IdRef(plus_one),
-                Operand::IdRef(down_or_zero),
-            ],
-        ),
-        Instruction::new(
-            Op::FAdd,
-            Some(float_ty),
-            Some(rounded),
-            vec![Operand::IdRef(truncated), Operand::IdRef(adjust)],
-        ),
-    ]);
-    if float_ty != rty {
-        out.push(Instruction::new(
-            Op::FConvert,
             Some(rty),
             Some(res),
-            vec![Operand::IdRef(rounded)],
-        ));
-    }
-    out
+            vec![
+                Operand::IdRef(is_one),
+                Operand::IdRef(y),
+                Operand::IdRef(zero_selected),
+            ],
+        ),
+    ]
 }
 
-/// Metal's `fast::sin` / `fast::cos` reduce the argument and then GIVE UP, answering exactly `0.0`
-/// once the quadrant index would exceed 2^22. Bisected on this repository's reference GPU (Apple M3
-/// Max, macOS 26.5.2): `fast::cos(6588397.5)` still tracks `precise::cos`, and the very next float,
-/// `6588398.0`, answers `0.0` — 6588397.5 is `float(pi/2) * 2^22`, so the boundary is the quadrant
-/// count, not a round power of two. The same input flushes both `sin` and `cos`, and the negatives
-/// mirror it.
-///
-/// The infinities and NaN flush too (`fast::cos(inf)`, `fast::cos(NaN)` are both `0.0`), which an
-/// ORDERED compare would miss for NaN — hence `FUnordGreaterThan`, whose NaN arm is the flush.
-///
-/// The flush is the WHOLE difference from GLSL `Sin`/`Cos`. This lowering used to reduce the
-/// argument first — `x - trunc(x / 2pi) * 2pi` — which is not something Metal does and which
-/// destroys precision for any argument big enough to reduce at all: `trunc(x / 2pi) * 2pi` rounds
-/// twice, so the reduced argument carries the absolute error of a number the size of `x`, not of
-/// the residue. Measured on the authored `kernel_fast_trig_range` fixture: with the reduction
-/// `fast::sin(100)` came back **38 ULP** from Metal's answer; without it every probed argument
-/// agrees with Metal bit for bit, including 1e5, 1e6 and the threshold itself, where MSL's own
-/// `sin` is correctly rounded and the reduction was purely destructive. Dropping it changed bytes
-/// in 564 of 14579 corpus modules and the status of none.
-///
-/// **Why `air.fast_tan` is NOT given this treatment, measured rather than assumed.** The guard is
-/// only sound because `fast::sin`/`fast::cos` and `precise::sin`/`precise::cos` are otherwise the
-/// SAME function: device-measured on an Apple M3 Max / macOS 26.5.2, they are bit-identical on all
-/// 10001 arguments of a 1/5 grid over [-1000, 1000], and differ on 165 and 162 of 10001 over
-/// [0, 6e6] by at most 2 ULP. The flush is the whole difference, so modelling the flush closes the
-/// whole gap -- which matters because SPIRV-Cross emits the UNQUALIFIED MSL `sin`/`cos` and
-/// MoltenVK answers those precisely.
-///
-/// `fast::tan` is a different approximation, not a flushed one. It differs from `precise::tan` on
-/// **5828 of the same 10001 arguments** at |x| <= 1000, by up to 4 ULP, and past roughly 5.09e7
-/// (positive) or -2.79e7 (negative) it returns NaN where `precise::tan` returns a finite value --
-/// and not at a clean threshold either, since 5 of 24 sampled arguments BELOW the positive bound
-/// are NaN too. No select-shaped guard reproduces that. `air.fast_tan.f32` is therefore closed as
-/// a MoltenVK limitation on the same terms as `air.fast_atan2.f32`: 85 corpus call sites that
-/// cannot be made byte-exact, not a lowering that is missing a guard.
 fn lower_fast_trig(
     ctx: &mut Ctx,
     res: Word,
@@ -1230,10 +802,15 @@ fn lower_fast_trig(
         ctx.ty_vec_bool(lanes)
     };
     let zero = ctx.const_float(0.0);
-    // float(pi/2) * 2^22, the largest magnitude the hardware still evaluates.
-    let threshold = ctx.const_float(6_588_397.5);
+    let threshold = ctx.const_float(1_073_741_824.0);
+    let two_pi = ctx.const_float(std::f32::consts::TAU);
     let (zero, threshold) = clamp_edges(ctx, rty, zero, threshold);
+    let (_, two_pi) = clamp_edges(ctx, rty, zero, two_pi);
     let abs = ctx.module.fresh_id();
+    let quotient = ctx.module.fresh_id();
+    let periods = ctx.module.fresh_id();
+    let scaled_periods = ctx.module.fresh_id();
+    let reduced = ctx.module.fresh_id();
     let raw = ctx.module.fresh_id();
     let too_large = ctx.module.fresh_id();
     vec![
@@ -1248,7 +825,35 @@ fn lower_fast_trig(
             ],
         ),
         Instruction::new(
-            Op::FUnordGreaterThan,
+            Op::FDiv,
+            Some(rty),
+            Some(quotient),
+            vec![Operand::IdRef(x), Operand::IdRef(two_pi)],
+        ),
+        Instruction::new(
+            Op::ExtInst,
+            Some(rty),
+            Some(periods),
+            vec![
+                Operand::IdRef(ext),
+                Operand::LiteralExtInstInteger(GLSLstd450::Trunc as u32),
+                Operand::IdRef(quotient),
+            ],
+        ),
+        Instruction::new(
+            Op::FMul,
+            Some(rty),
+            Some(scaled_periods),
+            vec![Operand::IdRef(periods), Operand::IdRef(two_pi)],
+        ),
+        Instruction::new(
+            Op::FSub,
+            Some(rty),
+            Some(reduced),
+            vec![Operand::IdRef(x), Operand::IdRef(scaled_periods)],
+        ),
+        Instruction::new(
+            Op::FOrdGreaterThanEqual,
             Some(bool_ty),
             Some(too_large),
             vec![Operand::IdRef(abs), Operand::IdRef(threshold)],
@@ -1260,7 +865,7 @@ fn lower_fast_trig(
             vec![
                 Operand::IdRef(ext),
                 Operand::LiteralExtInstInteger(op as u32),
-                Operand::IdRef(x),
+                Operand::IdRef(reduced),
             ],
         ),
         Instruction::new(
@@ -1419,118 +1024,27 @@ pub(in crate::passes) fn integer_vector_type(ctx: &mut Ctx, elem: Word, lanes: u
     id
 }
 
-use crate::passes::air_calls::images::integer_shape;
-
-/// Whether this call's block extent comes from the explicit size operand rather than the implicit
-/// imageblock (= threadgroup) extent.
-///
-/// Metal's `imageblock_slice` carries a size and a validity flag; the flag says whether the size is
-/// the one to use. A flag that is neither constant leaves the choice to runtime, and the bounds gate
-/// -- the only reader that can express both answers at once -- selects per axis. Every reader that
-/// needs one answer takes the explicit operand, which is the one AIR bothered to compute.
-///
-/// This is the one derivation of that choice. It used to be spelled twice, and the copy in the
-/// bounds gate and the copy in the acceptance check are exactly the pair that has to agree.
-pub(in crate::passes) fn imageblock_region_is_explicit(ctx: &Ctx, args: &[Word]) -> bool {
-    let has_size_flag = value_def_instruction(ctx, args[2]).map(|def| def.class.opcode);
-    let explicit_size_def = value_def_instruction(ctx, args[4]).map(|def| def.class.opcode);
-    let explicit_usable = !matches!(explicit_size_def, Some(Op::Undef) | None);
-    explicit_usable && !matches!(has_size_flag, Some(Op::ConstantFalse))
-}
-
-/// The block extent in cells, when it is a compile-time constant.
-///
-/// `None` is a call whose extent only exists at runtime: a non-constant explicit size operand. The
-/// implicit extent is the whole imageblock, and the imageblock is `emitted_tile_cell_scale` cells
-/// per thread in each axis, so the implicit form is static whenever that scale is.
-pub(in crate::passes) fn static_imageblock_region(ctx: &Ctx, args: &[Word]) -> Option<[u32; 2]> {
-    if imageblock_region_is_explicit(ctx, args) {
-        return constant_uvec2_components(ctx, args[4]);
-    }
-    let scale = emitted_tile_cell_scale(ctx, *args.get(1)?)?;
-    Some([
-        ctx.kernel_local_size[0].checked_mul(scale)?,
-        ctx.kernel_local_size[1].checked_mul(scale)?,
-    ])
-}
-
-/// How many imageblock cells the emitter gave each thread in each axis, read back off the cell index
-/// it built.
-///
-/// The implicit block extent is the imageblock's, and whether that is the threadgroup extent or a
-/// multiple of it is a choice `infer_imageblock_cell_scale` made and the native emitter acted on.
-/// Re-deriving it here from `TransformOptions` would be a second derivation of the same fact, and it
-/// was wrong for every entry that stages a `k`x`k` block per thread -- it named a `1/k^2` corner of
-/// the block Metal copies. So recover what the emitter actually multiplied the threadgroup row
-/// stride by, exactly as [`imageblock_row_stride`] recovers the stride itself: an unscaled tile
-/// leaves the stride alone, a scaled one is `OpIMul` by a constant.
-fn emitted_tile_cell_scale(ctx: &Ctx, cell_pointer: Word) -> Option<u32> {
-    let (_, cell_index, _) = imageblock_cell_chain(ctx, cell_pointer).ok()?;
-    let Some(width) = imageblock_row_stride(ctx, cell_index) else {
-        // A single-row tile never multiplied, so no scale was applied to a stride that is not there.
-        return Some(1);
-    };
-    let def = value_def_instruction(ctx, width)?;
-    if def.class.opcode != Op::IMul {
-        return Some(1);
-    }
-    let Some(Operand::IdRef(scale)) = def.operands.get(1) else {
-        return None;
-    };
-    match value_def_instruction(ctx, *scale)?.operands.first() {
-        Some(Operand::LiteralBit32(literal)) => Some(*literal),
-        _ => None,
-    }
-}
-
-/// The imageblock-slice write copies a whole WxH block of cells to the texture; this translator
-/// emits a single `OpImageWrite` of the one cell the pointer names.
-///
-/// `gate_imageblock_region_in_bounds` already derives that region -- the explicit size operand when
-/// the has-size flag is set, otherwise the imageblock (= threadgroup) extent -- and uses it only to
-/// clip the write. The two derivations of "how much does this call write" disagreed: the gate said
-/// WxH and the write said one texel. The single-texel form is exact when, and only when, the region
-/// is one cell, so accept that shape and refuse the rest rather than write 1/(WxH) of the block.
-///
-/// Device-measured on `copyTexture` (four 2x2 tiles over a 4x4 texture): Metal returns the input
-/// byte for byte, the single-texel lowering leaves 12 of 16 texels untouched.
-fn imageblock_slice_region_is_one_texel(ctx: &Ctx, args: &[Word]) -> Result<(), String> {
-    match static_imageblock_region(ctx, args) {
-        // One cell, or a degenerate region the bounds gate already clips to nothing.
-        Some([width, height]) if width * height <= 1 => Ok(()),
-        Some([width, height]) => Err(format!(
-            "air.write_imageblock_slice_to_texture copies a {width}x{height} block of imageblock \
-             cells, and this translator stages one cell per invocation; emitting the module would \
-             write a single texel where Metal writes the block"
-        )),
-        None => Err(
-            "air.write_imageblock_slice_to_texture carries a runtime block extent, and this \
-             translator stages one cell per invocation; emitting the module would write a single \
-             texel where Metal writes the block"
-                .into(),
-        ),
-    }
-}
-
-/// The two components of a constant `<2 x i16>`/`<2 x i32>` region operand, when both are constant.
-pub(in crate::passes) fn constant_uvec2_components(ctx: &Ctx, value: Word) -> Option<[u32; 2]> {
-    let def = value_def_instruction(ctx, value)?;
+pub(in crate::passes) fn integer_shape(ctx: &Ctx, ty: Word) -> Option<(u32, u32)> {
+    let def = type_def_of(ctx, ty)?;
     match def.class.opcode {
-        Op::ConstantNull => Some([0, 0]),
-        Op::ConstantComposite => {
-            let mut out = [0u32; 2];
-            for (slot, operand) in out.iter_mut().zip(def.operands.iter()) {
-                let Operand::IdRef(component) = operand else {
-                    return None;
-                };
-                let component = value_def_instruction(ctx, *component)?;
-                match (component.class.opcode, component.operands.first()) {
-                    (Op::Constant, Some(Operand::LiteralBit32(literal))) => *slot = *literal,
-                    (Op::ConstantNull, _) => *slot = 0,
-                    _ => return None,
-                }
-            }
-            Some(out)
+        Op::TypeInt => {
+            let bits = match def.operands.first()? {
+                Operand::LiteralBit32(bits) => *bits,
+                _ => return None,
+            };
+            Some((bits, 1))
+        }
+        Op::TypeVector => {
+            let elem = match def.operands.first()? {
+                Operand::IdRef(elem) => *elem,
+                _ => return None,
+            };
+            let lanes = match def.operands.get(1)? {
+                Operand::LiteralBit32(lanes) => *lanes,
+                _ => return None,
+            };
+            let (bits, elem_lanes) = integer_shape(ctx, elem)?;
+            (elem_lanes == 1).then_some((bits, lanes))
         }
         _ => None,
     }
@@ -1545,7 +1059,6 @@ pub(in crate::passes) fn lower_imageblock_slice_write(
     if args.len() < 6 {
         return Err("air.write_imageblock_slice_to_texture missing operands".into());
     }
-    imageblock_slice_region_is_one_texel(ctx, args)?;
     let ptr_ty = value_result_type(ctx, args[1])
         .ok_or("air.write_imageblock_slice_to_texture pointer has no result type")?;
     let texel_ty = pointer_pointee_type(ctx, ptr_ty)
@@ -1589,7 +1102,7 @@ pub(in crate::passes) fn lower_imageblock_slice_write(
             Some(texel),
             vec![Operand::IdRef(retyped)],
         ));
-        return lower_imageblock_slice_write_texel(ctx, name, args, v4, texel, write_texel_ty, out);
+        return lower_imageblock_slice_write_texel(ctx, args, v4, texel, write_texel_ty, out);
     };
     let texel = ctx.module.fresh_id();
     let out = vec![Instruction::new(
@@ -1598,7 +1111,7 @@ pub(in crate::passes) fn lower_imageblock_slice_write(
         Some(texel),
         vec![Operand::IdRef(texel_ptr)],
     )];
-    lower_imageblock_slice_write_texel(ctx, name, args, v4, texel, write_texel_ty, out)
+    lower_imageblock_slice_write_texel(ctx, args, v4, texel, write_texel_ty, out)
 }
 
 /// Return the exact zero-offset aggregate-member path from `source` to `target`.
@@ -1631,7 +1144,6 @@ pub(in crate::passes) fn imageblock_zero_offset_subobject_path(
 
 pub(in crate::passes) fn lower_imageblock_slice_write_texel(
     ctx: &mut Ctx,
-    name: &str,
     args: &[Word],
     v4: Word,
     texel: Word,
@@ -1640,10 +1152,9 @@ pub(in crate::passes) fn lower_imageblock_slice_write_texel(
 ) -> Result<Vec<Instruction>, String> {
     let mut img = resolve_image_value(ctx, args[0]);
     if !image_is_storage(ctx, img) {
-        img = recovered_image_for_private_operand(ctx, img, name, ImageOperandUse::Storage)
-            .ok_or_else(|| {
-                format!("air.write_imageblock_slice_to_texture on non-storage image id {img}")
-            })?;
+        img = single_storage_image_for_private_write(ctx, img).ok_or_else(|| {
+            format!("air.write_imageblock_slice_to_texture on non-storage image id {img}")
+        })?;
     }
     ctx.require_runtime_storage_image_use(img, RuntimeStorageImageUse::Write)?;
     let (dim, arrayed) = ctx
@@ -1876,23 +1387,14 @@ struct ImageblockRegionGate {
     empty: Word,
 }
 
-/// Gate an `air.write_imageblock_slice_to_texture_*` store on the region it names, and report
-/// whether that region has a zero spatial extent.
-///
-/// This lowering emits one `OpImageWrite`, so the region it is asked about is one cell: a block copy
-/// has already been split into per-cell calls carrying a constant 1x1 region
-/// (`imageblock_block_copy`). The gate then says "is this texel inside the texture", and where it is
-/// not, ORs the write coordinate with all-ones so Vulkan's out-of-bounds store rule drops it.
-///
-/// **Metal clips such a write per texel; it does not discard the whole block.** Device-measured on
-/// `copyTexture` by the authored case `imageblock-slice-block-hangs-off-the-texture`: four 2x2 tiles
-/// over a 3x3 texture, three of whose blocks hang off an edge, and Metal writes all nine texels that
-/// fit. The claim this comment used to make -- that the whole implicit-region write is discarded --
-/// was never measured and is wrong.
-///
-/// A zero-area region keeps its destination coordinate and writes a transparent-zero texel. That is
-/// the one part of this still unmeasured: no corpus module names a statically zero region, and the
-/// runtime-extent calls that could reach one at runtime are refused before they get here.
+/// Gate an `air.write_imageblock_slice_to_texture_*` store on its destination region when the call
+/// uses the implicit imageblock extent, and report whether the region has a zero spatial extent. The
+/// implicit extent is the imageblock dimensions, which for a compute kernel are the threadgroup x/y
+/// dimensions. The Apple GPU discards the whole implicit-region write when that region extends past
+/// the texture bounds, so OR the write coordinate with all-ones in that case and let Vulkan's OOB
+/// store rule drop the single `OpImageWrite` this lowering emits. Explicit zero-area regions keep
+/// the destination coordinate and write a transparent-zero texel; explicit non-empty regions that
+/// extend past the texture bounds are discarded by the same out-of-bounds coordinate gate.
 fn gate_imageblock_region_in_bounds(
     ctx: &mut Ctx,
     args: &[Word],
@@ -1937,9 +1439,11 @@ fn gate_imageblock_region_in_bounds(
     // Block region size per axis: the explicit size operand when the has-size flag is set, else the
     // imageblock (= threadgroup) dimensions. A non-constant flag selects at runtime.
     let has_size_flag = value_def_instruction(ctx, args[2]).map(|def| def.class.opcode);
+    let explicit_size_def = value_def_instruction(ctx, args[4]).map(|def| def.class.opcode);
+    let explicit_usable = !matches!(explicit_size_def, Some(Op::Undef) | None);
     let local_size = ctx.kernel_local_size_ids();
     let implicit = [local_size[0], local_size[1]];
-    let explicit = if imageblock_region_is_explicit(ctx, args) {
+    let explicit = if explicit_usable && !matches!(has_size_flag, Some(Op::ConstantFalse)) {
         // args[4] is a `<2 x i16>` size; widen to uint2 and split into components.
         let src_ty = value_result_type(ctx, args[4])
             .ok_or("air.write_imageblock_slice_to_texture: size operand has no type")?;
@@ -2138,21 +1642,5 @@ pub(in crate::passes) fn pointer_pointee_type(ctx: &Ctx, ptr_ty: Word) -> Option
     match def.operands.get(1) {
         Some(Operand::IdRef(pointee)) => Some(*pointee),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    /// The bisected boundary of Metal's `fast::sin` / `fast::cos` flush, pinned as the arithmetic it
-    /// actually is. On an Apple M3 Max (macOS 26.5.2) `fast::cos(6588397.5)` still tracks
-    /// `precise::cos` and the next representable float answers exactly `0.0`; that boundary is the
-    /// float `pi/2` scaled by 2^22, i.e. the largest argument whose quadrant index fits in 22 bits.
-    #[test]
-    fn fast_trig_flush_threshold_is_the_last_evaluated_quadrant() {
-        let threshold = 6_588_397.5f32;
-        assert_eq!(threshold, std::f32::consts::FRAC_PI_2 * (1u32 << 22) as f32);
-        assert_eq!(threshold.to_bits(), 0x4AC9_0FDB);
-        // The first magnitude the hardware flushes is the very next float.
-        assert_eq!(f32::from_bits(0x4AC9_0FDC), 6_588_398.0);
     }
 }

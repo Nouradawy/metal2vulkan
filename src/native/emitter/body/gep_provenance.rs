@@ -725,7 +725,7 @@ impl Emitter {
             && base_storage == StorageClass::Workgroup
             && indices.len() >= 2
             && !matches!(&gep.base.value,
-                LlValue::Local(base_name) if self.is_raw_buffer_param(base_name));
+                LlValue::Local(base_name) if self.raw_buffer_params.contains(base_name));
         let logical_indices = entry_metadata_indices.as_ref().unwrap_or(&indices);
         let access_indices = if use_ptr_access_chain {
             logical_indices.clone()

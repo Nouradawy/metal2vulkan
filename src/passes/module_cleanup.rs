@@ -109,8 +109,172 @@ fn targets_any(instruction: &Instruction, removed: &HashSet<Word>) -> bool {
     matches!(instruction.operands.first(), Some(Operand::IdRef(id)) if removed.contains(id))
 }
 
+/// The types whose values are opaque descriptor handles: images, samplers, sampled images, and
+/// arrays of them. A pointer to one is NOT in the set — a pointer is an address, not a handle.
+fn opaque_handle_types(module: &Module) -> HashSet<Word> {
+    let mut handles = HashSet::new();
+    // A type is defined before any array of it, so one pass in module order closes the set.
+    for instruction in &module.types_global_values {
+        let Some(id) = instruction.result_id else {
+            continue;
+        };
+        let is_handle = match instruction.class.opcode {
+            Op::TypeImage | Op::TypeSampler | Op::TypeSampledImage => true,
+            Op::TypeArray | Op::TypeRuntimeArray => matches!(
+                instruction.operands.first(),
+                Some(Operand::IdRef(element)) if handles.contains(element)
+            ),
+            _ => false,
+        };
+        if is_handle {
+            handles.insert(id);
+        }
+    }
+    handles
+}
+
+/// Whether `instruction` only produces a handle value from its operands, so that deleting it when
+/// nothing reads the result changes no observable behavior.
+///
+/// A volatile load is the one `OpLoad` that is not pure.
+fn is_pure_handle_producer(instruction: &Instruction) -> bool {
+    match instruction.class.opcode {
+        Op::CopyObject | Op::SampledImage | Op::Image | Op::Phi | Op::Select => true,
+        Op::Load => !instruction.operands.iter().any(|operand| {
+            matches!(
+                operand,
+                Operand::MemoryAccess(access) if access.contains(spirv::MemoryAccess::VOLATILE)
+            )
+        }),
+        _ => false,
+    }
+}
+
+/// Delete the opaque-handle values nothing consumes, together with the `OpName`/`OpDecorate`
+/// records about them. Returns whether anything was removed.
+///
+/// Every `texture` and `sampler` parameter of an entry point becomes a `UniformConstant` variable
+/// that the entry prologue loads once. When the Metal function never samples, reads, or writes that
+/// parameter, the loaded handle has no consumer — yet the load is a reference to the variable, so
+/// the variable, its `DescriptorSet`/`Binding` decorations, and its entry-point interface entry
+/// all stay, and the module demands a descriptor the shader never touches. A consumer that builds
+/// its layout from the module then finds an unbound resource at that binding on every draw.
+///
+/// Liveness is transitive from the consumers, not "appears as an operand": a handle is live when
+/// something that is not itself a pure handle producer reads it (a sample, a store, a call
+/// argument), or when a live producer reads it. That
+/// collects a whole dead chain (`OpLoad` → `OpSampledImage` → `OpCopyObject`) and a dead phi cycle
+/// in one pass, so no fixed-point loop is needed. A debug name or decoration about a handle is not
+/// a consumer.
+///
+/// This is deliberately narrower than general dead-value elimination, which the pipeline does not
+/// perform: only values of opaque handle type are candidates, and only the pure producers of such
+/// values. Anything with an effect — a store, a call, an image read or write — is a consumer, and
+/// a handle it names stays live. It also covers the synthesized placeholder descriptors
+/// (`air.get_read_sampler()`, `air.get_null_texture_*()`) whose value nothing uses.
+fn drop_unconsumed_handle_values(module: &mut Module) -> bool {
+    let handle_types = opaque_handle_types(module);
+    if handle_types.is_empty() {
+        return false;
+    }
+    let is_candidate = |instruction: &Instruction| {
+        instruction.result_id.is_some()
+            && instruction
+                .result_type
+                .is_some_and(|ty| handle_types.contains(&ty))
+            && is_pure_handle_producer(instruction)
+    };
+    let id_operands = |instruction: &Instruction| {
+        instruction
+            .operands
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::IdRef(id) | Operand::IdScope(id) | Operand::IdMemorySemantics(id) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    // Candidate result id -> the ids it reads.
+    let mut producers: HashMap<Word, Vec<Word>> = HashMap::new();
+    let mut pending: Vec<Word> = Vec::new();
+    for function in &module.functions {
+        for instruction in function.all_inst_iter() {
+            match instruction.result_id {
+                Some(result) if is_candidate(instruction) => {
+                    producers.insert(result, id_operands(instruction));
+                }
+                _ => pending.extend(id_operands(instruction)),
+            }
+        }
+    }
+    if producers.is_empty() {
+        return false;
+    }
+    // Module-scope consumers (initializers, spec-constant operations, the entry interface,
+    // execution modes). Debug names and decoration targets are not consumers; the extra operands
+    // of a decoration (`OpDecorateId`) can be real references, so those count.
+    for section in [
+        &module.entry_points,
+        &module.execution_modes,
+        &module.debug_string_source,
+        &module.debug_module_processed,
+        &module.types_global_values,
+    ] {
+        for instruction in section {
+            pending.extend(id_operands(instruction));
+        }
+    }
+    for instruction in &module.annotations {
+        pending.extend(id_operands(instruction).into_iter().skip(1));
+    }
+
+    let mut live = HashSet::new();
+    while let Some(id) = pending.pop() {
+        if !live.insert(id) {
+            continue;
+        }
+        if let Some(reads) = producers.get(&id) {
+            pending.extend(reads.iter().copied().filter(|read| !live.contains(read)));
+        }
+    }
+
+    let removed = producers
+        .keys()
+        .copied()
+        .filter(|id| !live.contains(id))
+        .collect::<HashSet<_>>();
+    if removed.is_empty() {
+        return false;
+    }
+    for function in &mut module.functions {
+        for block in &mut function.blocks {
+            block.instructions.retain(|instruction| {
+                !(is_candidate(instruction)
+                    && instruction
+                        .result_id
+                        .is_some_and(|id| removed.contains(&id)))
+            });
+        }
+    }
+    module
+        .annotations
+        .retain(|instruction| !targets_any(instruction, &removed));
+    module
+        .debug_names
+        .retain(|instruction| !targets_any(instruction, &removed));
+    true
+}
+
 /// Drop every global `OpVariable` no instruction references, together with its entry-point interface
 /// entry, its decorations, and its debug names. Returns whether anything was removed.
+///
+/// A descriptor variable is referenced by the entry prologue's `OpLoad` even when nothing consumes
+/// the loaded handle, so the rule first retracts the handle values nothing consumes
+/// ([`drop_unconsumed_handle_values`]); only then is "no instruction references it" true of a
+/// texture or sampler parameter the shader never uses.
 ///
 /// `finalize` applies this rule once, against the bodies as they stand when it builds the entry
 /// point. Instruction-deleting work runs after it at two boundaries — the pointer and access-chain
@@ -129,8 +293,8 @@ pub(crate) fn drop_unreferenced_global_variables(module: &mut Module) -> bool {
     /// `OpEntryPoint` operands: execution model, entry function id, name, then the interface ids.
     const INTERFACE_START: usize = 3;
 
+    let mut changed = drop_unconsumed_handle_values(module);
     let referenced = function_referenced_ids(module);
-    let mut changed = false;
     for entry_point in &mut module.entry_points {
         let before = entry_point.operands.len();
         entry_point.operands = std::mem::take(&mut entry_point.operands)
@@ -181,24 +345,6 @@ pub(crate) fn drop_dangling_debug(module: &mut Module) {
     module.annotations.retain(&keep);
 }
 
-/// Decorations that only DESCRIBE the explicit memory layout of the declaration they name. They are
-/// metadata owned by their target, not an independent reason for it to exist, so `gc_dead_globals`
-/// does not root liveness at them.
-///
-/// This is an allowlist on purpose. Most decorations do give their target a module-level role that
-/// nothing else records -- `BuiltIn WorkgroupSize` on an otherwise unreferenced constant is the
-/// local-size declaration, `SpecId` is the specialization contract -- and treating every decoration
-/// as description broke 9,857 of the 14,579 corpus sources on exactly that constant.
-const LAYOUT_DECORATIONS: &[spirv::Decoration] = &[
-    spirv::Decoration::ArrayStride,
-    spirv::Decoration::Block,
-    spirv::Decoration::BufferBlock,
-    spirv::Decoration::ColMajor,
-    spirv::Decoration::MatrixStride,
-    spirv::Decoration::Offset,
-    spirv::Decoration::RowMajor,
-];
-
 /// Iteratively drop types/global-values whose result id is referenced nowhere else in the module
 /// (instruction operands, result-types, decorations, entry-point interface, function bodies). Keeps
 /// variables referenced by the entry interface. Repeats to a fixpoint so chains die cleanly.
@@ -233,15 +379,12 @@ pub(super) fn gc_dead_globals(ctx: &mut Ctx) {
         }
     }
     for instruction in &ctx.module.annotations {
-        // A layout decoration describes its target; it does not use it. Rooting liveness at the
-        // target lets a `Block`/`Offset`-decorated struct keep itself, and every member type it
-        // names, alive on the strength of its own description, and lets an `ArrayStride`-decorated
-        // physical pointer retain a capability-requiring declaration in a Logical module. The
-        // decoration operand sits at a different position on `OpDecorate` than on
-        // `OpMemberDecorate`, so look for it anywhere in the instruction.
-        if instruction.operands.iter().any(|operand| {
-            matches!(operand, Operand::Decoration(decoration) if LAYOUT_DECORATIONS.contains(decoration))
-        }) {
+        // ArrayStride is metadata owned by its target type, not an independent liveness root. A
+        // late BDA candidate can leave a decorated physical pointer type after its executable
+        // address path is eliminated; rooting the type from this decoration would retain an
+        // otherwise-dead capability-requiring declaration in a Logical module.
+        if instruction.operands.get(1) == Some(&Operand::Decoration(spirv::Decoration::ArrayStride))
+        {
             continue;
         }
         collect(instruction, &mut live);
@@ -289,248 +432,27 @@ pub(super) fn gc_dead_globals(ctx: &mut Ctx) {
     drop_dangling_debug(&mut ctx.module);
 }
 
-/// Remove every `OpCapability Int8`/`Int16`/`Int64`/`Float16`/`Float64` whose scalar type does not
-/// survive (i.e. is used nowhere after access-chain narrowing + dead-global gc).
-///
-/// Leaving a capability whose feature is unused is legal for spirv-val, but it is not free. It is
-/// what cues NVIDIA's compiler down the 64-bit path that crashes, and every one of these is a
-/// Vulkan device feature -- `shaderInt8`, `shaderInt16`, `shaderFloat16`, `shaderFloat64` -- so a
-/// module that declares one it never uses refuses to load on hardware that would otherwise have run
-/// it. **Measured before this generalized past `Int64`: 656 of the 14,579 corpus sources declared a
-/// width capability with no type of that width -- 591 `Int8`, 32 `Float16`, 29 `Int16`.**
-///
-/// The width->capability table is `native::scalar_width_capability`, the same one the owned-module
-/// check reads in the opposite direction to REFUSE a module that declares such a type without the
-/// capability. If genuine narrow math remains the type is still present, so the capability stays
-/// (and `add_needed_capabilities` would re-add it).
-pub(crate) fn drop_unused_scalar_width_capabilities(module: &mut Module) {
-    let used: HashSet<spirv::Capability> = module
-        .types_global_values
-        .iter()
-        .filter(|i| matches!(i.class.opcode, Op::TypeInt | Op::TypeFloat))
-        .filter_map(|i| match i.operands.first() {
-            Some(&Operand::LiteralBit32(width)) => {
-                crate::native::scalar_width_capability(i.class.opcode, width)
-            }
-            _ => None,
-        })
-        .collect();
-    module.capabilities.retain(|c| match c.operands.first() {
-        Some(&Operand::Capability(capability)) => {
-            !matches!(
-                capability,
-                spirv::Capability::Int8
-                    | spirv::Capability::Int16
-                    | spirv::Capability::Int64
-                    | spirv::Capability::Float16
-                    | spirv::Capability::Float64
-            ) || used.contains(&capability)
-        }
-        _ => true,
+/// Remove `OpCapability Int64` when no `OpTypeInt 64` survives (i.e. no genuine 64-bit-int type is
+/// used anywhere after access-chain narrowing + dead-global gc). Leaving a capability whose feature is
+/// unused is legal for spirv-val, but the Int64 declaration is what cues NVIDIA's compiler down the
+/// 64-bit path that crashes; dropping it keeps the module strictly 32-bit. If genuine i64 math remains
+/// the type is still present and we leave the capability (and `add_needed_capabilities` would re-add it).
+pub(super) fn drop_unused_int64_capability(ctx: &mut Ctx) {
+    let has_int64_type = ctx.module.types_global_values.iter().any(|i| {
+        i.class.opcode == Op::TypeInt && i.operands.first() == Some(&Operand::LiteralBit32(64))
     });
-}
-
-/// Capabilities whose ENTIRE requirement is expressed in the SPIR-V grammar: each one is enabling
-/// for a fixed set of opcodes or enumerants and nothing else, so "no instruction and no operand in
-/// the finished module names it" is a proof that it is unused.
-///
-/// This is deliberately an ALLOWLIST rather than the complement of a blocklist. Plenty of
-/// capabilities are demanded by validation RULES the grammar cannot see -- `VariablePointers` by a
-/// pointer reaching an `OpPhi`, `StorageBuffer8BitAccess` by a narrow type landing in a block,
-/// `StorageImageWriteWithoutFormat` by an `Unknown` format being written -- and for those the
-/// grammar's silence means nothing. Getting this list short is safe (a capability we could have
-/// dropped survives); getting it wrong in the other direction would emit a module that does not
-/// validate. `VariablePointers`/`VariablePointersStorageBuffer` are excluded on purpose:
-/// `drop_unused_variable_pointer_capabilities` computes them from the rule that actually governs
-/// them. So are `Image1D`/`ImageBuffer`/`Sampled1D`/`SampledBuffer`: the grammar attaches those to
-/// the `Dim` enumerant of `OpTypeImage`, but the validator demands them to ACCESS such an image
-/// ("Capability ImageBuffer is required to access storage image"), and a module can reach an image
-/// whose type it did not spell. Dropping them broke 9 of the 14,579 corpus sources, measured;
-/// `add_needed_capabilities` computes those from the finished module already.
-const GRAMMAR_COMPLETE_CAPABILITIES: &[spirv::Capability] = &[
-    spirv::Capability::DemoteToHelperInvocation,
-    spirv::Capability::FloatControls2,
-    spirv::Capability::GroupNonUniformArithmetic,
-    spirv::Capability::GroupNonUniformBallot,
-    spirv::Capability::GroupNonUniformClustered,
-    spirv::Capability::GroupNonUniformQuad,
-    spirv::Capability::GroupNonUniformShuffle,
-    spirv::Capability::GroupNonUniformShuffleRelative,
-    spirv::Capability::GroupNonUniformVote,
-    spirv::Capability::ImageQuery,
-    spirv::Capability::StorageImageExtendedFormats,
-];
-
-/// Remove an `OpTypeInt`/`OpTypeFloat` no instruction references, so
-/// [`drop_unused_scalar_width_capabilities`] sees the widths the module actually uses.
-///
-/// A dead scalar type is not free: the width drop keys on the type EXISTING, so one that survives
-/// keeps its capability, and with it the Vulkan device feature. **Measured: 30 of the 14,579 corpus
-/// sources declared `Int64` (22) or `Int16` (8) purely through a type no instruction touched** --
-/// and a declared-but-unused `Int64` is the exact thing that dropper's comment says cues NVIDIA's
-/// compiler down the 64-bit path that crashes.
-///
-/// `gc_dead_globals` does not reach these because it runs before CFG construction deletes the last
-/// user. Its own carve-out covers layout decorations (`LAYOUT_DECORATIONS`), which is what stops a
-/// `Block`/`Offset`-decorated struct keeping its member types alive on the strength of its own
-/// description; this pass is the late sweep for what dies afterwards.
-pub(crate) fn drop_unreferenced_scalar_types(module: &mut Module) {
-    let scalars: HashSet<Word> = module
-        .types_global_values
-        .iter()
-        .filter(|instruction| matches!(instruction.class.opcode, Op::TypeInt | Op::TypeFloat))
-        .filter_map(|instruction| instruction.result_id)
-        .collect();
-    if scalars.is_empty() {
+    if has_int64_type {
         return;
     }
-    let mut referenced: HashSet<Word> = HashSet::new();
-    for instruction in module.all_inst_iter() {
-        // A name or a decoration describes a type; it does not use one.
-        if matches!(
-            instruction.class.opcode,
-            Op::Name | Op::MemberName | Op::Decorate | Op::MemberDecorate | Op::DecorateId
-        ) {
-            continue;
-        }
-        referenced.extend(instruction.result_type.filter(|ty| scalars.contains(ty)));
-        for operand in &instruction.operands {
-            if let Operand::IdRef(id) = operand {
-                if scalars.contains(id) && instruction.result_id != Some(*id) {
-                    referenced.insert(*id);
-                }
-            }
-        }
-    }
-    module.types_global_values.retain(|instruction| {
-        instruction
-            .result_id
-            .is_none_or(|id| !scalars.contains(&id) || referenced.contains(&id))
+    ctx.module.capabilities.retain(|c| {
+        !matches!(
+            c.operands.first(),
+            Some(Operand::Capability(spirv::Capability::Int64))
+        )
     });
-    drop_dangling_debug(module);
-}
-
-/// Drop an allowlisted capability that nothing in the finished module requires.
-///
-/// The same shape as `drop_unused_scalar_width_capabilities` and for the same reason: a capability
-/// is requested where the need is PREDICTED -- by the emitter, or by an earlier phase -- and a later
-/// phase can delete the thing that needed it. `add_needed_capabilities` already computes several of
-/// these exact predicates from the finished module and uses each in the ADD direction only, so a
-/// folded-away `OpDemoteToHelperInvocation` left its capability behind.
-///
-/// The requirement is read from the grammar rather than restated, so there is no second table to
-/// drift: an instruction's own capabilities, every operand enumerant's, and the scalar-width one.
-/// A kept capability's transitive prerequisites are kept with it.
-///
-/// **Measured before this existed: 118 of the 14,579 corpus sources declared a capability nothing in
-/// the module asked for** -- 56 `DemoteToHelperInvocation`, 40 `ImageQuery`, 27 `FloatControls2`,
-/// 13 `GroupNonUniform*`, 9 `StorageImageExtendedFormats`, 9 `Image1D`, 1 `ImageBuffer`, plus the
-/// variable-pointer rows below.
-///
-/// `VariablePointers`/`VariablePointersStorageBuffer` cannot join the allowlist because the grammar
-/// does not encode their need: what asks for them is a POINTER-TYPED `OpPhi`/`OpSelect`/
-/// `OpPtrAccessChain`, and the grammar attaches nothing to those opcodes. They get their own
-/// predicate here instead, recomputed from the finished module, because the pipeline computes the
-/// requirement once and reapplies the SNAPSHOT afterwards -- so a pass that deleted the last pointer
-/// merge left the capability behind. **Measured: 1 of the 14,579 corpus sources.** A stale
-/// declaration is legal SPIR-V, but it demands the strictly stronger `variablePointers` feature of
-/// every consumer and cues native drivers down a variable-pointer compiler path.
-pub(crate) fn drop_unrequired_capabilities(module: &mut Module) {
-    let mut required: HashSet<spirv::Capability> = HashSet::new();
-    let mut required_extensions: HashSet<&'static str> = HashSet::new();
-    for instruction in module.all_inst_iter() {
-        // A DECLARATION is not a use. `OpCapability X` carries `Operand::Capability(X)`, whose
-        // grammar entry names the extension that enables X -- so counting it here would let every
-        // declaration justify its own extension, and nothing would ever be dropped.
-        if matches!(instruction.class.opcode, Op::Capability | Op::Extension) {
-            continue;
-        }
-        if let Some((capabilities, extensions)) =
-            crate::spirv_binary::instruction_declaration_requirements(instruction.class.opcode)
-        {
-            required.extend(capabilities.iter().copied());
-            required_extensions.extend(extensions.iter().copied());
-        }
-        for operand in &instruction.operands {
-            for requirement in crate::spirv_binary::operand_declaration_requirements(operand) {
-                required.extend(requirement.capabilities.iter().copied());
-                required_extensions.extend(requirement.extensions.iter().copied());
-            }
-        }
-        if let (Op::TypeInt | Op::TypeFloat, Some(&Operand::LiteralBit32(width))) =
-            (instruction.class.opcode, instruction.operands.first())
-        {
-            required.extend(crate::native::scalar_width_capability(
-                instruction.class.opcode,
-                width,
-            ));
-        }
-    }
-    // A capability that survives keeps whatever it is built on, however deep.
-    let mut frontier: Vec<spirv::Capability> = module
-        .capabilities
-        .iter()
-        .filter_map(|instruction| match instruction.operands.first() {
-            Some(&Operand::Capability(capability)) => Some(capability),
-            _ => None,
-        })
-        .filter(|capability| {
-            !GRAMMAR_COMPLETE_CAPABILITIES.contains(capability) || required.contains(capability)
-        })
-        .collect();
-    while let Some(capability) = frontier.pop() {
-        for requirement in
-            crate::spirv_binary::operand_declaration_requirements(&Operand::Capability(capability))
-        {
-            // A lone prerequisite is implied. Several are enabling alternatives, and the module
-            // already chose one by declaring it, so they are not prerequisites of this one.
-            if let [prerequisite] = requirement.capabilities {
-                if required.insert(*prerequisite) {
-                    frontier.push(*prerequisite);
-                }
-            }
-            required_extensions.extend(requirement.extensions.iter().copied());
-        }
-    }
-    let (needs_storage_buffer_pointers, needs_other_pointers) =
-        crate::spirv_variable_ptr::variable_pointer_requirement(module);
-    module
-        .capabilities
-        .retain(|instruction| match instruction.operands.first() {
-            Some(&Operand::Capability(spirv::Capability::VariablePointersStorageBuffer)) => {
-                needs_storage_buffer_pointers || needs_other_pointers
-            }
-            Some(&Operand::Capability(spirv::Capability::VariablePointers)) => needs_other_pointers,
-            Some(&Operand::Capability(capability)) => {
-                !GRAMMAR_COMPLETE_CAPABILITIES.contains(&capability)
-                    || required.contains(&capability)
-            }
-            _ => true,
-        });
-    // Dropping a capability strands whatever `OpExtension` existed only to enable it, and an
-    // unused extension is the same demand on the driver the capability was. Only extensions an
-    // allowlisted capability can ask for are candidates, so an extension a validation rule
-    // demands -- which the grammar cannot see -- is never a candidate.
-    let droppable_extensions: HashSet<&'static str> = GRAMMAR_COMPLETE_CAPABILITIES
-        .iter()
-        .flat_map(|capability| {
-            crate::spirv_binary::operand_declaration_requirements(&Operand::Capability(*capability))
-        })
-        .flat_map(|requirement| requirement.extensions.iter().copied())
-        .collect();
-    module
-        .extensions
-        .retain(|instruction| match instruction.operands.first() {
-            Some(Operand::LiteralString(extension)) => {
-                !droppable_extensions.contains(extension.as_str())
-                    || required_extensions.contains(extension.as_str())
-            }
-            _ => true,
-        });
 }
 
 pub(super) fn drop_unused_variable_pointer_capabilities(ctx: &mut Ctx) -> (bool, bool) {
-    crate::spirv_variable_ptr::lower_storage_buffer_pointer_phis(&mut ctx.module);
     crate::spirv_variable_ptr::lower_zero_base_storage_buffer_ptr_access_chains(&mut ctx.module);
     crate::spirv_variable_ptr::rewrite_storage_buffer_atomic_scopes(&mut ctx.module);
     let (needs_storage_buffer, needs_other) = needed_variable_pointer_capabilities(ctx);
@@ -567,30 +489,32 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
     if has_demote {
         want.push(Capability::DemoteToHelperInvocation);
     }
-    // `Sampled1D`/`SampledBuffer` cover a SAMPLED image of that dimensionality; `Image1D`/
-    // `ImageBuffer` cover a storage one. They are separate capabilities, so a module holding only a
-    // storage image of that shape needs only the storage one. Asking for the sampled capability
-    // beside it asks the consumer for something the module cannot do.
-    //
-    // The storage arm always read operand 5 -- `Sampled`, where 2 means "used without a sampler" --
-    // and the sampled arm never did, so a `texture1d<..., access::write>` claimed both.
-    let image_dim = |dim: Dim, storage: bool| {
-        ctx.module.types_global_values.iter().any(|i| {
-            i.class.opcode == Op::TypeImage
-                && i.operands.get(1) == Some(&Operand::Dim(dim))
-                && (i.operands.get(5) == Some(&Operand::LiteralBit32(2))) == storage
-        })
-    };
-    if image_dim(Dim::Dim1D, false) {
+    let has_sampled_1d = ctx.module.types_global_values.iter().any(|i| {
+        i.class.opcode == Op::TypeImage && i.operands.get(1) == Some(&Operand::Dim(Dim::Dim1D))
+    });
+    let has_storage_1d = ctx.module.types_global_values.iter().any(|i| {
+        i.class.opcode == Op::TypeImage
+            && i.operands.get(1) == Some(&Operand::Dim(Dim::Dim1D))
+            && i.operands.get(5) == Some(&Operand::LiteralBit32(2))
+    });
+    if has_sampled_1d {
         want.push(Capability::Sampled1D);
     }
-    if image_dim(Dim::Dim1D, true) {
+    if has_storage_1d {
         want.push(Capability::Image1D);
     }
-    if image_dim(Dim::DimBuffer, false) {
+    let has_buffer_image = ctx.module.types_global_values.iter().any(|i| {
+        i.class.opcode == Op::TypeImage && i.operands.get(1) == Some(&Operand::Dim(Dim::DimBuffer))
+    });
+    let has_storage_buffer_image = ctx.module.types_global_values.iter().any(|i| {
+        i.class.opcode == Op::TypeImage
+            && i.operands.get(1) == Some(&Operand::Dim(Dim::DimBuffer))
+            && i.operands.get(5) == Some(&Operand::LiteralBit32(2))
+    });
+    if has_buffer_image {
         want.push(Capability::SampledBuffer);
     }
-    if image_dim(Dim::DimBuffer, true) {
+    if has_storage_buffer_image {
         want.push(Capability::ImageBuffer);
     }
     let has_input_attachment_type = ctx.module.types_global_values.iter().any(|i| {
@@ -618,6 +542,26 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
             }
         }
     }
+    let has_draw_parameters = ctx.module.annotations.iter().any(|instruction| {
+        instruction.class.opcode == Op::Decorate
+            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
+            && matches!(
+                instruction.operands.get(2),
+                Some(&Operand::BuiltIn(
+                    BuiltIn::BaseInstance | BuiltIn::BaseVertex
+                ))
+            )
+    });
+    if has_draw_parameters {
+        // Core since SPIR-V 1.3; below it the capability needs SPV_KHR_shader_draw_parameters.
+        want.push(Capability::DrawParameters);
+        if let Some(header) = ctx.module.header.as_mut() {
+            let version = header.version();
+            if version < (1, 3) {
+                header.set_version(1, 3);
+            }
+        }
+    }
     let has_layer = ctx.module.annotations.iter().any(|instruction| {
         instruction.class.opcode == Op::Decorate
             && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
@@ -632,16 +576,6 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
             }
         }
     }
-    // `ViewIndex` is `[[amplification_id]]`: the view a multiview pass is rasterizing. The
-    // capability is core since SPIR-V 1.3, which every module this translator emits already is.
-    let has_view_index = ctx.module.annotations.iter().any(|instruction| {
-        instruction.class.opcode == Op::Decorate
-            && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
-            && instruction.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::ViewIndex))
-    });
-    if has_view_index {
-        want.push(Capability::MultiView);
-    }
     let has_clip_distance = ctx.module.annotations.iter().any(|instruction| {
         instruction.class.opcode == Op::Decorate
             && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
@@ -655,33 +589,8 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
             && instruction.operands.get(1) == Some(&Operand::Decoration(Decoration::BuiltIn))
             && instruction.operands.get(2) == Some(&Operand::BuiltIn(BuiltIn::PrimitiveId))
     });
-    // `PrimitiveId` is enabled by ANY of `Geometry`, `Tessellation`, `RayTracingKHR` or
-    // `MeshShadingEXT`. That is a disjunction, and choosing `Geometry` from it was the worst
-    // available answer twice over.
-    //
-    // A tessellation-evaluation entry already declares `Tessellation` above, so for 226 of the 236
-    // corpus modules that carried `Geometry` the requirement was ALREADY satisfied and the
-    // declaration bought nothing. What it cost is that Vulkan reads a declared capability as a
-    // demand: the consumer must enable `geometryShader`, and no Metal-backed implementation has one
-    // -- Metal has no geometry stage at all. Every one of those modules was unloadable on the very
-    // platform this translator targets, for a capability nothing in it uses.
-    //
-    // The remaining 10 are fragment entries reading `[[primitive_id]]`, where one disjunct does
-    // have to be declared. Neither `Geometry` nor `Tessellation` describes a fragment shader, so
-    // the choice is not between a right answer and a wrong one; it is between a disjunct every
-    // Metal-backed implementation supports and one none of them does.
-    if has_primitive_id
-        && !want.iter().any(|capability| {
-            matches!(
-                capability,
-                Capability::Geometry
-                    | Capability::Tessellation
-                    | Capability::RayTracingKHR
-                    | Capability::MeshShadingEXT
-            )
-        })
-    {
-        want.push(Capability::Tessellation);
+    if has_primitive_id {
+        want.push(Capability::Geometry);
     }
     let has_sample_id = ctx.module.annotations.iter().any(|instruction| {
         instruction.class.opcode == Op::Decorate
@@ -867,24 +776,13 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
                     | Op::GroupNonUniformBitwiseOr
                     | Op::GroupNonUniformBitwiseXor
             )
-            // These opcodes take their capability from the GROUP OPERATION, not from the opcode:
-            // `Reduce`/`InclusiveScan`/`ExclusiveScan` need `GroupNonUniformArithmetic`, and
-            // `ClusteredReduce` needs `GroupNonUniformClustered` instead. Every `air.simd_*`
-            // whole-simdgroup reduction emits the clustered form, so keying on the opcode alone
-            // demanded arithmetic subgroup support of 244 corpus modules that use none.
-            && !i.operands.iter().any(|o| {
-                matches!(
-                    o,
-                    Operand::GroupOperation(spirv::GroupOperation::ClusteredReduce)
-                )
-            })
         });
     if has_group_arithmetic {
         want.push(Capability::GroupNonUniform);
         want.push(Capability::GroupNonUniformArithmetic);
     }
-    // A `ClusteredReduce` group operation (emitted by every `air.simd_*` whole-simdgroup
-    // reduction) additionally needs the `GroupNonUniformClustered` capability.
+    // A `ClusteredReduce` group operation (emitted by the M-D2 `TransformOptions::simd_cluster32`
+    // simd lowering) additionally needs the `GroupNonUniformClustered` capability.
     let has_clustered_reduce = ctx
         .module
         .functions
@@ -972,44 +870,6 @@ pub(super) fn add_needed_capabilities(ctx: &mut Ctx, variable_pointer_requiremen
     if want.contains(&Capability::StencilExportEXT) {
         let ext = "SPV_EXT_shader_stencil_export";
         require_extension(ctx, ext);
-        // `StencilRefReplacingEXT` is to `FragStencilRefEXT` what `DepthReplacing` is to
-        // `FragDepth`: the declaration that this fragment shader replaces the value, without which
-        // a driver is entitled to keep the pipeline's. spirv-val does not demand it, so nothing
-        // caught its absence; glslang emits it for `gl_FragStencilRefARB` alongside exactly the
-        // capability and extension above, which is the answer this matches.
-        let entry_points: Vec<Word> = ctx
-            .module
-            .entry_points
-            .iter()
-            .filter(|instruction| {
-                instruction.operands.first()
-                    == Some(&Operand::ExecutionModel(spirv::ExecutionModel::Fragment))
-            })
-            .filter_map(|instruction| match instruction.operands.get(1) {
-                Some(&Operand::IdRef(entry)) => Some(entry),
-                _ => None,
-            })
-            .collect();
-        for entry in entry_points {
-            let declared = ctx.module.execution_modes.iter().any(|instruction| {
-                instruction.operands.as_slice()
-                    == [
-                        Operand::IdRef(entry),
-                        Operand::ExecutionMode(spirv::ExecutionMode::StencilRefReplacingEXT),
-                    ]
-            });
-            if !declared {
-                ctx.module.execution_modes.push(Instruction::new(
-                    Op::ExecutionMode,
-                    None,
-                    None,
-                    vec![
-                        Operand::IdRef(entry),
-                        Operand::ExecutionMode(spirv::ExecutionMode::StencilRefReplacingEXT),
-                    ],
-                ));
-            }
-        }
     }
 }
 
@@ -1018,351 +878,6 @@ mod tests {
     use super::*;
     use crate::spirv_module::Module;
     use crate::spirv_module::ModuleHeader;
-
-    /// A fragment module carrying `OpCapability DemoteToHelperInvocation` and its extension, with
-    /// `body` for the entry's only block.
-    fn module_with_demote_declared(body: Vec<Instruction>) -> Module {
-        use crate::spirv_module::{Block, Function};
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(10));
-        module.capabilities = vec![
-            Instruction::new(
-                Op::Capability,
-                None,
-                None,
-                vec![Operand::Capability(spirv::Capability::Shader)],
-            ),
-            Instruction::new(
-                Op::Capability,
-                None,
-                None,
-                vec![Operand::Capability(
-                    spirv::Capability::DemoteToHelperInvocation,
-                )],
-            ),
-        ];
-        module.extensions = vec![Instruction::new(
-            Op::Extension,
-            None,
-            None,
-            vec![Operand::LiteralString(
-                "SPV_EXT_demote_to_helper_invocation".to_string(),
-            )],
-        )];
-        module.types_global_values = vec![
-            Instruction::new(Op::TypeVoid, None, Some(1), vec![]),
-            Instruction::new(Op::TypeFunction, None, Some(2), vec![Operand::IdRef(1)]),
-            Instruction::new(Op::TypeBool, None, Some(3), vec![]),
-        ];
-        let mut instructions = body;
-        instructions.push(Instruction::new(Op::Return, None, None, vec![]));
-        module.functions = vec![Function {
-            def: Some(Instruction::new(
-                Op::Function,
-                Some(1),
-                Some(4),
-                vec![
-                    Operand::FunctionControl(spirv::FunctionControl::NONE),
-                    Operand::IdRef(2),
-                ],
-            )),
-            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-            parameters: vec![],
-            blocks: vec![Block {
-                label: Some(Instruction::new(Op::Label, None, Some(5), vec![])),
-                instructions,
-            }],
-        }];
-        module
-    }
-
-    fn declares(module: &Module, capability: spirv::Capability) -> bool {
-        module.capabilities.iter().any(|instruction| {
-            instruction.operands.first() == Some(&Operand::Capability(capability))
-        })
-    }
-
-    fn declares_extension(module: &Module, extension: &str) -> bool {
-        module.extensions.iter().any(|instruction| {
-            matches!(instruction.operands.first(), Some(Operand::LiteralString(name)) if name == extension)
-        })
-    }
-
-    /// A module declaring `Int64` plus an `OpTypeInt 64`, with `body` for the entry's only block.
-    fn module_with_int64_declared(body: Vec<Instruction>) -> Module {
-        use crate::spirv_module::{Block, Function};
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(10));
-        module.capabilities = vec![
-            Instruction::new(
-                Op::Capability,
-                None,
-                None,
-                vec![Operand::Capability(spirv::Capability::Shader)],
-            ),
-            Instruction::new(
-                Op::Capability,
-                None,
-                None,
-                vec![Operand::Capability(spirv::Capability::Int64)],
-            ),
-        ];
-        module.types_global_values = vec![
-            Instruction::new(Op::TypeVoid, None, Some(1), vec![]),
-            Instruction::new(Op::TypeFunction, None, Some(2), vec![Operand::IdRef(1)]),
-            Instruction::new(
-                Op::TypeInt,
-                None,
-                Some(3),
-                vec![Operand::LiteralBit32(64), Operand::LiteralBit32(0)],
-            ),
-        ];
-        // The kind of description that keeps a type alive through `gc_dead_globals` without
-        // anything using it.
-        module.debug_names = vec![Instruction::new(
-            Op::Name,
-            None,
-            None,
-            vec![
-                Operand::IdRef(3),
-                Operand::LiteralString("ulong".to_string()),
-            ],
-        )];
-        let mut instructions = body;
-        instructions.push(Instruction::new(Op::Return, None, None, vec![]));
-        module.functions = vec![Function {
-            def: Some(Instruction::new(
-                Op::Function,
-                Some(1),
-                Some(4),
-                vec![
-                    Operand::FunctionControl(spirv::FunctionControl::NONE),
-                    Operand::IdRef(2),
-                ],
-            )),
-            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-            parameters: vec![],
-            blocks: vec![Block {
-                label: Some(Instruction::new(Op::Label, None, Some(5), vec![])),
-                instructions,
-            }],
-        }];
-        module
-    }
-
-    fn declares_type(module: &Module, opcode: Op, width: u32) -> bool {
-        module.types_global_values.iter().any(|instruction| {
-            instruction.class.opcode == opcode
-                && instruction.operands.first() == Some(&Operand::LiteralBit32(width))
-        })
-    }
-
-    /// The scalar type is named but never used, so it goes -- and the capability it was the only
-    /// evidence for goes with it. Before the late pass existed, 30 of the 14,579 corpus sources
-    /// shipped `Int64` or `Int16` on exactly this basis: CFG construction deleted the last user
-    /// after `gc_dead_globals` had already run.
-    #[test]
-    fn a_scalar_type_nothing_uses_takes_its_capability_with_it() {
-        let mut module = module_with_int64_declared(vec![]);
-
-        drop_unreferenced_scalar_types(&mut module);
-        drop_unused_scalar_width_capabilities(&mut module);
-
-        assert!(!declares_type(&module, Op::TypeInt, 64));
-        assert!(!declares(&module, spirv::Capability::Int64));
-        assert!(
-            module.debug_names.is_empty(),
-            "the name that described it goes too"
-        );
-    }
-
-    /// The control: one instruction whose RESULT TYPE is the scalar keeps both.
-    #[test]
-    fn a_scalar_type_an_instruction_results_in_is_kept() {
-        let mut module =
-            module_with_int64_declared(vec![Instruction::new(Op::Undef, Some(3), Some(6), vec![])]);
-
-        drop_unreferenced_scalar_types(&mut module);
-        drop_unused_scalar_width_capabilities(&mut module);
-
-        assert!(declares_type(&module, Op::TypeInt, 64));
-        assert!(declares(&module, spirv::Capability::Int64));
-    }
-
-    /// Nothing in the module demotes, so neither the capability nor the extension that exists only
-    /// to enable it survives.
-    #[test]
-    fn a_capability_no_instruction_requires_is_dropped_with_its_extension() {
-        let mut module = module_with_demote_declared(vec![]);
-
-        drop_unrequired_capabilities(&mut module);
-
-        assert!(!declares(
-            &module,
-            spirv::Capability::DemoteToHelperInvocation
-        ));
-        assert!(!declares_extension(
-            &module,
-            "SPV_EXT_demote_to_helper_invocation"
-        ));
-        assert!(
-            declares(&module, spirv::Capability::Shader),
-            "a capability outside the allowlist is never a candidate"
-        );
-    }
-
-    /// `OpIsHelperInvocationEXT` needs the same capability `OpDemoteToHelperInvocation` does, and
-    /// the grammar says so, so reading the requirement from the grammar rather than restating it
-    /// keeps both. A hand-written "does the module demote?" predicate would drop them here.
-    #[test]
-    fn the_other_instruction_that_needs_a_capability_keeps_it() {
-        let mut module = module_with_demote_declared(vec![Instruction::new(
-            Op::IsHelperInvocationEXT,
-            Some(3),
-            Some(6),
-            vec![],
-        )]);
-
-        drop_unrequired_capabilities(&mut module);
-
-        assert!(declares(
-            &module,
-            spirv::Capability::DemoteToHelperInvocation
-        ));
-        assert!(declares_extension(
-            &module,
-            "SPV_EXT_demote_to_helper_invocation"
-        ));
-    }
-
-    /// A module declaring `VariablePointers`, with `body` for the entry's only block.
-    ///
-    /// Types for a `Workgroup` pointer are present either way, so what decides the capability is
-    /// the body -- which is the point: the grammar attaches nothing to `OpSelect`, so only a
-    /// pointer-typed one asks for this.
-    fn module_with_variable_pointers_declared(body: Vec<Instruction>) -> Module {
-        use crate::spirv_module::{Block, Function};
-        let (void, fn_ty, uint, pointer, a, b, cond) = (1, 2, 3, 4, 5, 6, 7);
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(20));
-        module.capabilities = [
-            spirv::Capability::Shader,
-            spirv::Capability::VariablePointersStorageBuffer,
-            spirv::Capability::VariablePointers,
-        ]
-        .into_iter()
-        .map(|capability| {
-            Instruction::new(
-                Op::Capability,
-                None,
-                None,
-                vec![Operand::Capability(capability)],
-            )
-        })
-        .collect();
-        module.types_global_values = vec![
-            Instruction::new(Op::TypeVoid, None, Some(void), vec![]),
-            Instruction::new(
-                Op::TypeFunction,
-                None,
-                Some(fn_ty),
-                vec![Operand::IdRef(void)],
-            ),
-            Instruction::new(
-                Op::TypeInt,
-                None,
-                Some(uint),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-            ),
-            Instruction::new(
-                Op::TypePointer,
-                None,
-                Some(pointer),
-                vec![
-                    Operand::StorageClass(spirv::StorageClass::Workgroup),
-                    Operand::IdRef(uint),
-                ],
-            ),
-            Instruction::new(
-                Op::Variable,
-                Some(pointer),
-                Some(a),
-                vec![Operand::StorageClass(spirv::StorageClass::Workgroup)],
-            ),
-            Instruction::new(
-                Op::Variable,
-                Some(pointer),
-                Some(b),
-                vec![Operand::StorageClass(spirv::StorageClass::Workgroup)],
-            ),
-            Instruction::new(Op::TypeBool, None, Some(cond), vec![]),
-            Instruction::new(Op::Undef, Some(cond), Some(8), vec![]),
-        ];
-        let mut instructions = body;
-        instructions.push(Instruction::new(Op::Return, None, None, vec![]));
-        module.functions = vec![Function {
-            def: Some(Instruction::new(
-                Op::Function,
-                Some(void),
-                Some(9),
-                vec![
-                    Operand::FunctionControl(spirv::FunctionControl::NONE),
-                    Operand::IdRef(fn_ty),
-                ],
-            )),
-            end: Some(Instruction::new(Op::FunctionEnd, None, None, vec![])),
-            parameters: vec![],
-            blocks: vec![Block {
-                label: Some(Instruction::new(Op::Label, None, Some(10), vec![])),
-                instructions,
-            }],
-        }];
-        module
-    }
-
-    /// The pipeline computes the variable-pointer requirement once and reapplies that snapshot after
-    /// later passes run, so a pass that deletes the last pointer merge leaves the capability behind.
-    /// Recomputing here is what makes the declaration a statement about the module that ships.
-    /// Measured over the corpus: 1 of 14,579 sources carried a `VariablePointers` nothing asked for.
-    #[test]
-    fn variable_pointers_goes_when_the_last_pointer_merge_does() {
-        // An OpSelect over plain integers is the same opcode with a non-pointer result type, which
-        // is exactly the distinction the grammar does not draw and this predicate must.
-        let mut module = module_with_variable_pointers_declared(vec![Instruction::new(
-            Op::Select,
-            Some(3),
-            Some(11),
-            vec![Operand::IdRef(8), Operand::IdRef(3), Operand::IdRef(3)],
-        )]);
-
-        drop_unrequired_capabilities(&mut module);
-
-        assert!(!declares(&module, spirv::Capability::VariablePointers));
-        assert!(!declares(
-            &module,
-            spirv::Capability::VariablePointersStorageBuffer
-        ));
-    }
-
-    /// The converse, and the reason the predicate cannot simply be "no pointer type in the module":
-    /// a `Workgroup` pointer select is what only full `VariablePointers` permits.
-    #[test]
-    fn a_workgroup_pointer_select_keeps_variable_pointers() {
-        let mut module = module_with_variable_pointers_declared(vec![Instruction::new(
-            Op::Select,
-            Some(4),
-            Some(11),
-            vec![Operand::IdRef(8), Operand::IdRef(5), Operand::IdRef(6)],
-        )]);
-
-        drop_unrequired_capabilities(&mut module);
-
-        assert!(declares(&module, spirv::Capability::VariablePointers));
-        assert!(declares(
-            &module,
-            spirv::Capability::VariablePointersStorageBuffer
-        ));
-    }
 
     /// A module whose entry point lists two descriptor variables while only one is still loaded.
     /// The second is what a pipeline boundary strands when a later rewrite deletes its last use.
@@ -1582,120 +1097,6 @@ mod tests {
         assert!(ctx.module.debug_names.is_empty());
     }
 
-    /// A `Block`-decorated struct with `Offset`-decorated members describes a buffer layout. That
-    /// description is not a reason for the struct, or the member types it names, to exist: 26,233
-    /// struct declarations survived in 10,588 of the 14,579 corpus sources on exactly this basis.
-    #[test]
-    fn gc_drops_dead_struct_owned_only_by_its_block_and_offset_layout() {
-        let word = 1;
-        let structure = 2;
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(3));
-        module.types_global_values = vec![
-            Instruction::new(
-                Op::TypeInt,
-                None,
-                Some(word),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-            ),
-            Instruction::new(
-                Op::TypeStruct,
-                None,
-                Some(structure),
-                vec![Operand::IdRef(word), Operand::IdRef(word)],
-            ),
-        ];
-        module.annotations = vec![
-            Instruction::new(
-                Op::Decorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(structure),
-                    Operand::Decoration(spirv::Decoration::Block),
-                ],
-            ),
-            Instruction::new(
-                Op::MemberDecorate,
-                None,
-                None,
-                vec![
-                    Operand::IdRef(structure),
-                    Operand::LiteralBit32(1),
-                    Operand::Decoration(spirv::Decoration::Offset),
-                    Operand::LiteralBit32(4),
-                ],
-            ),
-        ];
-        let mut ctx = Ctx::new(module);
-
-        gc_dead_globals(&mut ctx);
-
-        assert!(ctx.module.types_global_values.is_empty());
-        assert!(ctx.module.annotations.is_empty());
-    }
-
-    /// The control, and why the carve-out is an allowlist. `BuiltIn WorkgroupSize` on an otherwise
-    /// unreferenced constant IS the local size -- nothing else in the module records it -- so that
-    /// decoration has to stay a liveness root. Treating every decoration as description dropped the
-    /// constant and broke 9,857 of the 14,579 corpus sources on
-    /// `VUID-StandaloneSpirv-None-10685`.
-    #[test]
-    fn gc_keeps_the_constant_a_workgroup_size_decoration_names() {
-        let word = 1;
-        let vector = 2;
-        let one = 3;
-        let size = 4;
-        let mut module = Module::new();
-        module.header = Some(ModuleHeader::new(5));
-        module.types_global_values = vec![
-            Instruction::new(
-                Op::TypeInt,
-                None,
-                Some(word),
-                vec![Operand::LiteralBit32(32), Operand::LiteralBit32(0)],
-            ),
-            Instruction::new(
-                Op::TypeVector,
-                None,
-                Some(vector),
-                vec![Operand::IdRef(word), Operand::LiteralBit32(3)],
-            ),
-            Instruction::new(
-                Op::Constant,
-                Some(word),
-                Some(one),
-                vec![Operand::LiteralBit32(1)],
-            ),
-            Instruction::new(
-                Op::ConstantComposite,
-                Some(vector),
-                Some(size),
-                vec![
-                    Operand::IdRef(one),
-                    Operand::IdRef(one),
-                    Operand::IdRef(one),
-                ],
-            ),
-        ];
-        module.annotations = vec![Instruction::new(
-            Op::Decorate,
-            None,
-            None,
-            vec![
-                Operand::IdRef(size),
-                Operand::Decoration(spirv::Decoration::BuiltIn),
-                Operand::BuiltIn(spirv::BuiltIn::WorkgroupSize),
-            ],
-        )];
-        let mut ctx = Ctx::new(module);
-
-        gc_dead_globals(&mut ctx);
-
-        assert_eq!(ctx.module.types_global_values.len(), 4);
-        assert_eq!(ctx.module.annotations.len(), 1);
-    }
-
     #[test]
     fn gc_drops_dead_pointer_type_owned_only_by_array_stride() {
         let byte = 1;
@@ -1735,5 +1136,411 @@ mod tests {
 
         assert!(ctx.module.types_global_values.is_empty());
         assert!(ctx.module.annotations.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod unconsumed_handle_tests {
+    use super::*;
+    use crate::spirv_module::{Block, Function, ModuleHeader};
+
+    const FLOAT: Word = 1;
+    const IMAGE: Word = 2;
+    const SAMPLER: Word = 3;
+    const SAMPLED_IMAGE: Word = 4;
+    const IMAGE_POINTER: Word = 5;
+    const SAMPLER_POINTER: Word = 6;
+    const COORD: Word = 7;
+    const IMAGE_ARRAY: Word = 8;
+    /// The first id the fixtures hand out to variables.
+    const FIRST_VARIABLE: Word = 10;
+    const ENTRY: Word = 40;
+
+    fn handle_module(descriptors: &[(Word, Word)]) -> Module {
+        let mut module = Module::new();
+        module.header = Some(ModuleHeader::new(100));
+        module.types_global_values = vec![
+            Instruction::new(
+                Op::TypeFloat,
+                None,
+                Some(FLOAT),
+                vec![Operand::LiteralBit32(32)],
+            ),
+            Instruction::new(
+                Op::TypeImage,
+                None,
+                Some(IMAGE),
+                vec![
+                    Operand::IdRef(FLOAT),
+                    Operand::Dim(spirv::Dim::Dim2D),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(0),
+                    Operand::LiteralBit32(1),
+                    Operand::ImageFormat(spirv::ImageFormat::Unknown),
+                ],
+            ),
+            Instruction::new(Op::TypeSampler, None, Some(SAMPLER), vec![]),
+            Instruction::new(
+                Op::TypeSampledImage,
+                None,
+                Some(SAMPLED_IMAGE),
+                vec![Operand::IdRef(IMAGE)],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(IMAGE_POINTER),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(IMAGE),
+                ],
+            ),
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(SAMPLER_POINTER),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(SAMPLER),
+                ],
+            ),
+            Instruction::new(Op::ConstantNull, Some(FLOAT), Some(COORD), vec![]),
+            Instruction::new(
+                Op::TypeRuntimeArray,
+                None,
+                Some(IMAGE_ARRAY),
+                vec![Operand::IdRef(IMAGE)],
+            ),
+        ];
+        let mut entry_operands = vec![
+            Operand::ExecutionModel(spirv::ExecutionModel::Fragment),
+            Operand::IdRef(ENTRY),
+            Operand::LiteralString("main".to_string()),
+        ];
+        for (index, (variable, pointer)) in descriptors.iter().enumerate() {
+            module.types_global_values.push(Instruction::new(
+                Op::Variable,
+                Some(*pointer),
+                Some(*variable),
+                vec![Operand::StorageClass(StorageClass::UniformConstant)],
+            ));
+            module.annotations.push(Instruction::new(
+                Op::Decorate,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(*variable),
+                    Operand::Decoration(spirv::Decoration::Binding),
+                    Operand::LiteralBit32(index as u32),
+                ],
+            ));
+            module.debug_names.push(Instruction::new(
+                Op::Name,
+                None,
+                None,
+                vec![
+                    Operand::IdRef(*variable),
+                    Operand::LiteralString(format!("resource{index}")),
+                ],
+            ));
+            entry_operands.push(Operand::IdRef(*variable));
+        }
+        module
+            .entry_points
+            .push(Instruction::new(Op::EntryPoint, None, None, entry_operands));
+        module
+    }
+
+    fn load(ty: Word, result: Word, variable: Word) -> Instruction {
+        Instruction::new(
+            Op::Load,
+            Some(ty),
+            Some(result),
+            vec![Operand::IdRef(variable)],
+        )
+    }
+
+    fn with_body(mut module: Module, instructions: Vec<Instruction>) -> Module {
+        let mut block = Block::new();
+        block.instructions = instructions;
+        let mut function = Function::new();
+        function.blocks.push(block);
+        module.functions.push(function);
+        module
+    }
+
+    fn body_results(module: &Module) -> HashSet<Word> {
+        module
+            .functions
+            .iter()
+            .flat_map(|function| function.blocks.iter())
+            .flat_map(|block| block.instructions.iter())
+            .filter_map(|instruction| instruction.result_id)
+            .collect()
+    }
+
+    fn variables(module: &Module) -> HashSet<Word> {
+        module
+            .types_global_values
+            .iter()
+            .filter(|instruction| instruction.class.opcode == Op::Variable)
+            .filter_map(|instruction| instruction.result_id)
+            .collect()
+    }
+
+    fn interface(module: &Module) -> HashSet<Word> {
+        module.entry_points[0].operands[3..]
+            .iter()
+            .filter_map(|operand| match operand {
+                Operand::IdRef(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn records_about(records: &[Instruction]) -> HashSet<Word> {
+        records
+            .iter()
+            .filter_map(|instruction| match instruction.operands.first() {
+                Some(Operand::IdRef(id)) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Two textures and two samplers; only the first of each pair is sampled. The second pair is
+    /// loaded, combined, copied, and merged by a phi that feeds itself -- a chain and a cycle no
+    /// instruction outside them reads.
+    #[test]
+    fn a_dead_handle_chain_takes_its_variable_binding_name_and_interface_entry() {
+        let (tex0, tex1, samp0, samp1) = (10, 11, 12, 13);
+        let module = handle_module(&[
+            (tex0, IMAGE_POINTER),
+            (tex1, IMAGE_POINTER),
+            (samp0, SAMPLER_POINTER),
+            (samp1, SAMPLER_POINTER),
+        ]);
+        let (image0, sampler0, combined0, sample) = (20, 21, 22, 23);
+        let (image1, sampler1, combined1, copy, phi) = (24, 25, 26, 27, 28);
+        let mut module = with_body(
+            module,
+            vec![
+                load(IMAGE, image0, tex0),
+                load(SAMPLER, sampler0, samp0),
+                Instruction::new(
+                    Op::SampledImage,
+                    Some(SAMPLED_IMAGE),
+                    Some(combined0),
+                    vec![Operand::IdRef(image0), Operand::IdRef(sampler0)],
+                ),
+                Instruction::new(
+                    Op::ImageSampleImplicitLod,
+                    Some(FLOAT),
+                    Some(sample),
+                    vec![Operand::IdRef(combined0), Operand::IdRef(COORD)],
+                ),
+                load(IMAGE, image1, tex1),
+                load(SAMPLER, sampler1, samp1),
+                Instruction::new(
+                    Op::SampledImage,
+                    Some(SAMPLED_IMAGE),
+                    Some(combined1),
+                    vec![Operand::IdRef(image1), Operand::IdRef(sampler1)],
+                ),
+                Instruction::new(
+                    Op::CopyObject,
+                    Some(SAMPLED_IMAGE),
+                    Some(copy),
+                    vec![Operand::IdRef(combined1)],
+                ),
+                Instruction::new(
+                    Op::Phi,
+                    Some(IMAGE),
+                    Some(phi),
+                    vec![
+                        Operand::IdRef(image1),
+                        Operand::IdRef(ENTRY),
+                        Operand::IdRef(phi),
+                        Operand::IdRef(ENTRY),
+                    ],
+                ),
+                Instruction::new(Op::Return, None, None, vec![]),
+            ],
+        );
+
+        assert!(drop_unreferenced_global_variables(&mut module));
+
+        assert_eq!(
+            body_results(&module),
+            HashSet::from([image0, sampler0, combined0, sample])
+        );
+        assert_eq!(variables(&module), HashSet::from([tex0, samp0]));
+        assert_eq!(interface(&module), HashSet::from([tex0, samp0]));
+        assert_eq!(
+            records_about(&module.annotations),
+            HashSet::from([tex0, samp0])
+        );
+        assert_eq!(
+            records_about(&module.debug_names),
+            HashSet::from([tex0, samp0])
+        );
+        // Nothing left to remove.
+        assert!(!drop_unreferenced_global_variables(&mut module));
+    }
+
+    /// A name or a decoration about a handle is not a use of it.
+    #[test]
+    fn a_name_and_a_decoration_on_the_dead_load_do_not_keep_it() {
+        let tex = FIRST_VARIABLE;
+        let image = 20;
+        let mut module = with_body(
+            handle_module(&[(tex, IMAGE_POINTER)]),
+            vec![
+                load(IMAGE, image, tex),
+                Instruction::new(Op::Return, None, None, vec![]),
+            ],
+        );
+        module.debug_names.push(Instruction::new(
+            Op::Name,
+            None,
+            None,
+            vec![
+                Operand::IdRef(image),
+                Operand::LiteralString("texture".to_string()),
+            ],
+        ));
+        module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(image),
+                Operand::Decoration(spirv::Decoration::NonUniform),
+            ],
+        ));
+
+        assert!(drop_unreferenced_global_variables(&mut module));
+
+        assert!(body_results(&module).is_empty());
+        assert!(variables(&module).is_empty());
+        assert!(interface(&module).is_empty());
+        assert!(module.annotations.is_empty());
+        assert!(module.debug_names.is_empty());
+    }
+
+    /// Every way a handle can be consumed keeps its load and its descriptor, and a handle array
+    /// loaded whole is as removable as a single handle once nothing reads it.
+    #[test]
+    fn a_consumed_handle_keeps_its_load_and_variable() {
+        let (written, passed, stored, volatile, array) = (10, 11, 12, 13, 14);
+        let (helper, private, array_pointer) = (50, 51, 52);
+        let mut module = handle_module(&[
+            (written, IMAGE_POINTER),
+            (passed, IMAGE_POINTER),
+            (stored, IMAGE_POINTER),
+            (volatile, IMAGE_POINTER),
+            (array, array_pointer),
+        ]);
+        // The array pointer type follows the array type it points at and precedes the variables.
+        module.types_global_values.insert(
+            8,
+            Instruction::new(
+                Op::TypePointer,
+                None,
+                Some(array_pointer),
+                vec![
+                    Operand::StorageClass(StorageClass::UniformConstant),
+                    Operand::IdRef(IMAGE_ARRAY),
+                ],
+            ),
+        );
+        let mut module = with_body(
+            module,
+            vec![
+                load(IMAGE, 20, written),
+                Instruction::new(
+                    Op::ImageWrite,
+                    None,
+                    None,
+                    vec![
+                        Operand::IdRef(20),
+                        Operand::IdRef(COORD),
+                        Operand::IdRef(COORD),
+                    ],
+                ),
+                load(IMAGE, 21, passed),
+                Instruction::new(
+                    Op::FunctionCall,
+                    Some(FLOAT),
+                    Some(22),
+                    vec![Operand::IdRef(helper), Operand::IdRef(21)],
+                ),
+                load(IMAGE, 23, stored),
+                Instruction::new(
+                    Op::Store,
+                    None,
+                    None,
+                    vec![Operand::IdRef(private), Operand::IdRef(23)],
+                ),
+                // An unused volatile load is an access the shader asked for.
+                Instruction::new(
+                    Op::Load,
+                    Some(IMAGE),
+                    Some(24),
+                    vec![
+                        Operand::IdRef(volatile),
+                        Operand::MemoryAccess(spirv::MemoryAccess::VOLATILE),
+                    ],
+                ),
+                load(IMAGE_ARRAY, 25, array),
+                Instruction::new(Op::Return, None, None, vec![]),
+            ],
+        );
+
+        assert!(drop_unreferenced_global_variables(&mut module));
+
+        assert_eq!(
+            body_results(&module),
+            HashSet::from([20, 21, 22, 23, 24]),
+            "only the unread whole-array load goes"
+        );
+        assert_eq!(
+            variables(&module),
+            HashSet::from([written, passed, stored, volatile])
+        );
+    }
+
+    /// Only handles are candidates: an unused load of ordinary data stays exactly as it was.
+    #[test]
+    fn an_unused_load_of_a_non_handle_is_left_alone() {
+        let buffer = FIRST_VARIABLE;
+        let mut module = handle_module(&[]);
+        module.types_global_values.push(Instruction::new(
+            Op::TypePointer,
+            None,
+            Some(60),
+            vec![
+                Operand::StorageClass(StorageClass::StorageBuffer),
+                Operand::IdRef(FLOAT),
+            ],
+        ));
+        module.types_global_values.push(Instruction::new(
+            Op::Variable,
+            Some(60),
+            Some(buffer),
+            vec![Operand::StorageClass(StorageClass::StorageBuffer)],
+        ));
+        let mut module = with_body(
+            module,
+            vec![
+                load(FLOAT, 20, buffer),
+                Instruction::new(Op::Return, None, None, vec![]),
+            ],
+        );
+
+        assert!(!drop_unconsumed_handle_values(&mut module));
+
+        assert_eq!(body_results(&module), HashSet::from([20]));
     }
 }
