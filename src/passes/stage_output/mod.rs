@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::passes::stage_input::{
-    decorate_builtin, decorate_location, decorate_with, scalar_or_vector_component,
+    decorate_builtin, decorate_index, decorate_location, decorate_with, scalar_or_vector_component,
 };
 
 fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Option<u32> {
@@ -10,6 +10,12 @@ fn fragment_output_location(frag: Option<&FragMeta>, member_idx: usize) -> Optio
         Some(meta) => meta.render_target_location_for_member(member_idx as u32),
         None => Some(member_idx as u32),
     }
+}
+
+/// The output's dual-source blend index; 0 for an ordinary color output.
+fn fragment_output_dual_index(frag: Option<&FragMeta>, member_idx: usize) -> u32 {
+    frag.map(|meta| meta.render_target_dual_index_for_member(member_idx as u32))
+        .unwrap_or(0)
 }
 
 fn fragment_output_is_depth(frag: Option<&FragMeta>, member_idx: usize) -> bool {
@@ -762,7 +768,11 @@ pub(in crate::passes) fn rewrite_return(
                         let var = make_output_var(ctx, output_ty);
                         match kind {
                             OutKind::Location(location) => {
-                                decorate_location(&mut ctx.module, var, location)
+                                decorate_location(&mut ctx.module, var, location);
+                                let index = fragment_output_dual_index(frag, mi);
+                                if index != 0 {
+                                    decorate_index(&mut ctx.module, var, index);
+                                }
                             }
                             OutKind::Depth => {
                                 decorate_builtin(&mut ctx.module, var, BuiltIn::FragDepth);
@@ -828,6 +838,10 @@ pub(in crate::passes) fn rewrite_return(
                         let output_ty = fragment_output_type(ctx, frag, 0, ret_ty, defs);
                         let var = make_output_var(ctx, output_ty);
                         decorate_location(&mut ctx.module, var, location);
+                        let index = fragment_output_dual_index(frag, 0);
+                        if index != 0 {
+                            decorate_index(&mut ctx.module, var, index);
+                        }
                         ctx.interface.push(var);
                         outputs.push(OutputWrite::Direct {
                             var,

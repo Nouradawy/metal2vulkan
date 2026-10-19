@@ -1456,3 +1456,27 @@ entry:
     let meta = parse_air_fragment_meta(&unresolved).unwrap();
     assert_eq!(meta.render_target_members, vec![(0, 0), (1, 1)]);
 }
+
+/// Dawn's coverage blending (Skia Graphite paths and icons in Chrome) returns two colors for
+/// attachment 0: `[[color(0), index(0)]]` and `[[color(0), index(1)]]`. The second operand after
+/// `air.render_target` is that index. Both members keep Location 0; the index-1 member is the
+/// blend's second source, not another attachment, so it is absent from the attachment list.
+#[test]
+fn a_dual_source_render_target_carries_its_blend_index() {
+    const FRAGMENT: &str = r#"
+!air.fragment = !{!0}
+!0 = !{ptr @F, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"color"}
+!3 = !{!"air.render_target", i32 0, i32 1, !"air.arg_type_name", !"float4", !"air.arg_name", !"blend"}
+!4 = !{}
+"#;
+
+    let meta = parse_air_fragment_meta(FRAGMENT).unwrap();
+    assert_eq!(meta.render_target_members, vec![(0, 0), (1, 0)]);
+    assert_eq!(meta.render_target_dual_indices, vec![(1, 1)]);
+    assert_eq!(meta.render_target_dual_index_for_member(0), 0);
+    assert_eq!(meta.render_target_dual_index_for_member(1), 1);
+    assert_eq!(meta.render_target_indices, vec![0]);
+    assert_eq!(meta.n_render_targets, 1);
+}

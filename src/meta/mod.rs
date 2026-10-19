@@ -194,6 +194,12 @@ pub struct FragMeta {
     /// Return-struct member index -> color attachment Location for actual `air.render_target`
     /// outputs. Non-color outputs such as `air.stencil` are deliberately absent.
     pub render_target_members: Vec<(u32, u32)>,
+    /// Return-struct member index -> dual-source blend index for `air.render_target` outputs whose
+    /// index is not 0 (`[[color(0), index(1)]]`, the second operand after the marker). Such an output
+    /// is the blend's second source for the same attachment, not an attachment of its own: Vulkan
+    /// spells it `Location N` + `Index 1`, and without the `Index` two outputs share location 0 and
+    /// the module is invalid (Dawn/Skia Graphite coverage blending).
+    pub render_target_dual_indices: Vec<(u32, u32)>,
     /// Return-struct member index -> AIR render-target type name (`float4`, `int4`, ...).
     pub render_target_type_names: HashMap<u32, String>,
     /// Return-struct member indices tagged as `air.depth` (`[[depth(...)]]`).
@@ -339,6 +345,12 @@ impl FragMeta {
         self.render_target_members
             .iter()
             .find_map(|(member, location)| (*member == member_idx).then_some(*location))
+    }
+    pub fn render_target_dual_index_for_member(&self, member_idx: u32) -> u32 {
+        self.render_target_dual_indices
+            .iter()
+            .find_map(|(member, index)| (*member == member_idx).then_some(*index))
+            .unwrap_or(0)
     }
     pub fn render_target_type_name(&self, member_idx: u32) -> Option<&str> {
         self.render_target_type_names
@@ -1604,6 +1616,17 @@ fn render_target_location(
     declared_slot(body, "air.render_target", fallback, static_int_globals)
 }
 
+/// The dual-source blend index of an `air.render_target` output: the operand after the color slot
+/// (`!"air.render_target", i32 0, i32 1` is `[[color(0), index(1)]]`). Absent means 0; a
+/// function-constant global this module does not initialize also reads 0, the plain output.
+fn render_target_dual_index(body: &str, static_int_globals: &HashMap<String, u32>) -> u32 {
+    match marker_operands(body, "air.render_target").into_iter().nth(1).flatten() {
+        Some(LocationOperand::Literal(index)) => index,
+        Some(LocationOperand::Global(global)) => static_int_globals.get(&global).copied().unwrap_or(0),
+        None => 0,
+    }
+}
+
 fn address_space(body: &str) -> Option<u32> {
     i32_after_marker(body, "air.address_space")
 }
@@ -2156,8 +2179,28 @@ fn parse_air_fragment_meta_with_nodes(
                 .collect()
         })
         .unwrap_or_default();
+    let render_target_dual_indices: Vec<(u32, u32)> = nodes
+        .get(&out_ref)
+        .map(|c| {
+            refs_in(c)
+                .into_iter()
+                .enumerate()
+                .filter_map(|(i, r)| {
+                    let node = nodes.get(&r)?;
+                    let is_render_target = primary_role(&role_strings(node)) == Some("render_target");
+                    let index = render_target_dual_index(node, &static_int_globals);
+                    (is_render_target
+                        && index != 0
+                        && metadata_enabled_by_default(node, nodes, &static_int_globals))
+                    .then_some((i as u32, index))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    // Attachments only: a dual-source second output writes the same attachment as its index-0 twin.
     let render_target_indices: Vec<u32> = render_target_members
         .iter()
+        .filter(|(member, _)| !render_target_dual_indices.iter().any(|(m, _)| m == member))
         .map(|(_, location)| *location)
         .collect();
     let n_render_targets = render_target_indices.len() as u32;
@@ -2345,6 +2388,7 @@ fn parse_air_fragment_meta_with_nodes(
         varying_interpolation,
         n_render_targets,
         render_target_members,
+        render_target_dual_indices,
         render_target_type_names,
         depth_members,
         depth_qualifier,
