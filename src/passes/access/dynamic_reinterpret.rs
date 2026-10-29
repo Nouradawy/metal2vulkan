@@ -337,8 +337,11 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_reinterpret(
 /// 32-bit backing word. The byte-correct lowering uses `%dyn / lanes_per_word` to address member-0's
 /// `uint` word and `%dyn & (lanes_per_word - 1)` to extract or replace the selected 8/16-bit lane.
 ///
-/// Floor-safe gates: one non-constant index, `StorageBuffer`, base pointee exactly a single-member
-/// array/runtime-array of unsigned 32-bit words, result pointee exactly an 8/16-bit int/float scalar, and
+/// Function-local `{ uint4 }` carriers use the same word/lane address math. Their components
+/// occupy all sixteen bytes and each invocation owns its writes, so subword stores remain local.
+///
+/// Floor-safe gates: one non-constant index, a `StorageBuffer` single-member array/runtime-array or
+/// a `Function` single-member four-lane vector of unsigned 32-bit words, an 8/16-bit result, and
 /// every use is a plain `OpLoad`/`OpStore` of that pointee. Anything else remains visible to
 /// spirv-val instead of guessing.
 #[derive(Clone, Copy)]
@@ -352,6 +355,7 @@ struct DynamicSubwordPlan {
     index_ty: Word,
     result_pointee: Word,
     result_bits: u32,
+    storage_class: StorageClass,
 }
 
 pub(in crate::passes) fn rewrite_dynamic_struct_index_subword_reinterpret(
@@ -390,7 +394,7 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_subword_reinterpret(
             let Some(result_bits) = direct_scalar_width(ctx, result_pointee) else {
                 continue;
             };
-            if sc != StorageClass::StorageBuffer
+            if !matches!(sc, StorageClass::StorageBuffer | StorageClass::Function)
                 || !(8..32).contains(&result_bits)
                 || 32 % result_bits != 0
             {
@@ -416,7 +420,12 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_subword_reinterpret(
             let Some(&(_, base_pointee)) = ptr_info.get(&base_ptr_ty) else {
                 continue;
             };
-            let Some(elem_ty) = single_member_array_scalar_elem(ctx, base_pointee) else {
+            let elem_ty = if sc == StorageClass::Function {
+                single_member_vector_scalar_elem(ctx, base_pointee)
+            } else {
+                single_member_array_scalar_elem(ctx, base_pointee)
+            };
+            let Some(elem_ty) = elem_ty else {
                 continue;
             };
             if !is_unsigned_int_width(ctx, elem_ty, 32) {
@@ -435,6 +444,7 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_subword_reinterpret(
                 index_ty,
                 result_pointee,
                 result_bits,
+                storage_class: sc,
             });
         }
     }
@@ -486,7 +496,6 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_subword_reinterpret(
     }
 
     let uint = ctx.ty_uint();
-    let ptr_uint = ctx.ty_ptr(StorageClass::StorageBuffer, uint);
     let member0 = ctx.const_uint(0);
     let chain_at: HashSet<(usize, usize)> = plans.iter().map(|plan| (plan.bi, plan.ii)).collect();
     let plan_by_id: HashMap<Word, DynamicSubwordPlan> =
@@ -517,6 +526,7 @@ pub(in crate::passes) fn rewrite_dynamic_struct_index_subword_reinterpret(
                 continue;
             };
             let plan = plan_by_id[&chain_id];
+            let ptr_uint = ctx.ty_ptr(plan.storage_class, uint);
             let (word_ptr, shift_bits) =
                 emit_dynamic_halfword_address(ctx, &plan, ptr_uint, member0, &mut rewritten);
             match inst.class.opcode {
@@ -653,6 +663,26 @@ fn is_unsigned_int_width(ctx: &Ctx, ty: Word, bits: u32) -> bool {
             && def.operands.first() == Some(&Operand::LiteralBit32(bits))
             && def.operands.get(1) == Some(&Operand::LiteralBit32(0))
     })
+}
+
+fn single_member_vector_scalar_elem(ctx: &Ctx, struct_ty: Word) -> Option<Word> {
+    let structure = type_def_of(ctx, struct_ty)?;
+    if structure.class.opcode != Op::TypeStruct {
+        return None;
+    }
+    let [Operand::IdRef(member)] = structure.operands.as_slice() else {
+        return None;
+    };
+    let vector = type_def_of(ctx, *member)?;
+    if vector.class.opcode != Op::TypeVector {
+        return None;
+    }
+    // A three-lane AIR vector may have ABI tail padding; keep unsupported
+    // padding reads from becoming out-of-bounds SPIR-V component accesses.
+    let [Operand::IdRef(component), Operand::LiteralBit32(4)] = vector.operands.as_slice() else {
+        return None;
+    };
+    direct_scalar_width(ctx, *component).map(|_| *component)
 }
 
 fn emit_dynamic_halfword_address(

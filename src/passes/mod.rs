@@ -340,6 +340,8 @@ struct Ctx {
     bound_buffer_vars: HashSet<Word>,
     /// loaded-image ids synthesized by `air.get_null_texture_*()`.
     null_image_values: HashSet<Word>,
+    /// Runtime nil checks, keyed by the source Metal texture argument index.
+    texture_null_specs: HashMap<u32, Word>,
     /// composite type ids already given explicit Offset/ArrayStride layout (dedup; a type decorated
     /// twice is a validation error).
     laid_out: HashSet<Word>,
@@ -445,6 +447,7 @@ impl Ctx {
             image_array_vars: HashMap::new(),
             bound_buffer_vars: HashSet::new(),
             null_image_values: HashSet::new(),
+            texture_null_specs: HashMap::new(),
             laid_out: HashSet::new(),
             air_struct_offsets,
             air_data_layout,
@@ -1384,6 +1387,35 @@ impl Ctx {
             ],
         ));
         self.raster_sample_count_spec_id = Some(id);
+        id
+    }
+
+    fn texture_null_spec(&mut self, index: u32) -> Word {
+        if let Some(id) = self.texture_null_specs.get(&index) {
+            return *id;
+        }
+        let bool_ty = self.ty_bool();
+        let id = self.module.fresh_id();
+        self.new_globals.push(Instruction::new(
+            Op::SpecConstantFalse,
+            Some(bool_ty),
+            Some(id),
+            vec![],
+        ));
+        self.module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(id),
+                Operand::Decoration(Decoration::SpecId),
+                Operand::LiteralBit32(
+                    crate::reflect::texture_null_spec_id(index)
+                        .expect("texture index was checked against the argument table"),
+                ),
+            ],
+        ));
+        self.texture_null_specs.insert(index, id);
         id
     }
 

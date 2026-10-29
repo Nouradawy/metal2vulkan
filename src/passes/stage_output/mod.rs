@@ -57,7 +57,7 @@ fn user_location_output_type(ctx: &mut Ctx, ty: Word) -> Word {
     if type_def_of(ctx, ty).is_some_and(|definition| definition.class.opcode == Op::TypeBool) {
         ctx.ty_uint()
     } else {
-        ty
+        float_stage_interface_type(ctx, ty)
     }
 }
 
@@ -156,6 +156,20 @@ fn value_for_store(
 ) -> Word {
     if src_ty == dst_ty {
         return value;
+    }
+    if matches!(
+        (float_value_shape(ctx, src_ty), float_value_shape(ctx, dst_ty)),
+        (Some((source_bits, source_lanes)), Some((dest_bits, dest_lanes)))
+            if source_bits != dest_bits && source_lanes == dest_lanes
+    ) {
+        let converted = ctx.module.fresh_id();
+        stores.push(Instruction::new(
+            Op::FConvert,
+            Some(dst_ty),
+            Some(converted),
+            vec![Operand::IdRef(value)],
+        ));
+        return converted;
     }
     if let (Some((src_bits, _)), Some((dst_bits, dst_signed))) = (
         int_component_shape_live(ctx, src_ty),
@@ -1198,6 +1212,30 @@ fn make_output_var(ctx: &mut Ctx, ty: Word) -> Word {
 mod tests {
     use super::*;
     use crate::passes::resources::rewrites::combined_type_defs;
+
+    #[test]
+    fn half_stage_outputs_convert_to_float_without_changing_lane_count() {
+        let mut ctx = Ctx::new(Module::new());
+        let half = ctx.get_or_create(Op::TypeFloat, None, vec![Operand::LiteralBit32(16)]);
+        for lanes in [None, Some(2), Some(3), Some(4)] {
+            let original = lanes.map_or(half, |lanes| {
+                ctx.get_or_create(
+                    Op::TypeVector,
+                    None,
+                    vec![Operand::IdRef(half), Operand::LiteralBit32(lanes)],
+                )
+            });
+            let interface = user_location_output_type(&mut ctx, original);
+            assert_eq!(float_value_shape(&ctx, interface), Some((32, lanes)));
+            let value = ctx.module.fresh_id();
+            let mut stores = Vec::new();
+            value_for_store(&mut ctx, &mut stores, value, original, interface);
+            assert_eq!(stores.len(), 1);
+            assert_eq!(stores[0].class.opcode, Op::FConvert);
+            assert_eq!(stores[0].result_type, Some(interface));
+            assert_eq!(float_value_shape(&ctx, original), Some((16, lanes)));
+        }
+    }
 
     /// Stage-input lowering may retype the entry's return to a struct it creates (a value copy of
     /// a type that is also a decorated buffer block), so the pre-lowering snapshot does not hold

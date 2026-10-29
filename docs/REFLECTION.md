@@ -312,6 +312,19 @@ becomes unbounded instead of allowing reflection size to grow without limit.
   coordinate, compare, anisotropy, LOD, border, and reduction fields plus the original two AIR
   words.
 
+### Texture presence
+
+Reflection ABI v42 reserves `TEXTURE_NULL_SPEC_ID_BASE + metal_texture_index` for
+boolean `is_null_texture` queries on interface arguments. The value is true for
+a nil argument and false for a present texture, independently for each stage.
+Consumers must specialize these ids, or their exact module defaults, from the
+current argument table. A real 1x1 texture is present; a 1x1 placeholder supplied
+for an absent descriptor is still nil. Descriptor relocation does not change
+these ids. Synthesized `get_null_texture` values remain statically null.
+
+The default is false for consumers whose texture arguments are all bound.
+Unsupported image origins are refused rather than assumed non-null.
+
 ### Runtime sampler specialization
 
 AIR identifies dynamically bound samplers by Metal index but does not encode the state selected by

@@ -582,6 +582,10 @@ impl Emitter {
             },
             LlValue::Float32Bits(bits) => match self.resolve_type(ty)? {
                 LlType::Float => self.const_float32_bits(*bits),
+                // Special spellings (qnan/snan/inf) carry float32 bits in the
+                // parsed IR even when the use is half. Encode their numeric
+                // value at the destination width, preserving sign and NaN class.
+                LlType::Half => self.const_float16_bits(f32_to_f16_bits(f32::from_bits(*bits))),
                 other => Err(format!(
                     "native emitter: float32 bit literal f0x{bits:08x} used as non-float type {other:?}"
                 )),

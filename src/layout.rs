@@ -85,6 +85,20 @@ impl AirDataLayout {
     }
 }
 
+/// TEMP (lab): `REIMS_VGPU_M2V_NATURAL_AGG_ALIGN=1` drops the four-byte alignment floor on arrays
+/// and SPIR-V structs, so `[3 x half]`/`packed_half3[3]` members keep LLVM's (and Metal's) two-byte
+/// alignment instead of being pushed to the next four-byte boundary. Default off.
+pub(crate) fn natural_aggregate_align() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("REIMS_VGPU_M2V_NATURAL_AGG_ALIGN").is_ok_and(|v| v != "0" && !v.is_empty())
+    })
+}
+
+fn array_align_floor(elem_align: u64) -> u64 {
+    if natural_aggregate_align() { elem_align } else { elem_align.max(4) }
+}
+
 /// Byte size of a scalar/pointer `LlType` (the "scalar storage" rule). `None` for aggregates and
 /// unknown types. Was `LlModule::scalar_storage_size`.
 pub(super) fn scalar_storage_size(
@@ -170,7 +184,7 @@ pub(super) fn memcpy_size_align(
             let (elem_size, elem_align) = memcpy_size_align(&elem, resolve, data_layout)?;
             Some((
                 round_up_u64(elem_size, elem_align) * len as u64,
-                elem_align.max(4),
+                array_align_floor(elem_align),
             ))
         }
         LlType::Struct(fields) => {
@@ -224,7 +238,7 @@ pub(super) fn raw_size_align(
         LlType::Array(elem, len) => {
             let (elem_size, elem_align) = raw_size_align(&elem, resolve, data_layout)?;
             let stride = round_up_u64(elem_size, elem_align);
-            Ok((stride * len as u64, elem_align.max(4)))
+            Ok((stride * len as u64, array_align_floor(elem_align)))
         }
         LlType::Struct(fields) => {
             let mut off = 0;
@@ -398,7 +412,7 @@ pub(crate) fn spirv_size_align(
         Op::TypeStruct => {
             let mut cursor = 0u32;
             let mut end = 0u32;
-            let mut max_align = 4u32;
+            let mut max_align = if natural_aggregate_align() { 1u32 } else { 4u32 };
             let explicit_offsets = rule.struct_offsets(ty);
             for (index, operand) in def.operands.iter().enumerate() {
                 let Operand::IdRef(member) = operand else {

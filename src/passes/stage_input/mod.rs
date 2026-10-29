@@ -1341,6 +1341,17 @@ pub(super) fn build_stage_input(
                 ctx.interface.push(var);
                 if interface_ty == *pty {
                     bindings.push((*pid, ParamBinding::LoadVar { var, ty: *pty }));
+                } else if float_value_shape(ctx, *pty).is_some()
+                    && float_value_shape(ctx, interface_ty).is_some()
+                {
+                    bindings.push((
+                        *pid,
+                        ParamBinding::LoadVarConverted {
+                            var,
+                            load_ty: interface_ty,
+                            param_ty: *pty,
+                        },
+                    ));
                 } else if matches!(stage, Stage::Vertex)
                     && (type_int_shape(&defs, *pty).is_some()
                         || defs.get(pty).is_some_and(|definition| {
@@ -2585,6 +2596,28 @@ impl Ctx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn half_varyings_and_vertex_attributes_use_float_interfaces() {
+        let mut ctx = Ctx::new(Module::new());
+        let half = ctx.get_or_create(Op::TypeFloat, None, vec![Operand::LiteralBit32(16)]);
+        for lanes in [None, Some(2), Some(3), Some(4)] {
+            let original = lanes.map_or(half, |lanes| {
+                ctx.get_or_create(
+                    Op::TypeVector,
+                    None,
+                    vec![Operand::IdRef(half), Operand::LiteralBit32(lanes)],
+                )
+            });
+            let defs =
+                crate::passes::resources::rewrites::combined_type_defs(&ctx, &HashMap::new());
+            let fragment = fragment_varying_interface_type(&mut ctx, None, 0, original, &defs);
+            let vertex = vertex_attribute_interface_type(&mut ctx, None, 0, original, &defs);
+            assert_eq!(float_value_shape(&ctx, fragment), Some((32, lanes)));
+            assert_eq!(vertex, fragment);
+            assert_eq!(float_value_shape(&ctx, original), Some((16, lanes)));
+        }
+    }
 
     #[test]
     fn typed_buffer_alias_elements_include_numeric_vectors() {

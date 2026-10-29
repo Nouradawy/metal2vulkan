@@ -775,6 +775,99 @@ mod byte_reinterpret_tests {
     }
 
     #[test]
+    fn local_word_vector_subword_load_and_store_keep_function_storage() {
+        for lanes in [3, 4] {
+            let mut ctx = Ctx::new(Module::new());
+            let uint = ctx.ty_uint();
+            let uchar = ctx.ty_int8();
+            let vector = ctx.module.fresh_id();
+            ctx.new_globals.push(Instruction::new(
+                Op::TypeVector,
+                None,
+                Some(vector),
+                vec![Operand::IdRef(uint), Operand::LiteralBit32(lanes)],
+            ));
+            let structure = ctx.module.fresh_id();
+            ctx.new_globals.push(Instruction::new(
+                Op::TypeStruct,
+                None,
+                Some(structure),
+                vec![Operand::IdRef(vector)],
+            ));
+            let ptr_struct = ctx.ty_ptr(StorageClass::Function, structure);
+            let ptr_byte = ctx.ty_ptr(StorageClass::Function, uchar);
+            let base = ctx.module.fresh_id();
+            let index = ctx.module.fresh_id();
+            let chain = ctx.module.fresh_id();
+            let value = ctx.module.fresh_id();
+            install_entry(
+                &mut ctx,
+                vec![
+                    Instruction::new(
+                        Op::Variable,
+                        Some(ptr_struct),
+                        Some(base),
+                        vec![Operand::StorageClass(StorageClass::Function)],
+                    ),
+                    Instruction::new(Op::Undef, Some(uint), Some(index), vec![]),
+                    Instruction::new(
+                        Op::InBoundsAccessChain,
+                        Some(ptr_byte),
+                        Some(chain),
+                        vec![Operand::IdRef(base), Operand::IdRef(index)],
+                    ),
+                    Instruction::new(
+                        Op::Load,
+                        Some(uchar),
+                        Some(value),
+                        vec![Operand::IdRef(chain)],
+                    ),
+                    Instruction::new(
+                        Op::Store,
+                        None,
+                        None,
+                        vec![Operand::IdRef(chain), Operand::IdRef(value)],
+                    ),
+                ],
+            );
+            rewrite_dynamic_struct_index_subword_reinterpret(&mut ctx, 0).unwrap();
+            if lanes == 3 {
+                assert!(
+                    ctx.module.functions[0].blocks[0]
+                        .instructions
+                        .iter()
+                        .any(|inst| inst.result_id == Some(chain)),
+                    "a padded three-lane vector remains unsupported"
+                );
+                continue;
+            }
+            let pointer = ctx.ty_ptr(StorageClass::Function, uint);
+            let insts = &ctx.module.functions[0].blocks[0].instructions;
+            assert!(!insts.iter().any(|inst| inst.result_id == Some(chain)));
+            let chains: Vec<_> = insts
+                .iter()
+                .filter(|inst| inst.class.opcode == Op::InBoundsAccessChain)
+                .collect();
+            assert_eq!(chains.len(), 2, "load and store address the same word/lane");
+            for inst in chains {
+                assert_eq!(inst.result_type, Some(pointer));
+                assert_eq!(inst.operands.len(), 3);
+                assert_eq!(inst.operands[0], Operand::IdRef(base));
+                let Operand::IdRef(member) = inst.operands[1] else {
+                    panic!("missing member")
+                };
+                assert_eq!(const_u32(&ctx, member), Some(0));
+            }
+            assert!(insts
+                .iter()
+                .any(|inst| inst.class.opcode == Op::ShiftRightLogical));
+            assert!(insts
+                .iter()
+                .any(|inst| inst.class.opcode == Op::ShiftLeftLogical));
+        }
+    }
+
+    #[test]
     fn dynamic_struct_index_wide_word_reinterpret_assembles_ulong_from_two_words() {
         let mut ctx = Ctx::new(Module::new());
         let uint = ctx.ty_uint();

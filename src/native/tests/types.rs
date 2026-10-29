@@ -1449,6 +1449,44 @@ entry:
 }
 
 #[test]
+fn native_half_special_literals_preserve_sign_and_nan_class() {
+    for (literal, expected) in [
+        ("+qnan", 0x7e00),
+        ("-qnan", 0xfe00),
+        ("+snan", 0x7c01),
+        ("-snan", 0xfc01),
+        ("+inf", 0x7c00),
+        ("-inf", 0xfc00),
+    ] {
+        let ll = format!(
+            "define half @value(i1 %choose, half %x) {{\n\
+             entry:\n  br i1 %choose, label %left, label %right\n\
+             left:\n  br label %merge\nright:\n  br label %merge\n\
+             merge:\n  %result = phi half [ %x, %left ], [ {literal}, %right ]\n\
+             ret half %result\n}}"
+        );
+        let bytes = emit_vulkan_spirv(&ll).unwrap_or_else(|error| panic!("{literal}: {error}"));
+        let module = load_bytes(bytes).expect("load native spv");
+        let half = module
+            .types_global_values
+            .iter()
+            .find(|inst| {
+                inst.class.opcode == Op::TypeFloat && inst.operands == [Operand::LiteralBit32(16)]
+            })
+            .and_then(|inst| inst.result_id)
+            .expect("half type");
+        assert!(
+            module.types_global_values.iter().any(|inst| {
+                inst.class.opcode == Op::Constant
+                    && inst.result_type == Some(half)
+                    && inst.operands == [Operand::LiteralBit32(expected)]
+            }),
+            "{literal} must keep its sign and infinity/quiet/signaling class"
+        );
+    }
+}
+
+#[test]
 fn native_phi_carrier_accepts_decimal_half_and_exact_float_bits() {
     let ll = r#"
 target triple = "spirv-unknown-vulkan1.3"

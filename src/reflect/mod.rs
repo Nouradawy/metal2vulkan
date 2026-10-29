@@ -87,7 +87,8 @@ mod footprint;
 /// v41 stops reporting a constexpr sampler the finished module does not bind. A state no sample
 /// reads leaves a variable nothing references, which the module drops; reflection still asked a
 /// consumer to create a `VkSampler` there. 112 such bindings in 60 of the 2880-source sample.
-pub const REFLECTION_VERSION: u32 = 41;
+/// v42 exposes runtime texture-presence queries through the specialization-id band below.
+pub const REFLECTION_VERSION: u32 = 42;
 
 /// Size in bytes of the twelve tightly packed `u32` values used by exact-thread dispatches: thread
 /// grid, thread base, threadgroup base, and total threadgroup grid (three dimensions each).
@@ -102,6 +103,27 @@ pub const KERNEL_LOCAL_SIZE_SPEC_IDS: [u32; 3] = [0, 1, 2];
 /// specialize it with the pipeline's `rasterizationSamples`; unspecialized it reads 1. A pipeline whose
 /// module does not declare it may still name it - Vulkan ignores a map entry no constant uses.
 pub const RASTER_SAMPLE_COUNT_SPEC_ID: u32 = 0x4d53_0001;
+
+/// Boolean specialization ids for `is_null_texture` on Metal texture arguments.
+/// `BASE + index` is true when that stage's texture argument is nil. The default
+/// is false; consumers must supply the actual binding state, including nil.
+/// These ids are independent of descriptor relocation and of image dimensions.
+pub const TEXTURE_NULL_SPEC_ID_BASE: u32 = 0x4d54_0000;
+
+pub const fn texture_null_spec_id(index: u32) -> Option<u32> {
+    if index < TEXTURE_ARGUMENT_COUNT {
+        Some(TEXTURE_NULL_SPEC_ID_BASE + index)
+    } else {
+        None
+    }
+}
+
+pub const fn texture_null_spec_index(id: u32) -> Option<u32> {
+    match id.checked_sub(TEXTURE_NULL_SPEC_ID_BASE) {
+        Some(index) if index < TEXTURE_ARGUMENT_COUNT => Some(index),
+        _ => None,
+    }
+}
 
 /// Default byte offset of the exact-thread dispatch-region payload.
 pub const DEFAULT_KERNEL_DISPATCH_PUSH_CONSTANT_OFFSET: u32 = 0;

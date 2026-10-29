@@ -828,8 +828,8 @@ pub(in crate::passes) fn lower_image_size_query(
     Ok(out)
 }
 
-/// `air.is_null_texture*`: yields a bool telling whether the texture operand is one of the
-/// synthesized null-image values tracked on the pass Ctx.
+/// Preserve a texture argument's runtime presence. A synthesized null is known
+/// here; an interface texture is known only when the consumer binds the stage.
 pub(in crate::passes) fn lower_is_null_texture(
     ctx: &mut Ctx,
     name: &str,
@@ -843,8 +843,36 @@ pub(in crate::passes) fn lower_is_null_texture(
         .first()
         .copied()
         .ok_or_else(|| format!("{name} missing texture"))?;
-    let is_null = ctx.null_image_values.contains(&img);
-    let c = ctx.const_bool_of(rty, is_null);
+    let img = resolve_image_value(ctx, img);
+    let c = if ctx.null_image_values.contains(&img) {
+        ctx.const_bool_of(rty, true)
+    } else {
+        let root = match value_inst(ctx, img) {
+            Some(inst) if inst.class.opcode == Op::Load => match inst.operands.first() {
+                Some(Operand::IdRef(var)) => *var,
+                _ => return Err(format!("{name}: texture load has no descriptor root")),
+            },
+            Some(inst) if inst.class.opcode == Op::Variable => img,
+            _ => return Err(format!("{name}: unresolved texture argument origin")),
+        };
+        let binding = ctx.module.annotations.iter().find_map(|inst| {
+            match (inst.class.opcode, inst.operands.as_slice()) {
+                (Op::Decorate, [Operand::IdRef(var), Operand::Decoration(Decoration::Binding),
+                    Operand::LiteralBit32(binding)]) if *var == root => Some(*binding),
+                _ => None,
+            }
+        }).ok_or_else(|| format!("{name}: texture argument has no descriptor binding"))?;
+        let index = [
+            ctx.descriptor_layout.sampled_textures,
+            ctx.descriptor_layout.storage_textures,
+        ]
+        .into_iter()
+        .find(|range| range.contains(binding))
+        .map(|range| binding - range.start)
+        .filter(|index| crate::reflect::texture_null_spec_id(*index).is_some())
+        .ok_or_else(|| format!("{name}: binding {binding} is not a texture argument"))?;
+        ctx.texture_null_spec(index)
+    };
     Ok(vec![Instruction::new(
         Op::CopyObject,
         Some(rty),
@@ -1217,6 +1245,57 @@ pub(in crate::passes) fn lower_get_read_sampler(
 mod tests {
     use super::*;
     use crate::spirv_module::Module;
+
+    #[test]
+    fn interface_texture_nullness_is_runtime_state_not_constant_false() {
+        let mut ctx = Ctx::new(Module::new());
+        let image = ctx.ty_image(Dim::Dim2D, false, ImageComp::Float);
+        let pointer = ctx.ty_ptr(StorageClass::UniformConstant, image);
+        let var = ctx.module.fresh_id();
+        ctx.new_globals.push(Instruction::new(
+            Op::Variable,
+            Some(pointer),
+            Some(var),
+            vec![Operand::StorageClass(StorageClass::UniformConstant)],
+        ));
+        ctx.module.annotations.push(Instruction::new(
+            Op::Decorate,
+            None,
+            None,
+            vec![
+                Operand::IdRef(var),
+                Operand::Decoration(Decoration::Binding),
+                Operand::LiteralBit32(ctx.descriptor_layout.sampled_texture_binding(3).unwrap()),
+            ],
+        ));
+        let bool_ty = ctx.ty_bool();
+        let res = ctx.module.fresh_id();
+        lower_is_null_texture(
+            &mut ctx,
+            "air.is_null_texture_2d",
+            Some(res),
+            Some(bool_ty),
+            &[var],
+        )
+        .unwrap();
+        assert!(ctx
+            .new_globals
+            .iter()
+            .any(|i| i.class.opcode == Op::SpecConstantFalse));
+        assert!(ctx.module.annotations.iter().any(|i| i.operands.last()
+            == Some(&Operand::LiteralBit32(
+                crate::reflect::texture_null_spec_id(3).unwrap()
+            ))));
+        let unknown = ctx.module.fresh_id();
+        assert!(lower_is_null_texture(
+            &mut ctx,
+            "air.is_null_texture_2d",
+            Some(res),
+            Some(bool_ty),
+            &[unknown]
+        )
+        .is_err());
+    }
 
     fn ext_inst_number(instructions: &[Instruction]) -> u32 {
         instructions

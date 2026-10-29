@@ -46,6 +46,38 @@ pub(in crate::passes) fn type_def_of(ctx: &Ctx, ty: Word) -> Option<Instruction>
         .cloned()
 }
 
+/// Component width and optional lane count of a scalar/vector floating value.
+pub(in crate::passes) fn float_value_shape(ctx: &Ctx, ty: Word) -> Option<(u32, Option<u32>)> {
+    let definition = type_def_of(ctx, ty)?;
+    let (scalar, lanes) = if definition.class.opcode == Op::TypeVector {
+        match definition.operands.as_slice() {
+            [Operand::IdRef(component), Operand::LiteralBit32(lanes)] => (*component, Some(*lanes)),
+            _ => return None,
+        }
+    } else {
+        (ty, None)
+    };
+    let definition = type_def_of(ctx, scalar)?;
+    if definition.class.opcode != Op::TypeFloat {
+        return None;
+    }
+    match definition.operands.first()? {
+        Operand::LiteralBit32(bits) => Some((*bits, lanes)),
+        _ => None,
+    }
+}
+
+/// Keep stage I/O on Vulkan's baseline 32-bit interface. Float16 arithmetic is
+/// independent of the optional storageInputOutput16 feature; the body converts
+/// at the boundary and retains its original half precision.
+pub(in crate::passes) fn float_stage_interface_type(ctx: &mut Ctx, ty: Word) -> Word {
+    match float_value_shape(ctx, ty) {
+        Some((16, Some(lanes))) => ctx.ty_vecf(lanes),
+        Some((16, None)) => ctx.ty_float(),
+        _ => ty,
+    }
+}
+
 /// Find the defining instruction for a value id in globals, parameters, or function bodies.
 pub(in crate::passes) fn value_def_instruction(ctx: &Ctx, value: Word) -> Option<Instruction> {
     ctx.new_globals

@@ -109,7 +109,9 @@ pub(in crate::passes) fn apply_bindings(
                 load_ty,
                 param_ty,
             } => {
-                // load the 32-bit builtin, then UConvert down to the narrower param int type.
+                // Load the baseline-width interface, then restore the body's
+                // original numeric type. Half arithmetic must use FConvert,
+                // never an integer conversion or a cross-width bitcast.
                 let lid = ctx.module.fresh_id();
                 loads.push(Instruction::new(
                     Op::Load,
@@ -119,7 +121,11 @@ pub(in crate::passes) fn apply_bindings(
                 ));
                 let cid = ctx.module.fresh_id();
                 loads.push(Instruction::new(
-                    Op::UConvert,
+                    if float_value_shape(ctx, param_ty).is_some() {
+                        Op::FConvert
+                    } else {
+                        Op::UConvert
+                    },
                     Some(param_ty),
                     Some(cid),
                     vec![Operand::IdRef(lid)],
